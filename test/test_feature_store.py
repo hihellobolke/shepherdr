@@ -186,9 +186,10 @@ class FeatureStore(unittest.TestCase):
     def test_resolution_of_a_missing_ref_raises(self):
         with store.Store(self.loc) as s:
             s.new_feature("Login", "add-login", "feature/x-login")
+            missing = f"{s.prefix}-999"  # this folder's prefix, so it is a missing record, not a wrong prefix
             for call in (s.find, s.find_feature, s.resolve):
                 with self.assertRaises(Fail):
-                    call("HAT-999")
+                    call(missing)
 
     # ---- the feature field (and the other flow fields) on a Task -----------------------------
 
@@ -200,6 +201,16 @@ class FeatureStore(unittest.TestCase):
             self.assertEqual(t["role"], "child")
             self.assertEqual(t["owns"], ["src/a.ts"])
             self.assertEqual(t["rows"], ["1.1"])
+
+    def test_new_refuses_to_let_fields_override_the_allocated_id(self):
+        """`fields` cannot clobber the id (or the other base fields), so the shared counter stays
+        the one source of ids and a ref cannot be made to match both a Task and a Feature."""
+        with store.Store(self.loc) as s:
+            f = s.new_feature("Login", "add-login", "feature/x-login")
+            with self.assertRaises(Fail):
+                s.new("Sneaky child", feature=f["id"], id=f["id"])
+            # The feature's id is untouched and still resolves only to the feature.
+            self.assertEqual(s.resolve(s.ref(f)), ("feature", f))
 
     def test_a_classic_task_carries_no_flow_fields(self):
         with store.Store(self.loc) as s:

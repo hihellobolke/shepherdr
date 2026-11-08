@@ -217,10 +217,15 @@ class Store:
     def new(self, title, prompt="", mode="here", **fields):
         """A new Task, drawing the next folder number. A classic Task passes no `fields`; a flow
         Task stamps its flow fields here (`feature`, `role`, `owns`, `risk`, `rows`, ... of C2),
-        so the task dict is built in one place."""
+        so the task dict is built in one place. The id and the other base fields are the store's;
+        `fields` may not override them, so the shared counter stays the one source of ids."""
         d = self.data
         t = {"id": d["next"], "title": title, "prompt": prompt, "mode": mode, "state": "todo",
              "created": now(), "agents": []}
+        clash = t.keys() & fields.keys()
+        if clash:
+            raise Fail(f"new() sets {', '.join(sorted(clash))} itself; pass only flow fields "
+                       f"(feature, role, owns, risk, rows, ...).")
         t.update(fields)
         d["next"] += 1
         d["tasks"].append(t)
