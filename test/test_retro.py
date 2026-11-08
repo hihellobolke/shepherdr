@@ -111,6 +111,16 @@ class RetroAgent(RetroBase):
             with self._store() as s:
                 self.assertEqual(self.retro.retro_agent(s)["agent"], "claude")
 
+    def test_worker_argv_wins_over_agent_like_the_launcher(self):
+        # Settings layers can leave both keys on the worker (Everywhere sets agent, a space sets
+        # argv). The launcher runs argv, so the worker's real CLI is the argv's command; the retro
+        # must take the other CLI of that, not of the agent key.
+        self.everywhere(worker={"agent": "claude", "argv": ["codex", "--no-daemon"]})
+        other = {"claude": "codex", "codex": "claude"}
+        with mock.patch.object(self.settings, "other_cli", lambda a: other[a]):
+            with self._store() as s:
+                self.assertEqual(self.retro.retro_agent(s)["agent"], "claude")
+
 
 class Instructions(RetroBase):
     def test_built_in_loads_the_template_body(self):

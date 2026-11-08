@@ -69,11 +69,12 @@ def _retro_role(s, space=None):
     if not pick:
         pick = dict(cfg.get("reviewer") or {})
     if not pick.get("agent") and not pick.get("argv"):
-        # The worker's own CLI is its `agent`, or the command of its `argv` when it is set that way,
-        # else claude. The retro runs on the other CLI, so an argv-only worker never makes the retro
-        # read with the same CLI as the code it reviews.
+        # The worker's own CLI, resolved the way the launcher does: its `argv`'s command wins over
+        # its `agent` (argv_for/worker_argv read argv first), else `agent`, else claude. The retro
+        # runs on the other CLI, so it never reads with the same CLI as the code it reviews, whatever
+        # mix of `agent` and `argv` the settings layers leave on the worker.
         worker = cfg.get("worker") or {}
-        worker_cli = worker.get("agent") or (settings.agent_key(worker["argv"]) if worker.get("argv") else "claude")
+        worker_cli = settings.agent_key(worker["argv"]) if worker.get("argv") else (worker.get("agent") or "claude")
         pick["agent"] = settings.other_cli(worker_cli)
     return pick
 
