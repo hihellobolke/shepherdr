@@ -1,6 +1,7 @@
 """The person's settings (~/.herdr/shepherdr.json and per-folder), the agent each task runs, and
 the Settings block a task's brief ends with."""
 
+import copy
 import json
 import os
 import re
@@ -128,7 +129,9 @@ def settings_for(s, space=None):
     machine-only rows, read by machine_limits/machine_option); ones set before still apply here. Written by the settings window (~/.herdr/shepherdr.json); herdr-task only
     reads them."""
     everywhere, machine, pick = settings_layers(s, space)
-    out = {k: dict(v) for k, v in DEFAULTS.items()}
+    # A deep copy so a caller that mutates a list value (risky_paths, owns_exempt, may_change) never
+    # reaches DEFAULTS or another space's result.
+    out = copy.deepcopy(DEFAULTS)
 
     def merge(part):
         for k, v in (part or {}).items():

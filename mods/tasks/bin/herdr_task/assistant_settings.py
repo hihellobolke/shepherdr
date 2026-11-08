@@ -7,6 +7,7 @@ one hidden notice line per setting that changed for its space, several at once i
 never for a save that changed nothing there. Other agents (task workers, automation runs, agent
 tabs) aren't told the block: their brief is fixed; they get only Reactions (reactions.py)."""
 
+import copy
 import hashlib
 import json
 import os
@@ -35,6 +36,11 @@ NOTICE_END = "Nothing to answer: reply only <hc no-reply/>."
 FLOW_WORDS_ASSIST = {"classic": "classic", "openspec": "openspec (Features: a spec worker, fan-out to children, verify, then close)"}
 RETRO_WORDS_ASSIST = {"off": "off", "ask": "ask me (I ask before a retro runs after a Feature is done)",
                       "automatic": "automatic (a retro runs by itself after a Feature is done)"}
+# A Flow or Retro row leaves the block when its setting goes back to Herdr's default, so a running
+# Assistant would otherwise never hear it was turned off. These stand in for the gone row in the
+# change notice (settings_pass), saying it is back to the default.
+RESET_ROWS = {"flow": {"key": "flow", "label": "Flow", "text": FLOW_WORDS_ASSIST["classic"], "value": "classic", "by": None, "scope": "everywhere"},
+              "retro": {"key": "retro", "label": "Retro", "text": RETRO_WORDS_ASSIST["off"], "value": "off", "by": None, "scope": "everywhere"}}
 
 
 def space_of(k):
@@ -59,7 +65,8 @@ def layers(d, space):
 
 def resolve(ls):
     """The values that apply, from DEFAULTS and the layers (most specific wins)."""
-    out = {k: dict(v) for k, v in DEFAULTS.items()}
+    # A deep copy so a caller that mutates a list value never reaches DEFAULTS (see settings_for).
+    out = copy.deepcopy(DEFAULTS)
     for _, layer in ls:
         for k, v in layer.items():
             if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -260,6 +267,8 @@ def settings_pass(report, quiet):
             changed = [{"key": "all"}]
         else:
             changed = [r for r in rs if had.get(r["key"]) != now_digest[r["key"]]]
+            # A Flow or Retro row that left the block (back to its default) is told as a reset.
+            changed += [RESET_ROWS[kk] for kk in had if kk not in now_digest and kk in RESET_ROWS]
             if not changed:  # a line no longer said: just note it
                 run(["hc", "label", addr, f"{LABEL}={digest(rs)}"])
                 continue

@@ -92,6 +92,20 @@ class SettingsFor(unittest.TestCase):
         self.assertEqual(cfg["tasks"]["flow"], "openspec")  # still Everywhere's
         self.assertEqual(cfg["tasks"]["verify_rounds"], 4)
 
+    def test_list_defaults_are_not_shared_across_calls(self):
+        """A caller that mutates a returned list value must not reach DEFAULTS or the next result."""
+        a = settings.settings_for(self.s)
+        a["tasks"]["may_change"].append("specs")
+        a["tasks"]["risky_paths"].append("src/**")
+        a["tasks"]["owns_exempt"].append("gen/**")
+        b = settings.settings_for(self.s)
+        self.assertEqual(b["tasks"]["may_change"], [])
+        self.assertEqual(b["tasks"]["risky_paths"], [])
+        self.assertEqual(b["tasks"]["owns_exempt"], [])
+        self.assertEqual(settings.DEFAULTS["tasks"]["may_change"], [])
+        self.assertEqual(settings.DEFAULTS["tasks"]["risky_paths"], [])
+        self.assertEqual(settings.DEFAULTS["tasks"]["owns_exempt"], [])
+
 
 class SetTask(unittest.TestCase):
     def test_flow_valid(self):
@@ -162,6 +176,16 @@ class Block(unittest.TestCase):
         self.assertNotIn("- Flow:", block)
         self.assertNotIn("- Retro:", block)
 
+    def test_classic_default_block_is_byte_for_byte_the_known_baseline(self):
+        """The exact worker Settings block a classic task got before the flow settings existed."""
+        expected = ("Settings: (from herdr-task show; where the brief above says otherwise, it wins)\n"
+                    "- Review: off\n"
+                    "- Merge: ask the person first: they accept it in the Tasks panel, which merges it\n"
+                    "- Proof: show verifiable proof in one recipe artifact: each proof with a one-line caption, "
+                    "real and from this work now, plus a \"Not proven\" list; then say ready with --proof <its id>\n"
+                    "- Agent: claude")
+        self.assertEqual(settings.settings_block(self.s, self.task()), expected)
+
     def test_set_flow_openspec_shows_the_flow_line_first(self):
         t = self.task()
         settings.set_task(t, "flow", "openspec")
@@ -226,6 +250,62 @@ class AssistantBlock(unittest.TestCase):
         rs = aset.rows("sp1", d, self.NO_AUTO)
         for ln in aset.notice(rs).split("\n"):
             self.assertRegex(ln, r'^<herdr-setting name="\w+" value="[^"]*" scope="\w+">[^\n]*</herdr-setting>$')
+
+    def test_resolve_lists_not_shared_across_calls(self):
+        a = aset.resolve(aset.layers({}, "sp1"))
+        a["tasks"]["risky_paths"].append("x")
+        b = aset.resolve(aset.layers({}, "sp1"))
+        self.assertEqual(b["tasks"]["risky_paths"], [])
+        self.assertEqual(settings.DEFAULTS["tasks"]["risky_paths"], [])
+
+
+class ResetNotice(unittest.TestCase):
+    """A running Assistant is told when Flow or Retro goes back to its default, even though the row
+    then leaves the block (settings_pass)."""
+    def setUp(self):
+        import herdr_task.news as news
+        self.news = news
+        self.dir = tempfile.mkdtemp()
+        self.file = os.path.join(self.dir, "shepherdr.json")
+        self.terminals, self.sent = {}, []
+
+        def hc_json(*args):
+            return self.terminals.get(args[1]) if args[0] == "get" else None
+
+        def run(args, **_):
+            if args[:2] == ["hc", "label"]:
+                k, v = args[3].split("=", 1)
+                self.terminals[args[2]].setdefault("labels", {})[k] = v
+
+        for target, name, value in [
+            (settings, "SETTINGS", self.file), (aset, "SETTINGS", self.file),
+            (aset, "STATE", os.path.join(self.dir, ".assistant-settings.json")),
+            (aset, "hc_json", hc_json), (aset, "run", run), (aset, "addon_off", lambda n: False),
+            (aset, "coordinators", lambda: list(self.terminals)),
+            (aset, "autopilot_of", lambda space, cfg: (False, "", "")),
+            (news, "news_send", lambda addr, text: self.sent.append((addr, text)) or True),
+        ]:
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def write(self, d):
+        with open(self.file, "w") as f:
+            json.dump(d, f)
+
+    def test_turning_flow_and_retro_off_tells_the_assistant(self):
+        was = {"everywhere": {"tasks": {"flow": "openspec", "retro": "automatic"}}}
+        had = aset.digest(aset.rows("sp1", was, (False, "", "")))
+        self.terminals["t5"] = {"state": "live", "turn": 3,
+                                "labels": {"herdr.role": "coordinator", "herdr.space": "sp1", aset.LABEL: had}}
+        self.write({})  # both back to their defaults: the rows leave the block
+        aset.settings_pass({}, {})
+        self.assertEqual(len(self.sent), 1)
+        msg = self.sent[0][1]
+        self.assertIn('name="flow" value="classic"', msg)
+        self.assertIn('name="retro" value="off"', msg)
+        self.assertIn("Flow is now classic", msg)
+        self.assertIn("Retro is now off", msg)
 
 
 if __name__ == "__main__":
