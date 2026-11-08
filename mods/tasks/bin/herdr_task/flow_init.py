@@ -10,6 +10,7 @@ moves the pinned copies to a newer commit.
 import json
 import os
 import shutil
+import sys
 import tempfile
 
 from . import base
@@ -23,8 +24,8 @@ from .store import locate
 # finds a skill by its folder name, not by a fixed path.
 SKILLS = ["grill-with-docs", "grilling", "domain-modeling", "to-spec", "retro", "writing-for-agents"]
 MATT_POCOCK_REPO = "https://github.com/mattpocock/skills"
-# The pinned source commit. `copy_skill` writes it into each copy; `flow init --update` moves the
-# copies to this value when it is newer than the one a copy records.
+# The pinned source commit. `copy_skill` writes it into each copy; `flow init --update` moves a
+# pinned copy to this value, and leaves a copy already at it as it is.
 MATT_POCOCK_COMMIT = "4ae2317ddb22b046e26455e4f9c9b3aaaf62212d"
 
 # A copy that flow init made carries this marker (the source repo and commit), so `--update` can
@@ -70,6 +71,15 @@ def skill_present(name, folder, machine=None):
 def _pinned(folder, name):
     """True when a skill in the repo is a copy flow init made (it carries the source marker)."""
     return os.path.isfile(os.path.join(_repo_skills(folder), name, SOURCE_MARKER))
+
+
+def _pinned_commit(folder, name):
+    """The commit a pinned repo copy records, or `None` when there is no readable marker."""
+    try:
+        with open(os.path.join(_repo_skills(folder), name, SOURCE_MARKER)) as f:
+            return json.load(f).get("commit")
+    except (OSError, ValueError):
+        return None
 
 
 # ---- the source repo and the copy -----------------------------------------------------------
@@ -127,32 +137,49 @@ def copy_skill(name, folder, commit):
 
 def _confirm_tty(name):
     """The default ask for a skill missing at both levels: yes or no from the person. The CLI's
-    chat card answers it where the worker runs with one; without an answer it is a no."""
+    chat card answers it where the worker runs with one; without an answer it is a no. The prompt
+    goes to stderr, so a `--json` run still prints one clean JSON object to stdout."""
     prompt = (f"The skill {name!r} is not in this repo or in your ~/.claude/skills. "
               f"Add a pinned copy from {MATT_POCOCK_REPO}? [y/N] ")
     try:
-        return input(prompt).strip().lower() in ("y", "yes")
+        sys.stderr.write(prompt)
+        sys.stderr.flush()
+        return input().strip().lower() in ("y", "yes")
     except EOFError:
         return False
 
 
 # ---- the commit -----------------------------------------------------------------------------
 
-def _commit_pr(folder, update):
-    """Commit what flow init changed on its own branch, so the person reviews it as a pull
-    request. Returns the branch name, or `None` when there was nothing to commit."""
+def _commit_pr(folder, paths, update):
+    """Commit exactly the paths flow init wrote, on its own fresh branch, so the person reviews it
+    as an ordinary pull request. It leaves any other work in the tree or the index untouched, never
+    resets an existing branch, and raises on a real git error (it does not report failure as
+    success). Returns the branch name, or `None` when those paths hold no change to commit."""
+    here = [p for p in paths if os.path.exists(os.path.join(folder, p))]
+    if not here:
+        return None
+    ok, status, _ = base.git(folder, "status", "--porcelain", "--", *here)
+    if not status.strip():
+        return None
+
     branch = UPDATE_BRANCH if update else INIT_BRANCH
-    ok, _, err = base.git(folder, "checkout", "-B", branch)
+    # Never reset an existing branch (its unmerged history is the person's): refuse instead.
+    exists, _, _ = base.git(folder, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")
+    if exists:
+        raise Fail(f"The branch {branch} already exists here. Delete or rename it, then run flow init again.")
+    ok, _, err = base.git(folder, "checkout", "-b", branch)
     if not ok:
         raise Fail(f"Could not start the branch {branch}: {err or 'git checkout failed'}")
-    paths = [p for p in ("openspec", ".claude") if os.path.exists(os.path.join(folder, p))]
-    if paths:
-        base.git(folder, "add", *paths)
-    message = "Update the pinned OpenSpec flow skills" if update else "Set up the OpenSpec flow"
-    ok, _, _ = base.git(folder, "-c", "commit.gpgsign=false", "commit", "-m", message)
+
+    # Stage and commit only these paths, so nothing already staged rides along (--only).
+    ok, out, err = base.git(folder, "add", "--", *here)
     if not ok:
-        # Nothing to commit (git exits non-zero on an empty commit).
-        return None
+        raise Fail(f"Could not stage the flow init changes: {(err or out).strip() or 'git add failed'}")
+    message = "Update the pinned OpenSpec flow skills" if update else "Set up the OpenSpec flow"
+    ok, out, err = base.git(folder, "-c", "commit.gpgsign=false", "commit", "--only", "-m", message, "--", *here)
+    if not ok:
+        raise Fail(f"Could not commit the flow init changes: {(err or out).strip() or 'git commit failed'}")
     return branch
 
 
@@ -180,23 +207,24 @@ def init(folder, update=False, confirm=None):
         confirm = _confirm_tty
     commit = MATT_POCOCK_COMMIT
     report = {"ok": True, "openspec": "", "skills": {}, "pr": None}
-    changed = False
+    touched = []  # the exact paths flow init wrote, for a precise commit
 
     if os.path.isdir(os.path.join(folder, "openspec")):
         report["openspec"] = "present"
     else:
         _openspec_init(folder)
         report["openspec"] = "initialized"
-        changed = True
+        touched.append("openspec")
 
     for name in SKILLS:
         where = skill_present(name, folder)
+        skill_path = os.path.join(".claude", "skills", name)
         if where in ("repo", "user"):
-            if update and where == "repo" and _pinned(folder, name):
-                # Move the pinned copy to the newer commit.
+            if update and where == "repo" and _pinned(folder, name) and _pinned_commit(folder, name) != commit:
+                # Move the pinned copy to the target commit; a copy already there stays as it is.
                 copy_skill(name, folder, commit)
                 report["skills"][name] = "added"
-                changed = True
+                touched.append(skill_path)
             else:
                 report["skills"][name] = where
             continue
@@ -208,12 +236,12 @@ def init(folder, update=False, confirm=None):
         if confirm(name):
             copy_skill(name, folder, commit)
             report["skills"][name] = "added"
-            changed = True
+            touched.append(skill_path)
         else:
             report["skills"][name] = "skipped"
 
-    if changed:
-        report["pr"] = _commit_pr(folder, update)
+    if touched:
+        report["pr"] = _commit_pr(folder, touched, update)
     return report
 
 

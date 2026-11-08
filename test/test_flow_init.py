@@ -206,6 +206,68 @@ class FlowInit(unittest.TestCase):
         self.assertEqual(report["skills"], {"to-spec": "repo"})
         self.assertFalse(os.path.isfile(os.path.join(self.folder, ".claude", "skills", "to-spec", flow_init.SOURCE_MARKER)))
 
+    def test_update_skips_a_copy_already_at_the_target_commit(self):
+        # A pinned copy already at the target commit is left as it is, not rewritten.
+        flow_init.copy_skill("to-spec", self.folder, flow_init.MATT_POCOCK_COMMIT)
+        os.makedirs(os.path.join(self.folder, "openspec"))
+        self._patch(flow_init, "SKILLS", ["to-spec"])
+        report = flow_init.init(self.folder, update=True, confirm=lambda name: True)
+        self.assertEqual(report["skills"], {"to-spec": "repo"})
+        self.assertIsNone(report["pr"])  # nothing changed, so no branch
+
+    # ---- safe git handling ------------------------------------------------------------------
+
+    def test_an_existing_init_branch_is_refused_not_reset(self):
+        # A branch left from an earlier run must not be reset (its history is the person's).
+        git(self.folder, "branch", flow_init.INIT_BRANCH)
+        before = git(self.folder, "rev-parse", flow_init.INIT_BRANCH)
+        self._patch(flow_init, "SKILLS", ["to-spec"])
+        with self.assertRaises(flow_init.Fail):
+            flow_init.init(self.folder, confirm=lambda name: True)
+        self.assertEqual(git(self.folder, "rev-parse", flow_init.INIT_BRANCH), before)
+
+    def test_unrelated_staged_work_is_not_committed(self):
+        # Something already staged in the worktree must stay out of the flow init commit.
+        with open(os.path.join(self.folder, "README.md"), "w") as f:
+            f.write("an unrelated edit\n")
+        git(self.folder, "add", "README.md")
+        self._patch(flow_init, "SKILLS", ["to-spec"])
+        report = flow_init.init(self.folder, confirm=lambda name: True)
+        committed = git(self.folder, "show", "--name-only", "--format=", "HEAD").splitlines()
+        self.assertIn(".claude/skills/to-spec/SKILL.md", committed)
+        self.assertNotIn("README.md", committed)
+        self.assertEqual(report["pr"], flow_init.INIT_BRANCH)
+
+    def test_a_commit_error_raises_rather_than_reporting_success(self):
+        # A git failure (a hook, a missing identity) must not be reported as ok with no branch.
+        self._patch(flow_init, "SKILLS", ["to-spec"])
+        real_git = flow_init.base.git
+
+        def failing(cwd, *args):
+            if "commit" in args:
+                return False, "", "fatal: could not write commit"
+            return real_git(cwd, *args)
+
+        self._patch(flow_init.base, "git", failing)
+        with self.assertRaises(flow_init.Fail):
+            flow_init.init(self.folder, confirm=lambda name: True)
+
+    # ---- the command entry ------------------------------------------------------------------
+
+    def test_cmd_flow_init_prints_one_json_object_with_a_missing_skill(self):
+        import contextlib
+        import io
+        import types
+        self._patch(flow_init, "SKILLS", ["to-spec"])  # missing at both levels
+        args = types.SimpleNamespace(folder=self.folder, json=True, update=False)
+        out = io.StringIO()
+        self._patch(sys, "stdin", io.StringIO(""))  # default confirm reads stdin: EOF is a no
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            flow_init.cmd_flow_init(args)
+        report = json.loads(out.getvalue())  # one clean JSON object, no prompt mixed in
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["skills"], {"to-spec": "skipped"})
+
     # ---- the report shape -------------------------------------------------------------------
 
     def test_report_has_the_contract_shape(self):
