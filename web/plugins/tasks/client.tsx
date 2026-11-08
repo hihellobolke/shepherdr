@@ -587,15 +587,20 @@ function TaskList(_: { placeId: string }) {
     )
   }
   // OpenSpec flow (proposal section 6.17): group each folder's Features, their child Tasks nested under one summary row.
-  // Scope the Features to the view first (by folder and machine, groups.ts featureChildren; a Feature id repeats across
-  // stores): a Feature belongs here when the view holds any of its Tasks, archived ones included. So a Feature stays
-  // visible with its Merge feature action even after its children are all done and archived, and a Feature from another
-  // space or machine never shows, not even when its ref matches a search. In view, every scoped Feature shows; searching,
-  // only those the search matches (by the Feature or a child). Its children are pulled out of the status, space and
-  // machine groups below (baseSnap), but a pinned or needs-you child stays cross-cutting in Pinned and Needs you, so no
-  // Task shows twice. A classic space has no Features, so feats is empty and the list is unchanged.
+  // Scope the Features to the view first, by their own folder and machine: a Feature belongs here when one of the view's
+  // spaces is its own (same machine, same folder), or when the view still holds one of its Tasks (groups.ts
+  // featureChildren, archived ones included). So a Feature stays visible with its Merge feature action even once its
+  // children are all done - including after the service drops week-old Done Tasks from the snapshot - and a Feature from
+  // another space or machine never shows, not even when its ref matches a search. In view, every scoped Feature shows;
+  // searching, only those the search matches (by the Feature or a child). Its children are then pulled out of the status,
+  // space and machine groups below (baseSnap), but a pinned or needs-you child stays cross-cutting in Pinned and Needs
+  // you, so no Task shows twice. A classic space has no Features, so feats is empty and the list is unchanged.
   const inView = snap.tasks.filter((t) => inList(snap, view.chips, t.place))
-  const scopedFeatures = (snap.features ?? []).filter((f) => featureChildren(f, inView, snap.host).length > 0)
+  const viewPlaces = snap.places.filter((p) => inList(snap, view.chips, p.id))
+  const inScope = (f: Feature) =>
+    viewPlaces.some((p) => p.machine === (f.machine ?? snap.host) && p.store?.folder === f.folder) ||
+    featureChildren(f, inView, snap.host).length > 0
+  const scopedFeatures = (snap.features ?? []).filter(inScope)
   const feats = featureGroups(scopedFeatures, live, snap.host, (f) => (q ? matches(q, f.ref, f.title, f.phaseLabel) : true))
   const underFeature = new Set(feats.flatMap((g) => g.tasks.map((t) => t.id)))
   // a Feature heading names its machine and space only as far as more than one shown Feature contributes each
