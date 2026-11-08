@@ -20,6 +20,14 @@ import flowfakes
 from flowfakes import FlowFakes
 
 
+def read_jsonl(path):
+    """The JSON objects in a `.jsonl` file (empty list when it does not exist yet)."""
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(ln) for ln in f if ln.strip()]
+
+
 def git(cwd, *args, check=True):
     # The same isolated git identity the harness uses, so the tests need no global git config.
     env = {**os.environ, **flowfakes._GIT_ENV}
@@ -69,9 +77,16 @@ class Environment(Base):
             found = shutil.which(tool, path=self.env["PATH"])
             self.assertEqual(found, os.path.join(self.fakes.bin_dir, tool))
 
-    def test_home_store_and_settings_point_into_the_scratch_root(self):
-        for key in ("HOME", "HERDR_TASK_STORE", "HERDR_TASK_SETTINGS", "FLOWFAKES_STATE"):
+    def test_store_settings_and_state_point_into_the_scratch_root(self):
+        for key in ("HERDR_TASK_STORE", "HERDR_TASK_SETTINGS", "FLOWFAKES_STATE"):
             self.assertTrue(self.env[key].startswith(self.root), f"{key}={self.env[key]}")
+
+    def test_env_keeps_the_real_home_so_the_guard_lets_hc_run(self):
+        # base.guard refuses hc when HOME is not the account's own, before it even resolves the fake
+        # on PATH. So env() must not change HOME; isolation is through the redirected store/settings.
+        self.assertEqual(self.env["HOME"], os.environ["HOME"])
+        # An explicit home= is honoured, for tests that drive the fakes on their own.
+        self.assertEqual(self.fakes.env(home="/tmp/x")["HOME"], "/tmp/x")
 
     def test_the_remote_and_the_home_clone_exist_with_a_first_commit(self):
         self.assertTrue(os.path.isdir(os.path.join(self.fakes.origin, "refs")))  # a bare repo
@@ -147,6 +162,25 @@ class GhPullRequests(Base):
     def test_view_of_a_missing_pull_request_fails(self):
         r = self.gh("pr", "view", "99", "--repo", "octo/demo", "--json", "state")
         self.assertEqual(r.returncode, 1)
+
+    def test_an_open_pr_head_sha_follows_a_later_push(self):
+        path = self.branch("task/HAT-14-x")
+        self.fakes.open_pr("task/HAT-14-x")
+        # The child pushes a correction (as after a rebase).
+        with open(os.path.join(path, "fix.txt"), "w") as f:
+            f.write("fix\n")
+        git(path, "add", "fix.txt")
+        git(path, "commit", "-q", "-m", "fix")
+        git(path, "push", "-q", "--force-with-lease", "origin", "task/HAT-14-x")
+        new_tip = self.fakes.base_sha("task/HAT-14-x")
+        r = self.gh("pr", "view", "1", "--repo", "octo/demo", "--json", "headRefOid")
+        self.assertEqual(json.loads(r.stdout)["headRefOid"], new_tip)
+        # On merge the head is frozen at the merged tip.
+        self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash")
+        r = self.gh("pr", "view", "1", "--repo", "octo/demo", "--json", "headRefOid,state")
+        data = json.loads(r.stdout)
+        self.assertEqual(data["state"], "MERGED")
+        self.assertEqual(data["headRefOid"], new_tip)
 
 
 # ---- gh: squash merge into the bare remote ----------------------------------------------------
@@ -258,9 +292,7 @@ class ChildAgent(Base):
         # It pushed the branch to the origin.
         self.assertTrue(self.fakes.base_sha("task/HAT-20-p"))
         # It ran `herdr-task ready HAT-20`.
-        with open(log) as f:
-            calls = [json.loads(ln) for ln in f if ln.strip()]
-        self.assertEqual(calls, [["ready", "HAT-20", "--folder", self.fakes.home_repo, "--json"]])
+        self.assertEqual(read_jsonl(log), [["ready", "HAT-20", "--folder", self.fakes.home_repo, "--json"]])
 
     def test_a_failed_child_exits_nonzero_and_never_runs_ready(self):
         log = FakeHerdrTask.install(self.fakes)
@@ -273,10 +305,23 @@ class ChildAgent(Base):
         self.assertIn("child failed", res.stderr)
         self.assertFalse(os.path.exists(log))  # ready was never reached
 
-    def test_a_risky_child_is_recorded_as_risky(self):
-        self.fakes.script_agent("r22", risky=True, ready=False)
-        state = flowfakes._read_state(self.fakes.state_dir)
-        self.assertTrue(state["agents"]["r22"]["risky"])
+    def test_a_risky_child_does_its_work_but_waits_for_an_accept(self):
+        wt = os.path.join(self.root, "wt-r")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-22-risky", wt, "main")
+        self.fakes.script_agent("r22", risky=True, ready=False, owns="risky.txt")
+        res = self.fakes.run_agent("r22", worktree=wt, branch="task/HAT-22-risky", ref="HAT-22")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # It committed and pushed, like any child, but is recorded as awaiting the person's Accept.
+        self.assertTrue(self.fakes.base_sha("task/HAT-22-risky"))
+        ran = self.fakes.ran("r22")
+        self.assertTrue(ran["risky"])
+        self.assertTrue(ran["awaiting_accept"])
+        # A non-risky child is not awaiting an accept.
+        wt2 = os.path.join(self.root, "wt-n")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-24-plain", wt2, "main")
+        self.fakes.script_agent("n24", ready=False, owns="plain.txt")
+        self.fakes.run_agent("n24", worktree=wt2, branch="task/HAT-24-plain", ref="HAT-24")
+        self.assertFalse(self.fakes.ran("n24")["awaiting_accept"])
 
     def test_an_unscripted_agent_uses_the_default_behaviour(self):
         FakeHerdrTask.install(self.fakes)
@@ -289,6 +334,16 @@ class ChildAgent(Base):
 
 
 # ---- hc run: starting the agent ---------------------------------------------------------------
+
+class BranchRef(unittest.TestCase):
+    def test_child_ref_is_the_last_ref_token_in_the_branch(self):
+        # A child branch carries the feature ref then the child ref (C5); the child is the last one.
+        self.assertEqual(flowfakes.ref_from_branch("task/HAT-12-HAT-14-parser"), "HAT-14")
+        # A classic task branch and a feature branch have a single ref.
+        self.assertEqual(flowfakes.ref_from_branch("task/HAT-14-title"), "HAT-14")
+        self.assertEqual(flowfakes.ref_from_branch("feature/HAT-12-login-flow"), "HAT-12")
+        self.assertEqual(flowfakes.ref_from_branch("no-ref-here"), "no-ref-here")
+
 
 class HcRun(Base):
     def wait_for(self, predicate, timeout=10):
@@ -312,6 +367,16 @@ class HcRun(Base):
         self.assertTrue(self.wait_for(lambda: self.fakes.base_sha("task/HAT-40-p") is not None),
                         "the agent never pushed its branch")
         self.assertIn("forty.txt", git(wt, "show", "--name-only", "--format=", "HEAD"))
+
+    def test_hc_run_readies_the_child_ref_from_a_feature_child_branch(self):
+        log = FakeHerdrTask.install(self.fakes)
+        wt = os.path.join(self.root, "wt-fc")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-12-HAT-14-parser", wt, "main")
+        self.hc("run", "--bg", "--json", "--keep", "--cwd", wt, "--name", "child-14",
+                "--no-parent", "--", "env", "claude")
+        self.assertTrue(self.wait_for(lambda: bool(read_jsonl(log))), "the agent never ran ready")
+        # ready is run for the child ref HAT-14, not the feature ref HAT-12.
+        self.assertEqual(read_jsonl(log)[0][:2], ["ready", "HAT-14"])
 
 
 # ---- a second machine -------------------------------------------------------------------------
@@ -344,6 +409,28 @@ class SecondMachine(Base):
         self.assertTrue(os.path.isfile(dest))
         with open(dest) as f:
             self.assertEqual(f.read(), "payload")
+
+    def test_file_write_carries_binary_bytes_intact(self):
+        # cli.remote_run sends the binary herdr-task zipapp (a PK zip header, non-UTF-8 bytes).
+        m = self.fakes.add_machine("vm-b")
+        payload = b"PK\x03\x04\x00\xfb\x01binary zipapp\x80\x81"
+        r = subprocess.run([os.path.join(self.fakes.bin_dir, "hc"), "file", "write", "--on", "vm-b",
+                            ".local/bin/herdr-task"], env=self.env, input=payload,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(os.path.join(m["home"], ".local/bin/herdr-task"), "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_file_write_refuses_a_path_that_escapes_the_machine_home(self):
+        m = self.fakes.add_machine("vm-b")
+        outside = os.path.join(self.root, "escaped.txt")
+        for target in ("/" + outside.lstrip("/"), "../../../../../../.." + outside):
+            r = self.hc("file", "write", "--on", "vm-b", target, stdin="nope")
+            self.assertEqual(r.returncode, 1, target)
+            self.assertIn("refusing", r.stderr)
+        self.assertFalse(os.path.exists(outside))
+        # Nothing landed outside the machine home.
+        self.assertTrue(m["home"].startswith(self.root))
 
     def test_exec_reaches_a_real_herdr_task_on_the_machine_store(self):
         """The AutomationFromAnotherMachine pattern: a command sent with `hc exec --on` runs against

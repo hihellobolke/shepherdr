@@ -29,6 +29,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,7 +51,7 @@ _GIT_ENV = {
 
 # A child agent's default behaviour when a test does not script one for its name.
 DEFAULT_AGENT = {"commit": True, "ready": True, "fail": False, "conflict": False, "risky": False,
-                 "owns": None, "message": None}
+                 "owns": None, "message": None, "ref": None}
 
 
 def _state_dir():
@@ -63,7 +64,8 @@ def _state_dir():
 @contextlib.contextmanager
 def _locked(state_dir):
     """The state file, open for read-modify-write under an exclusive lock. Yields the loaded dict;
-    whatever it holds on exit is written back."""
+    whatever it holds on exit is written back with an atomic replace, so a concurrent lock-free
+    reader (a background agent, a pull-request query) never sees a half-written file."""
     lock = os.path.join(state_dir, "lock")
     path = os.path.join(state_dir, "state.json")
     with open(lock, "w") as lf:
@@ -72,11 +74,21 @@ def _locked(state_dir):
             state = json.load(f)
         box = {"state": state}
         yield box
-        with open(path, "w") as f:
-            json.dump(box["state"], f, indent=2, sort_keys=True)
+        _write_state(state_dir, box["state"])
+
+
+def _write_state(state_dir, state):
+    """Replace the state file atomically (write a sibling temp, then `os.replace`)."""
+    path = os.path.join(state_dir, "state.json")
+    tmp = path + f".{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
 
 
 def _read_state(state_dir):
+    # No lock: writers replace the file atomically, so a read sees either the whole old or the whole
+    # new state, never a torn one.
     with open(os.path.join(state_dir, "state.json")) as f:
         return json.load(f)
 
@@ -154,6 +166,7 @@ class FlowFakes:
             "default_check": "SUCCESS",
             "machines": {},
             "agents": {},
+            "ran": {},
         }
         with open(os.path.join(self.state_dir, "state.json"), "w") as f:
             json.dump(state, f, indent=2, sort_keys=True)
@@ -192,16 +205,23 @@ class FlowFakes:
 
     def env(self, extra=None, *, home=None, store=None, settings=None):
         """The environment a test runs `herdr-task` or `git` under: the fakes first on `PATH`,
-        `HERDR_TASK_GH` at the fake `gh`, `FLOWFAKES_STATE` at the state directory, and a scratch
-        `HOME`, store and settings so nothing touches the real ones."""
-        home = home or self.home
+        `HERDR_TASK_GH` at the fake `gh`, `FLOWFAKES_STATE` at the state directory, and the store and
+        settings redirected into the scratch root so nothing touches the real ones.
+
+        `HOME` is left as the real one by default, on purpose: `base.guard` refuses every `hc` call
+        when `HOME` is not the account's own (it checks the environment before it even resolves the
+        fake on `PATH`), so a changed `HOME` would stop the real `herdr-task` from running `hc` at
+        all. Isolation comes from the redirected store, settings and `HERDR_TASK_GH` and from the
+        fakes being `hc` and `gh`, not from a changed `HOME`. Pass `home=` only to test the fakes
+        themselves in isolation (they read `FLOWFAKES_STATE`, never `HOME`)."""
         env = dict(os.environ)
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         env["HERDR_TASK_GH"] = os.path.join(self.bin_dir, "gh")
         env["FLOWFAKES_STATE"] = self.state_dir
-        env["HOME"] = home
-        env["HERDR_TASK_STORE"] = store or os.path.join(home, ".herdr", "tasks")
-        env["HERDR_TASK_SETTINGS"] = settings or os.path.join(home, ".herdr", "shepherdr.json")
+        if home is not None:
+            env["HOME"] = home
+        env["HERDR_TASK_STORE"] = store or os.path.join(self.root, "store")
+        env["HERDR_TASK_SETTINGS"] = settings or os.path.join(self.root, "shepherdr.json")
         env.update(_GIT_ENV)  # a git identity and no global/system config, so git stays isolated too
         if extra:
             env.update(extra)
@@ -291,7 +311,7 @@ class FlowFakes:
     # -- fake child agents --
 
     def script_agent(self, key, *, commit=True, ready=True, fail=False, conflict=False,
-                     risky=False, owns=None, message=None):
+                     risky=False, owns=None, message=None, ref=None):
         """Script what the child agent named `key` (the `hc run --name`) does when it is started.
 
         - `commit`: make a commit on the task branch touching an owned path (default on).
@@ -299,16 +319,24 @@ class FlowFakes:
         - `fail`: the child fails (no ready; the run exits non-zero): the failed-child scenario.
         - `conflict`: write content that conflicts with the base branch: the forced-conflict
           scenario at merge time.
-        - `risky`: mark the child risky (a high-risk Task shows its Accept card): recorded so a
-          test can assert the agent was treated as risky.
+        - `risky`: the child is a Risky Task. The real flow gives a high-risk Task `merge=ask`, so
+          it must not merge on its own: the agent does its work and runs `ready`, but it does not ask
+          for a merge and records that it is awaiting the person's Accept (`ran()` reads it). The E2E
+          sets `--risk high` at fan-out and then simulates the Accept with an explicit merge.
         - `owns`: the path(s) the commit touches (default `<key>.txt`).
         - `message`: the commit message (default `"<key> work"`).
+        - `ref`: the ref the agent uses for `ready`, when the `hc run` branch does not carry it.
         """
         rec = {"commit": commit, "ready": ready, "fail": fail, "conflict": conflict, "risky": risky,
-               "owns": [owns] if isinstance(owns, str) else owns, "message": message}
+               "owns": [owns] if isinstance(owns, str) else owns, "message": message, "ref": ref}
         with _locked(self.state_dir) as box:
             box["state"]["agents"][key] = rec
         return rec
+
+    def ran(self, key):
+        """What the agent named `key` did when it last ran: `{ref, risky, awaiting_accept, ready}`,
+        or `None` if it has not run. A risky child records `awaiting_accept` true."""
+        return _read_state(self.state_dir).get("ran", {}).get(key)
 
     def run_agent(self, key, *, worktree, branch, ref, base=None, folder=None, wait=True, env=None):
         """Start the child agent `key` directly (what the fake `hc run` does for it), for a test
@@ -369,6 +397,15 @@ def _rollup(pr):
     if c == "PENDING":
         return [{"__typename": "CheckRun", "name": "check", "status": "IN_PROGRESS", "conclusion": ""}]
     return [{"__typename": "CheckRun", "name": "check", "status": "COMPLETED", "conclusion": c}]
+
+
+def _live_head(state, pr):
+    """A pull request with its head sha refreshed from the remote while it is open, so a child that
+    rebased or pushed corrections after the pull request opened is reflected (what `gh pr view`
+    returns live). A merged pull request keeps the head sha frozen at the moment it merged."""
+    if pr["state"] == "OPEN":
+        return {**pr, "headRefOid": _sha(state["origin"], pr["head"]) or pr["headRefOid"]}
+    return pr
 
 
 def _pr_json(pr, fields):
@@ -505,6 +542,7 @@ def _gh_pr_list(state_dir, argv):
             continue
         if want != "ALL" and pr["state"] != want:
             continue
+        pr = _live_head(state, pr)
         rows.append(_pr_json(pr, fields) if fields else {"number": pr["number"]})
     print(json.dumps(rows))
     return 0
@@ -519,6 +557,7 @@ def _gh_pr_view(state_dir, argv):
     except RuntimeError:
         sys.stderr.write(f"no pull request found for {number}\n")
         return 1
+    pr = _live_head(state, pr)
     fields = (flags.get("--json") or "").split(",") if flags.get("--json") else []
     data = _pr_json(pr, fields) if fields else pr
     q = flags.get("-q") or flags.get("--jq")
@@ -558,6 +597,7 @@ def _gh_pr_merge(state_dir, argv):
         if pr.get("mergeable") == "CONFLICTING":
             sys.stderr.write(f"Pull request #{number} is not mergeable: the merge commit cannot be cleanly created\n")
             return 1
+        merged_head = _sha(state["origin"], pr["head"]) or pr["headRefOid"]
         ok, merge_commit, conflicted = _squash_merge(state, pr)
         if not ok:
             pr["mergeable"] = "CONFLICTING"
@@ -565,6 +605,7 @@ def _gh_pr_merge(state_dir, argv):
             return 1
         pr["state"] = "MERGED"
         pr["mergeCommit"] = merge_commit
+        pr["headRefOid"] = merged_head  # freeze the head that was merged, so later queries are stable
     print(f"Merged pull request #{number} ({merge_commit[:7]})")
     return 0
 
@@ -644,7 +685,7 @@ def _hc_run(state_dir, argv):
         bare=("--bg", "--json", "--keep", "--no-parent", "--outlive-parent"))
     name = flags.get("--name") or "agent"
     cwd = flags.get("--cwd") or os.getcwd()
-    ref, branch, base, folder = _agent_target(after, cwd, state_dir)
+    ref, branch, base, folder = _agent_target(cwd, state_dir, name)
     args = [sys.executable, "-I", SELF, "agent", name, "--worktree", cwd, "--branch", branch,
             "--ref", ref, "--base", base, "--folder", folder]
     subprocess.Popen(args, env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -654,26 +695,41 @@ def _hc_run(state_dir, argv):
     return 0
 
 
-def _agent_target(after, cwd, state_dir):
-    """Work out the ref, branch, base and folder for the agent the run starts. The ref and base
-    come from the worktree's git branch; a test that needs exact values scripts them or uses
-    `run_agent` directly."""
+REF_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
+
+
+def ref_from_branch(branch):
+    """The child ref encoded in a branch name. A child branch carries the feature ref and then the
+    child ref (`task/HAT-12-HAT-14-parser`, C5), so the child is the last ref-like token, not the
+    first; a classic branch (`task/HAT-14-title`) and a feature branch (`feature/HAT-12-login`)
+    have one, so the last is also the right one. Returns the branch unchanged when it holds none."""
+    tokens = REF_TOKEN.findall(branch)
+    return tokens[-1] if tokens else branch
+
+
+def _agent_target(cwd, state_dir, name):
+    """Work out the ref, branch, base and folder for the agent the run starts. A test that scripts
+    the agent by `name` with an explicit `ref` gets exactly that; otherwise the ref is read from the
+    worktree's branch (the child ref, C5), which is what `herdr-task ready` needs."""
     branch = "HEAD"
     r = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD", check=False)
     if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != "HEAD":
         branch = r.stdout.strip()
-    base = _read_state(state_dir)["default_branch"]
-    # The ref is the last path element of the branch when it looks like task/<REF>-...; else the name.
-    ref = branch
-    parts = branch.split("/")[-1].split("-")
-    if len(parts) >= 2:
-        ref = "-".join(parts[:2])
+    state = _read_state(state_dir)
+    base = state["default_branch"]
+    scripted = (state["agents"].get(name) or {}).get("ref")
+    ref = scripted or ref_from_branch(branch)
     return ref, branch, base, cwd
 
 
 def _hc_exec(state_dir, argv):
-    """`hc exec --on <machine> [--timeout T] -- <cmd...>`: run the command in the machine's own
-    environment (its store and home), or answer connection refused when the machine is down."""
+    """`hc exec --on <machine> [--timeout T] -- <cmd...>`: run the command as if on that machine, or
+    answer connection refused when the machine is down.
+
+    The command runs with the machine's own `HOME`, working directory, store and settings, all inside
+    the scratch directory, so a relative path a remote command inspects, chmods or writes
+    (`cli.remote_run` does `test -d .config/...`, `chmod`, and the install lands under the home) stays
+    on that simulated machine and never on the real one."""
     flags, _, after = _parse_flags(argv, {"--on", "--timeout"}, bare=("--stdin", "--observe"))
     machine = flags.get("--on")
     state = _read_state(state_dir)
@@ -682,11 +738,13 @@ def _hc_exec(state_dir, argv):
         if rec.get("down"):
             sys.stderr.write(f"hc: {machine}: connection refused\n")
             return 1
+        home = rec["home"]
         env = dict(os.environ)
+        env["HOME"] = home
         env["HERDR_TASK_STORE"] = rec["store"]
-        env["HERDR_TASK_SETTINGS"] = os.path.join(rec["home"], ".herdr", "shepherdr.json")
+        env["HERDR_TASK_SETTINGS"] = os.path.join(home, ".herdr", "shepherdr.json")
         stdin = sys.stdin.read() if flags.get("--stdin") else None
-        r = subprocess.run(after, env=env, input=stdin, stdout=subprocess.PIPE,
+        r = subprocess.run(after, env=env, cwd=home, input=stdin, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True)
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
@@ -701,20 +759,29 @@ def _hc_exec(state_dir, argv):
 
 
 def _hc_file(state_dir, argv):
-    """`hc file write --on <machine> <target>`: write stdin to the target under the machine's home
-    (never an absolute real path)."""
+    """`hc file write --on <machine> <target>`: write stdin to the target under the machine's home.
+
+    The target is always resolved under that machine's scratch home, and a target that would escape
+    it (an absolute path, a `..` climb, a symlink out) is refused: a fake must never write outside
+    the scratch directory. The body is copied as bytes, so the real binary `herdr-task` zipapp
+    (`base.bundle`, sent by `cli.remote_run`) transfers intact."""
     if not argv or argv[0] != "write":
         return 0
     flags, pos, _ = _parse_flags(argv[1:], {"--on"})
     machine = flags.get("--on")
     target = pos[0] if pos else None
-    body = sys.stdin.read()
+    body = sys.stdin.buffer.read()
     state = _read_state(state_dir)
     if machine and machine in state["machines"] and target:
-        home = state["machines"][machine]["home"]
-        dest = target if os.path.isabs(target) else os.path.join(home, target)
+        home = os.path.realpath(state["machines"][machine]["home"])
+        dest = os.path.realpath(os.path.join(home, target))
+        # A target is a relative path under the machine home (cli.remote_run writes
+        # `.local/bin/herdr-task`). Refuse an absolute path or one that climbs or links out.
+        if os.path.isabs(target) or (dest != home and not dest.startswith(home + os.sep)):
+            sys.stderr.write(f"hc file write: refusing a path outside {machine}: {target}\n")
+            return 1
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "w") as f:
+        with open(dest, "wb") as f:
             f.write(body)
     return 0
 
@@ -747,18 +814,37 @@ def _fake_agent(argv):
     base = flags.get("--base") or state["default_branch"]
     folder = flags.get("--folder")
 
+    risky = bool(script.get("risky"))
     if script.get("commit") and wt:
         _agent_commit(wt, branch, base, ref, key, script)
     if script.get("fail"):
+        _mark_ran(state_dir, key, ref, risky=risky, ready=False, awaiting_accept=False, failed=True)
         sys.stderr.write(f"{ref}: child failed\n")
         return 1
+    rc = 0
     if script.get("ready") and folder:
+        # A child reports done the same way whether or not it is risky. A Risky Task's merge waits
+        # for the person because its Task carries merge=ask (set at fan-out with --risk high, in the
+        # flow's own code); the agent does not gate the merge itself. The harness records that a risky
+        # child is awaiting the person's Accept (observable through `ran`).
         r = subprocess.run(["herdr-task", "ready", ref, "--folder", folder, "--json"],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
-        return r.returncode
-    return 0
+        rc = r.returncode
+    _mark_ran(state_dir, key, ref, risky=risky, ready=bool(script.get("ready")),
+              awaiting_accept=risky, failed=False)
+    return rc
+
+
+def _mark_ran(state_dir, key, ref, *, risky, ready, awaiting_accept, failed):
+    """Record what the agent did, so a test can observe the outcome (the risky child awaiting an
+    Accept, the failed child, the normal child)."""
+    with _locked(state_dir) as box:
+        box["state"].setdefault("ran", {})[key] = {
+            "ref": ref, "risky": risky, "ready": ready,
+            "awaiting_accept": awaiting_accept, "failed": failed,
+        }
 
 
 def _agent_commit(wt, branch, base, ref, key, script):
