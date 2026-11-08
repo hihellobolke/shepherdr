@@ -29,34 +29,46 @@ sys.dont_write_bytecode = True
 
 from herdr_task import feature  # noqa: E402
 from herdr_task import store as store_mod  # noqa: E402
+from herdr_task import settings as settings_mod  # noqa: E402
+from herdr_task import base as base_mod  # noqa: E402
 from herdr_task.store import Store, locate  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
 
 # A throwaway STORE and settings file, plus an empty git-config, kept for the lifetime of this
 # module's tests and torn down after, so the real ones are never read or written and nothing leaks
-# into later test files. Each test also patches store_mod.STORE to its own throwaway dir.
-_ENV_PATCH = None
+# into later test files. STORE and SETTINGS are cached from the env at import (base.py, settings.py),
+# before setUpModule runs, so the module attributes are patched directly as well as the env (the env
+# still matters for any git or subprocess call). Each test also re-patches store_mod.STORE in setUp.
+_PATCHES = []
 _GITCONFIG = None
 
 
 def setUpModule():
-    global _ENV_PATCH, _GITCONFIG
+    global _PATCHES, _GITCONFIG
     _fd, _GITCONFIG = tempfile.mkstemp(prefix="herdr-feature-gitconfig-")
     os.close(_fd)
-    _ENV_PATCH = mock.patch.dict(os.environ, {
-        "HERDR_TASK_STORE": tempfile.mkdtemp(prefix="herdr-feature-store-import-"),
-        "HERDR_TASK_SETTINGS": os.path.join(
-            tempfile.mkdtemp(prefix="herdr-feature-settings-"), "shepherdr.json"),
-        # Isolate every git call from the user's global and system config (hooks, signing, fsmonitor).
-        "GIT_CONFIG_GLOBAL": _GITCONFIG,
-        "GIT_CONFIG_SYSTEM": os.devnull,
-    })
-    _ENV_PATCH.start()
+    store_dir = tempfile.mkdtemp(prefix="herdr-feature-store-import-")
+    settings_file = os.path.join(tempfile.mkdtemp(prefix="herdr-feature-settings-"), "shepherdr.json")
+    _PATCHES = [
+        mock.patch.dict(os.environ, {
+            "HERDR_TASK_STORE": store_dir,
+            "HERDR_TASK_SETTINGS": settings_file,
+            # Isolate every git call from the user's global and system config (hooks, signing, fsmonitor).
+            "GIT_CONFIG_GLOBAL": _GITCONFIG,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }),
+        mock.patch.object(settings_mod, "SETTINGS", settings_file),
+        mock.patch.object(store_mod, "STORE", store_dir),
+        mock.patch.object(base_mod, "STORE", store_dir),
+    ]
+    for p in _PATCHES:
+        p.start()
 
 
 def tearDownModule():
-    if _ENV_PATCH is not None:
-        _ENV_PATCH.stop()
+    for p in reversed(_PATCHES):
+        p.stop()
+    _PATCHES.clear()
     if _GITCONFIG and os.path.exists(_GITCONFIG):
         os.unlink(_GITCONFIG)
 
