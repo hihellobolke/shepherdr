@@ -88,6 +88,25 @@ class Environment(Base):
         # An explicit home= is honoured, for tests that drive the fakes on their own.
         self.assertEqual(self.fakes.env(home="/tmp/x")["HOME"], "/tmp/x")
 
+    def test_env_redirects_worktrees_under_the_scratch_root(self):
+        self.assertTrue(self.env["HERDR_TASK_WORKTREES"].startswith(self.root))
+
+    def test_base_honours_the_worktrees_override_so_worktrees_stay_off_the_real_home(self):
+        # base.WORKTREES must read HERDR_TASK_WORKTREES, so a real herdr-task's worktrees land in the
+        # scratch root, never the real ~/.herdr/worktrees (HOME stays real for base.guard).
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "mods", "tasks", "bin")
+        code = ("import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]);"
+                "import herdr_task.base as b; print(b.WORKTREES)")
+        with_override = subprocess.run([sys.executable, "-c", code, bin_dir], env=self.env,
+                                       capture_output=True, text=True)
+        self.assertEqual(with_override.stdout.strip(), self.env["HERDR_TASK_WORKTREES"])
+        # Without the override it falls back to the real path, so the default behaviour is unchanged.
+        plain = {k: v for k, v in self.env.items() if k != "HERDR_TASK_WORKTREES"}
+        fallback = subprocess.run([sys.executable, "-c", code, bin_dir], env=plain,
+                                  capture_output=True, text=True)
+        self.assertTrue(fallback.stdout.strip().endswith(os.path.join(".herdr", "worktrees")))
+
     def test_the_remote_and_the_home_clone_exist_with_a_first_commit(self):
         self.assertTrue(os.path.isdir(os.path.join(self.fakes.origin, "refs")))  # a bare repo
         self.assertEqual(git(self.fakes.home_repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
@@ -204,6 +223,28 @@ class SquashMerge(Base):
         # The head branch on the remote is untouched by the squash (its own commits stay).
         self.assertEqual(self.fakes.base_sha("task/HAT-14-x"), before_branch)
 
+    def test_merge_refuses_a_stale_match_head_commit(self):
+        # github.cmd merges with --match-head-commit <sha> (the head it last saw); GitHub refuses when
+        # the branch has moved since.
+        path = self.branch("task/HAT-14-x")
+        old_head = self.fakes.base_sha("task/HAT-14-x")
+        self.fakes.open_pr("task/HAT-14-x")
+        # The child pushes another commit, so the head moves.
+        with open(os.path.join(path, "more.txt"), "w") as f:
+            f.write("more\n")
+        git(path, "add", "more.txt")
+        git(path, "commit", "-q", "-m", "more")
+        git(path, "push", "-q", "origin", "task/HAT-14-x")
+        r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash", "--match-head-commit", old_head)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("head has changed", r.stderr)
+        self.assertEqual(self.fakes.find_pr(number=1)["state"], "OPEN")
+        # With the current head it merges.
+        new_head = self.fakes.base_sha("task/HAT-14-x")
+        r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash", "--match-head-commit", new_head)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.fakes.find_pr(number=1)["state"], "MERGED")
+
     def test_a_merged_pull_request_shows_in_the_merged_list(self):
         self.branch("task/HAT-14-x")
         self.fakes.open_pr("task/HAT-14-x")
@@ -250,13 +291,39 @@ class ForcedConflict(Base):
         self.assertEqual(pr["state"], "OPEN")  # not merged
         self.assertEqual(self.fakes.base_sha(), base_before)  # the base is untouched
 
-    def test_a_conflicting_flag_can_be_set_directly(self):
+    def test_a_scripted_conflicting_flag_is_sticky(self):
         self.branch("task/HAT-30-c")
         self.fakes.open_pr("task/HAT-30-c")
         self.fakes.set_mergeable(1, "CONFLICTING")
+        # A scripted conflict refuses every attempt (it does not retry the git merge).
+        for _ in range(2):
+            r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash")
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(self.fakes.find_pr(number=1)["state"], "OPEN")
+
+    def test_a_detected_conflict_recovers_once_the_head_is_resolved(self):
+        self.seed_shared("base line\n")
+        wt = os.path.join(self.root, "wt-c")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-30-c", wt, "main")
+        self.fakes.script_agent("c30", conflict=True, ready=False)
+        self.fakes.run_agent("c30", worktree=wt, branch="task/HAT-30-c", ref="HAT-30")
+        git(self.fakes.home_repo, "checkout", "-q", "main")
+        self.seed_shared("base changed differently\n")
+        self.fakes.open_pr("task/HAT-30-c")
+        # First merge hits a real git conflict.
         r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash")
         self.assertEqual(r.returncode, 1)
-        self.assertEqual(self.fakes.find_pr(number=1)["state"], "OPEN")
+        self.assertEqual(self.fakes.find_pr(number=1)["mergeable"], "CONFLICTING")
+        # The child resolves: it merges the base in and pushes, so the head no longer conflicts.
+        git(wt, "fetch", "-q", "origin", "main")
+        git(wt, "-c", "core.editor=true", "merge", "-q", "-X", "ours", "origin/main")
+        git(wt, "push", "-q", "--force-with-lease", "origin", "task/HAT-30-c")
+        # Now the merge of the resolved head goes through (the detected conflict was not sticky).
+        r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pr = self.fakes.find_pr(number=1)
+        self.assertEqual(pr["state"], "MERGED")
+        self.assertEqual(pr["mergeable"], "MERGEABLE")
 
 
 # ---- the child agent --------------------------------------------------------------------------
@@ -439,6 +506,15 @@ class SecondMachine(Base):
         probe = ("import os, json; print(json.dumps({'store': os.environ['HERDR_TASK_STORE']}))")
         r = self.hc("exec", "--on", "vm-b", "--", sys.executable, "-c", probe)
         self.assertEqual(json.loads(r.stdout)["store"], m["store"])
+
+    def test_exec_keeps_the_real_home_but_runs_in_the_machine_dir(self):
+        # base.guard refuses hc under a changed HOME, so a remote herdr-task needs the real HOME; a
+        # remote command's relative paths are isolated by running in the machine's own directory.
+        m = self.fakes.add_machine("vm-b")
+        r = self.hc("exec", "--on", "vm-b", "--", "sh", "-c", "echo $HOME; pwd")
+        home, cwd = r.stdout.strip().splitlines()
+        self.assertEqual(os.path.realpath(home), os.path.realpath(os.environ["HOME"]))
+        self.assertEqual(os.path.realpath(cwd), os.path.realpath(m["home"]))
 
 
 # ---- the call log and isolation ---------------------------------------------------------------

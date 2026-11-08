@@ -213,7 +213,11 @@ class FlowFakes:
         fake on `PATH`), so a changed `HOME` would stop the real `herdr-task` from running `hc` at
         all. Isolation comes from the redirected store, settings and `HERDR_TASK_GH` and from the
         fakes being `hc` and `gh`, not from a changed `HOME`. Pass `home=` only to test the fakes
-        themselves in isolation (they read `FLOWFAKES_STATE`, never `HOME`)."""
+        themselves in isolation (they read `FLOWFAKES_STATE`, never `HOME`).
+
+        Worker Task worktrees are redirected with `HERDR_TASK_WORKTREES` (which `base.WORKTREES`
+        reads), so a Task the real `herdr-task` starts in worktree mode creates its worktree under
+        the scratch root, not the real `~/.herdr/worktrees`, even though `HOME` stays real."""
         env = dict(os.environ)
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         env["HERDR_TASK_GH"] = os.path.join(self.bin_dir, "gh")
@@ -222,6 +226,7 @@ class FlowFakes:
             env["HOME"] = home
         env["HERDR_TASK_STORE"] = store or os.path.join(self.root, "store")
         env["HERDR_TASK_SETTINGS"] = settings or os.path.join(self.root, "shepherdr.json")
+        env["HERDR_TASK_WORKTREES"] = os.path.join(self.root, "worktrees")  # base.WORKTREES reads this
         env.update(_GIT_ENV)  # a git identity and no global/system config, so git stays isolated too
         if extra:
             env.update(extra)
@@ -278,10 +283,14 @@ class FlowFakes:
             _pr_by_number(box["state"], number)["checks"] = conclusion
 
     def set_mergeable(self, number, value):
-        """Force a pull request's mergeable flag (`MERGEABLE`, `CONFLICTING`, `UNKNOWN`). A
-        `CONFLICTING` pull request is the forced-conflict scenario for the closing step."""
+        """Force a pull request's mergeable flag (`MERGEABLE`, `CONFLICTING`, `UNKNOWN`). A scripted
+        `CONFLICTING` is sticky: it refuses every merge until it is cleared, the forced-conflict
+        scenario for the closing step. (A conflict that the git merge itself hits is not sticky: a
+        later merge of a resolved head still goes through.)"""
         with _locked(self.state_dir) as box:
-            _pr_by_number(box["state"], number)["mergeable"] = value
+            pr = _pr_by_number(box["state"], number)
+            pr["mergeable"] = value
+            pr["force_conflict"] = value == "CONFLICTING"
 
     def base_sha(self, branch=None):
         return _sha(self.origin, branch or self.default_branch)
@@ -374,6 +383,7 @@ def _new_pr(state, head, base, title, body):
         "body": body,
         "state": "OPEN",
         "mergeable": "MERGEABLE",
+        "force_conflict": False,
         "headRefOid": _sha(state["origin"], head) or "",
         "mergeCommit": None,
         "checks": state.get("default_check", "SUCCESS"),
@@ -586,7 +596,8 @@ def _gh_pr_comment(state_dir, argv):
 
 def _gh_pr_merge(state_dir, argv):
     flags, pos, _ = _parse_flags(
-        argv, {"--repo"}, bare=("--squash", "--merge", "--rebase", "--delete-branch", "--auto"))
+        argv, {"--repo", "--match-head-commit"},
+        bare=("--squash", "--merge", "--rebase", "--delete-branch", "--auto"))
     number = next((p for p in pos if p.isdigit()), None)
     with _locked(state_dir) as box:
         state = box["state"]
@@ -594,18 +605,27 @@ def _gh_pr_merge(state_dir, argv):
         if pr["state"] == "MERGED":
             print(f"Pull request #{number} already merged")
             return 0
-        if pr.get("mergeable") == "CONFLICTING":
+        if pr.get("force_conflict"):
             sys.stderr.write(f"Pull request #{number} is not mergeable: the merge commit cannot be cleanly created\n")
             return 1
-        merged_head = _sha(state["origin"], pr["head"]) or pr["headRefOid"]
+        current_head = _sha(state["origin"], pr["head"]) or pr["headRefOid"]
+        want = flags.get("--match-head-commit")
+        # GitHub refuses the merge when the branch moved since the caller last saw it (the sha it
+        # passes no longer matches the tip); the caller re-reads and retries.
+        if want and want != current_head:
+            sys.stderr.write(f"Pull request #{number} head has changed: expected {want}, found {current_head}\n")
+            return 1
         ok, merge_commit, conflicted = _squash_merge(state, pr)
         if not ok:
+            # A conflict the git merge itself hits, not scripted: recorded for display, but not sticky,
+            # so a later merge of a resolved head still succeeds.
             pr["mergeable"] = "CONFLICTING"
             sys.stderr.write("failed to merge: conflicts in " + ", ".join(conflicted) + "\n")
             return 1
         pr["state"] = "MERGED"
+        pr["mergeable"] = "MERGEABLE"
         pr["mergeCommit"] = merge_commit
-        pr["headRefOid"] = merged_head  # freeze the head that was merged, so later queries are stable
+        pr["headRefOid"] = current_head  # freeze the head that was merged, so later queries are stable
     print(f"Merged pull request #{number} ({merge_commit[:7]})")
     return 0
 
@@ -726,10 +746,12 @@ def _hc_exec(state_dir, argv):
     """`hc exec --on <machine> [--timeout T] -- <cmd...>`: run the command as if on that machine, or
     answer connection refused when the machine is down.
 
-    The command runs with the machine's own `HOME`, working directory, store and settings, all inside
-    the scratch directory, so a relative path a remote command inspects, chmods or writes
-    (`cli.remote_run` does `test -d .config/...`, `chmod`, and the install lands under the home) stays
-    on that simulated machine and never on the real one."""
+    The command runs in the machine's own scratch directory (its working directory) with its store
+    and settings redirected there, but with the real `HOME` left intact: a remote `herdr-task` calls
+    `base.guard`, which refuses `hc` when `HOME` is not the account's own, so a changed `HOME` would
+    stop the real remote `herdr-task` from running. `cli.remote_run`'s own paths are relative
+    (`test -d .config/...`, `chmod .local/bin/herdr-task`), so running in the machine's working
+    directory keeps them on that simulated machine and never on the real one."""
     flags, _, after = _parse_flags(argv, {"--on", "--timeout"}, bare=("--stdin", "--observe"))
     machine = flags.get("--on")
     state = _read_state(state_dir)
@@ -740,7 +762,6 @@ def _hc_exec(state_dir, argv):
             return 1
         home = rec["home"]
         env = dict(os.environ)
-        env["HOME"] = home
         env["HERDR_TASK_STORE"] = rec["store"]
         env["HERDR_TASK_SETTINGS"] = os.path.join(home, ".herdr", "shepherdr.json")
         stdin = sys.stdin.read() if flags.get("--stdin") else None
