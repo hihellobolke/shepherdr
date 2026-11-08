@@ -461,6 +461,8 @@ def _live_feature(d):
     (`retro_handled`), then left alone. A classic folder has no `features`, so this is False for it."""
     for f in d.get("features") or []:
         phase = f.get("phase")
+        if f.get("news_pending"):
+            return True  # still has news to deliver, whatever its phase
         if phase == phases.CANCELLED:
             continue
         if phase != phases.DONE or not f.get("retro_handled"):
@@ -521,6 +523,13 @@ def one_feature(s, feature, report):
     _child_pass(s, feature, children, report)
 
     new_phase, attention = phases.phase_of(feature, children)
+    # A Feature cannot verify without a Verify Task. Fan-out creates the children first and the Verify
+    # Task last, so a part-done fan-out (some children made, then a failure) can leave every child
+    # merged and no Verify Task; without this guard the Feature would move to verifying and strand there
+    # (nothing re-runs fan-out, which fires only in building). Hold it in building so the fan-out trigger
+    # re-runs and creates the missing Verify Task.
+    if new_phase == phases.VERIFYING and not feature.get("verify_task"):
+        new_phase, attention = phases.BUILDING, ""
     if new_phase == phases.VERIFYING:
         override = _verify_handling(s, feature, children, report)
         if override is not None:
@@ -528,9 +537,16 @@ def one_feature(s, feature, report):
     _apply_phase(s, feature, new_phase, attention)
 
     if feature.get("phase") == phases.CLOSING:
-        _closing(s, feature, report)
+        # Re-verify after an Integration Task merges (proposal 6.11; closing.py leaves this to the tick):
+        # a base conflict made an Integration Task, and now that it has merged the integrated branch must
+        # pass verify again before closing opens the pull request. Otherwise run the closing steps.
+        if feature.get("attention") == phases.ATTENTION_BASE_CONFLICT and _integration_merged(s, feature):
+            _reverify(s, feature, report)
+        else:
+            _closing(s, feature, report)
 
     _waves_pass(s, feature, children, report)
+    _remote_exception_news(s, feature, children, report)
     _phase_news(s, feature, phase_before, report)
     _flush_news(s, feature, report)
 
@@ -619,24 +635,29 @@ def _flow_children(s, feature, gathered):
     records = [t for t in s.data.get("tasks") or []
                if t.get("feature") == feature.get("id") and t.get("role") in _CHILD_ROLES]
     by_key = _gathered_by_key(s, gathered)
+    digests = feature.get("digests") or {}
     for entry in feature.get("children") or []:
         m = _norm_machine(entry.get("machine"))
         if m is None:
             continue
-        records.append(_remote_record(entry, by_key.get((m, f"{s.prefix}-{entry.get('ref')}"))))
+        status = by_key.get((m, f"{s.prefix}-{entry.get('ref')}"))
+        records.append(_remote_record(entry, status, digests.get(digest.child_key(entry))))
     return records
 
 
-def _remote_record(entry, status):
+def _remote_record(entry, status, stored_digest=None):
     """A synthetic child record for a remote child, from its gathered status and its digest. The
     record carries only what the phase rules read: role, rows, and the state (`merged`/`skipped`/
-    `cancelled`/`failed`/running) the digest or the live state says. A remote child cannot be restarted
-    from the home machine, so a failed one is marked with its retry already used (`retries` 1): the
-    phase rules then surface it as `child-failed` at once rather than waiting for a retry that never
-    comes (remote child restart is deferred with remote child creation, proposal 6.13)."""
+    `cancelled`/`failed`/running) the digest or the live state says. When the machine cannot be reached
+    this tick (no current status), the stored digest already carried home (`feature.digests`, contract
+    C2) stands in, so a child that merged before its machine went offline stays merged and does not fall
+    back to a stale `running` that would hold the Feature up. A remote child cannot be restarted from the
+    home machine, so a failed one is marked with its retry already used (`retries` 1): the phase rules
+    then surface it as `child-failed` at once rather than waiting for a retry that never comes (remote
+    child restart is deferred with remote child creation, proposal 6.13)."""
     rec = {"id": entry.get("ref"), "machine": entry.get("machine"),
            "role": entry.get("role") or "child", "rows": list(entry.get("rows") or [])}
-    dstate = ((status or {}).get("digest") or {}).get("state")
+    dstate = ((status or {}).get("digest") or stored_digest or {}).get("state")
     live_state = (status or {}).get("state")
     if dstate == "merged":
         rec["state"], rec["merged"] = "done", True
@@ -790,7 +811,7 @@ def _verify_rounds(s, feature):
         return 2
 
 
-# ---- closing and retro ----------------------------------------------------------------------
+# ---- closing, the integration re-verify, and retro ------------------------------------------
 
 def _closing(s, feature, report):
     """Run the closing steps while the Feature is in closing (contract C8). closing.close is
@@ -803,6 +824,44 @@ def _closing(s, feature, report):
         return
     report.setdefault("feature_closing", []).append(
         {"feature": s.ref(feature), "phase": feature.get("phase"), "attention": feature.get("attention", "")})
+
+
+def _integration_merged(s, feature):
+    """True when a base-conflict's Integration Task has merged and none is still open. closing made the
+    Integration Task on a base conflict (`closing.make_integration_task`); once it merges, the integrated
+    branch must be verified again before closing proceeds."""
+    integ = [t for t in s.data.get("tasks") or []
+             if t.get("feature") == feature.get("id") and t.get("role") == "integration"]
+    if not integ:
+        return False
+    if any(t.get("state") not in ("done", "cancelled") and not t.get("skipped") for t in integ):
+        return False  # one is still being worked
+    return any(t.get("state") == "done" and t.get("merged") for t in integ)
+
+
+def _reverify(s, feature, report):
+    """Run verify again after an Integration Task merged (proposal 6.11). A fresh Verify Task is made on
+    the integrated feature branch and the Feature goes back to verifying with its base-conflict cleared,
+    so the pull request is never opened on a branch whose conflict resolution was never verified."""
+    title = feature.get("title") or s.ref(feature)
+    verify = s.new(f"Verify {s.ref(feature)}: {title}",
+                   f"Run /opsx:verify {feature.get('change')} on the feature branch "
+                   f"{feature.get('branch')} after the integration merge. You are read-only: do not "
+                   f"change code. Report with `herdr-task verify-report --pass` or `--findings-file`.",
+                   mode="worktree", feature=feature["id"], role="verify", owns=[])
+    verify["base"], verify["base_set"] = feature["branch"], True
+    verify["branch"] = f"task/{s.ref(feature)}-{s.ref(verify)}-verify"
+    space = _feature_space(s, feature)
+    if space:
+        verify["queue"] = {"space": space}
+    verify["state"], verify["queued_at"] = "queued", now()
+    feature["verify_task"] = verify["id"]
+    feature["phase"], feature["attention"] = phases.VERIFYING, ""
+    s.dirty = True
+    report.setdefault("feature_reverify", []).append({"feature": s.ref(feature), "verify_task": s.ref(verify)})
+    _send_feature_news(s, feature, "phase",
+                       f"{s.ref(feature)} back to Verifying: the integration merged, verifying it again.",
+                       report)
 
 
 def _maybe_retro(s, feature, report):
@@ -858,6 +917,21 @@ def _waves_pass(s, feature, children, report):
             _send_feature_news(s, feature, "wave",
                                f"{s.ref(feature)}: wave {w} done, {len(kids)} task{'s' if len(kids) != 1 else ''} "
                                f"merged or skipped.", report)
+
+
+def _remote_exception_news(s, feature, children, report):
+    """Queue the one-by-one event for a remote child that failed (proposal 6.14). A remote child is not
+    restarted or flagged by `_child_pass` (it lives on another machine), but its failure still reaches
+    the Assistant, deduped by machine and ref so it is sent once. A remote child off the home machine is
+    named `"<machine>:<ref>"`, the way Shepherdr writes a cross-machine ref."""
+    for c in children:
+        m = c.get("machine")
+        if m is None or c.get("attention") != "failed":
+            continue
+        ref = f"{m}:{s.prefix}-{c.get('id')}"
+        _send_feature_news(s, feature, "failed",
+                           f"{ref} failed on {m} and cannot be restarted from here.",
+                           report, once=f"failed:{m}:{c.get('id')}")
 
 
 def _phase_news(s, feature, phase_before, report):

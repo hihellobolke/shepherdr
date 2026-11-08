@@ -167,7 +167,7 @@ class PhaseChanges(FeatureTickBase):
         f = self.feature(s, phase="building")
         self.child(s, f, rows=("1.1",), state="done", merged=True)
         self.child(s, f, rows=("1.2",), state="done", merged=True)
-        self.verify(s, f)  # the first Verify Task, not reported yet
+        f["verify_task"] = self.verify(s, f)["id"]  # fan-out has created the Verify Task
         report = {}
         tick.one_feature(s, f, report)
         self.assertEqual(f["phase"], "verifying")
@@ -179,9 +179,19 @@ class PhaseChanges(FeatureTickBase):
         f = self.feature(s, phase="building")
         self.child(s, f, rows=("1.1",), state="done", merged=True)
         self.child(s, f, rows=("1.2",), state="cancelled", skipped=True)
-        self.verify(s, f)
+        f["verify_task"] = self.verify(s, f)["id"]
         tick.one_feature(s, f, {})
         self.assertEqual(f["phase"], "verifying")
+
+    def test_all_children_merged_but_no_verify_task_stays_building(self):
+        # A part-done fan-out: every created child merged but the Verify Task was never made. The Feature
+        # must not strand in verifying; it stays building so the fan-out trigger can create it.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        self.child(s, f, rows=("1.1",), state="done", merged=True)
+        # no verify_task set, and spec_merged False so the trigger does not fan out in this test
+        tick.one_feature(s, f, {})
+        self.assertEqual(f["phase"], "building")
 
     def test_verify_pass_moves_to_closing(self):
         s = self.store()
@@ -208,6 +218,27 @@ class PhaseChanges(FeatureTickBase):
         self.assertEqual(f["phase"], "ready")
         self.assertTrue(any(n["event"] == "phase" and "Ready" in n["text"]
                             for n in report.get("feature_news", [])))
+
+    def test_reverify_after_integration_merge(self):
+        # A base conflict made an Integration Task; once it has merged, the Feature goes back to
+        # verifying with a fresh Verify Task rather than straight to the pull request (proposal 6.11).
+        s = self.store()
+        f = self.feature(s, phase="closing", attention="base-conflict")
+        self.child(s, f, role="integration", rows=("0.0",), state="done", merged=True)
+        report = {}
+        tick.one_feature(s, f, report)
+        self.assertEqual(f["phase"], "verifying")
+        self.assertIsNotNone(f["verify_task"])
+        self.assertEqual(f["attention"], "")
+        self.mocks["close"].assert_not_called()  # re-verify instead of closing
+        self.assertTrue(any(r["feature"] for r in report.get("feature_reverify", [])))
+
+    def test_closing_proceeds_when_no_base_conflict(self):
+        s = self.store()
+        f = self.feature(s, phase="closing")
+        self.child(s, f, rows=("1.1",), state="done", merged=True)
+        tick.one_feature(s, f, {})
+        self.mocks["close"].assert_called_once()
 
     def test_closing_row_no_child_attention_is_kept(self):
         s = self.store()
@@ -448,9 +479,9 @@ class Digests(FeatureTickBase):
         # Machine a's child is still running, so the Feature has not advanced out of building.
         self.assertEqual(f["phase"], "building")
 
-    def test_remote_failed_child_surfaces(self):
+    def test_remote_failed_child_surfaces_and_is_announced(self):
         # A remote child cannot be restarted from here, so a failed one surfaces at once (its synthetic
-        # record is marked with its retry used) rather than waiting for a retry that never comes.
+        # record is marked with its retry used) and its failure is announced to the Assistant.
         s = self.store()
         f = self.feature(s, phase="building")
         f["children"] = [{"ref": 2, "machine": "a", "rows": ["1.1"], "role": "child"}]
@@ -458,8 +489,24 @@ class Digests(FeatureTickBase):
             {"machine": "a", "reachable": True, "children": [
                 {"ref": "HAT-2", "state": "failed", "role": "child", "rows": ["1.1"],
                  "digest": {"state": "failed"}}]}]}
-        tick.one_feature(s, f, {})
+        report = {}
+        tick.one_feature(s, f, report)
         self.assertEqual(f["attention"], phases.ATTENTION_CHILD_FAILED)
+        self.assertTrue(any(n["event"] == "failed" for n in report.get("feature_news", [])))
+
+    def test_offline_remote_child_keeps_its_stored_merged_digest(self):
+        # The machine is unreachable this tick (no current status), but the child merged earlier and its
+        # digest was carried home; it must stay merged, not fall back to a stale running state.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        f["children"] = [{"ref": 2, "machine": "a", "rows": ["1.1"], "role": "child"}]
+        f["digests"] = {"a:2": {"state": "merged"}}
+        f["verify_task"] = self.verify(s, f)["id"]
+        self.mocks["gather"].return_value = {"machines": [
+            {"machine": "a", "reachable": False, "children": []}]}
+        tick.one_feature(s, f, {})
+        # The only work-package child is merged (from its stored digest), so the Feature advances.
+        self.assertEqual(f["phase"], "verifying")
 
 
 class Retro(FeatureTickBase):
@@ -512,6 +559,9 @@ class Classic(FeatureTickBase):
         self.assertFalse(tick._live_feature({"features": [{"phase": "done", "retro_handled": True}]}))
         self.assertTrue(tick._live_feature({"features": [{"phase": "building"}]}))
         self.assertTrue(tick._live_feature({"features": [{"phase": "done"}]}))  # retro not handled yet
+        # A done, retro-handled Feature with undelivered news is still looked at, to deliver it.
+        self.assertTrue(tick._live_feature(
+            {"features": [{"phase": "done", "retro_handled": True, "news_pending": [{"event": "x"}]}]}))
 
     def test_features_tick_isolates_one_feature_error(self):
         s = self.store()
