@@ -510,6 +510,9 @@ def handoff(s, task, prev, parent=None, argv=None):
     lines = [f"You are taking over task {s.ref(task)} \"{task['title']}\" from another agent.", instructions("worker"),
              flow_part(s, task)]
     lines.append(where_line(task))
+    # A taken-over worker runs the same reviewer, so it needs the concrete codex trust command too,
+    # not worker.md's "<the projects trust table your brief gives>" placeholder (SHMD-34).
+    lines.append(codex_review_note(s, task, None, argv))
     lines.append("The task:\n" + ((task.get("prompt") or "").strip() or task["title"]))
     if prev and prev.get("log"):
         lines.append(f"The previous agent ({prev.get('agent') or 'agent'}) kept its session log at {prev['log']}: read the recent part to pick up where it left off.")

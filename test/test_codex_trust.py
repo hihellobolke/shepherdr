@@ -185,5 +185,40 @@ class ReviewNoteInTheBrief(unittest.TestCase):
         self.assertEqual(tomllib.loads(arg), {"projects": {"/tmp/\U0001f680/repo": {"trust_level": "trusted"}}})
 
 
+class BriefAndHandoffBothCarryTheNote(unittest.TestCase):
+    """Both the fresh brief and the takeover handoff must supply the concrete codex trust command,
+    so a replacement worker does not get worker.md's placeholder with nothing filling it in."""
+
+    def _s(self):
+        return SimpleNamespace(loc={"folder": "/tmp/the repo", "kind": "repo"}, ref=lambda t: "REF-1")
+
+    def _patches(self):
+        # neutralise every other part of the brief/handoff so only the note's presence is tested
+        return [
+            mock.patch.object(L, "instructions", lambda r: ""),
+            mock.patch.object(L, "flow_part", lambda *a, **k: ""),
+            mock.patch.object(L, "where_line", lambda t: ""),
+            mock.patch.object(L, "notes_part", lambda *a, **k: ""),
+            mock.patch.object(L, "notes", lambda *a, **k: []),
+            mock.patch.object(L, "closing_line", lambda *a, **k: ""),
+            mock.patch.object(L, "settings_block", lambda *a, **k: ""),
+            mock.patch.object(L, "codex_review_note", lambda *a, **k: "CODEX_TRUST_NOTE_SENTINEL"),
+        ]
+
+    def test_brief_includes_the_note(self):
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        out = L.brief(self._s(), {"id": 1, "title": "t", "prompt": "p"}, argv=["claude"])
+        self.assertIn("CODEX_TRUST_NOTE_SENTINEL", out)
+
+    def test_handoff_includes_the_note(self):
+        for p in self._patches():
+            p.start()
+        self.addCleanup(mock.patch.stopall)
+        out = L.handoff(self._s(), {"id": 1, "title": "t", "prompt": "p"}, None, argv=["claude"])
+        self.assertIn("CODEX_TRUST_NOTE_SENTINEL", out)
+
+
 if __name__ == "__main__":
     unittest.main()
