@@ -15,18 +15,49 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 sys.dont_write_bytecode = True
-os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-fanout-store-"))
-os.environ.setdefault("HERDR_TASK_SETTINGS", os.path.join(tempfile.mkdtemp(prefix="herdr-fanout-cfg-"), "shepherdr.json"))
 
 from herdr_task import fanout, store as st  # noqa: E402
+from herdr_task import base as base_mod  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
 from herdr_task import settings as settings_mod  # noqa: E402
+
+# A throwaway STORE and settings file, kept for this module's tests and restored after, so the real
+# ~/.herdr is never read or written and nothing leaks into later test files in a full `unittest
+# discover` run (test_repo's TestHygiene forbids mutating os.environ at import time). STORE and
+# SETTINGS are cached from the env at import (base.py, settings.py), before setUpModule runs, so the
+# module attributes are patched directly as well as the env (the env still matters for subprocess
+# calls).
+_PATCHES = []
+
+
+def setUpModule():
+    global _PATCHES
+    store_dir = tempfile.mkdtemp(prefix="herdr-fanout-store-")
+    settings_file = os.path.join(tempfile.mkdtemp(prefix="herdr-fanout-cfg-"), "shepherdr.json")
+    _PATCHES = [
+        mock.patch.dict(os.environ, {
+            "HERDR_TASK_STORE": store_dir,
+            "HERDR_TASK_SETTINGS": settings_file,
+        }),
+        mock.patch.object(settings_mod, "SETTINGS", settings_file),
+        mock.patch.object(st, "STORE", store_dir),
+        mock.patch.object(base_mod, "STORE", store_dir),
+    ]
+    for p in _PATCHES:
+        p.start()
+
+
+def tearDownModule():
+    for p in reversed(_PATCHES):
+        p.stop()
+    _PATCHES.clear()
 
 
 VALID_TABLE = """# Login flow
@@ -367,6 +398,88 @@ class RunTest(Base):
         self.run_fanout()  # the repeated trigger must not drop the Assistant's edge
         wire = next(t for t in self.read()["tasks"] if t.get("rows") == ["2.1"])
         self.assertIn(extra, wire["after"])
+
+    def test_rerun_preserves_an_assistant_added_cross_machine_wait(self):
+        # The Assistant can add a cross-machine --after when it extends owned paths (proposal 6.8): an
+        # after_ext record for a child on another machine. A later fan-out rerun must keep it, just as it
+        # keeps a local one, and must not re-query the machine (the record and its polling state stay).
+        self.run_fanout()
+        with st.Store(self.loc) as s:
+            wire = next(t for t in s.data["tasks"] if t.get("rows") == ["2.1"])
+            wire.setdefault("after_ext", []).append(
+                {"ref": f"vm-b:{s.prefix}-99", "machine": "vm-b", "prefix": s.prefix, "id": 99,
+                 "state": "running", "checked": 123})
+            s.dirty = True
+        self.run_fanout()  # the repeated trigger must not drop the Assistant's cross-machine wait
+        wire = next(t for t in self.read()["tasks"] if t.get("rows") == ["2.1"])
+        ext = wire.get("after_ext") or []
+        self.assertIn(("vm-b", 99), [(e["machine"], e["id"]) for e in ext])
+        kept = next(e for e in ext if (e["machine"], e["id"]) == ("vm-b", 99))
+        self.assertEqual(kept["state"], "running")  # its polling state is kept, the machine not re-asked
+        self.assertEqual(kept["checked"], 123)
+
+    def test_rerun_recreates_a_hand_removed_child_and_reports_it(self):
+        # `herdr-task rm` on a child deletes its Task and its inbound after links, but leaves the stale
+        # Feature children entry. A rerun treats that row as a missing child: it re-creates it and reports
+        # the re-creation in the plan and dry-run JSON (not silently, and not as a duplicate entry).
+        self.run_fanout()
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            gone = next(c for c in feat["children"] if c["rows"] == ["1.1"])
+            s.data["tasks"] = [t for t in s.data["tasks"] if t["id"] != gone["ref"]]  # rm the Task
+            for t in s.data["tasks"]:
+                if gone["ref"] in (t.get("after") or []):
+                    t["after"] = [i for i in t["after"] if i != gone["ref"]]  # rm the inbound links
+            s.dirty = True
+        before = self.read()
+        dry = self.plan()  # the dry run names it and creates nothing
+        self.assertEqual([rc["rows"] for rc in dry["recreated"]], [["1.1"]])
+        self.assertEqual(self.read()["tasks"], before["tasks"])
+        r = self.run_fanout()  # the real run re-creates exactly that one and reports it
+        self.assertEqual(r["created"]["children"], 1)
+        self.assertEqual([rc["rows"] for rc in r["recreated"]], [["1.1"]])
+        children = self.read()["features"][0]["children"]
+        self.assertEqual(len(children), 4)
+        self.assertEqual([tuple(c["rows"]) for c in children].count(("1.1",)), 1)  # one entry, no dup
+        tasks = {t["id"]: t for t in self.read()["tasks"]}
+        by_rows = {tuple(t["rows"]): t for t in tasks.values() if t.get("role") == "child"}
+        self.assertEqual(by_rows[("1.1",)]["after"], [by_rows[("0.1",)]["id"]])  # relinked to its dep
+        # the Verify Task waits for the live re-created child, never a dead ref
+        verify = next(t for t in tasks.values() if t.get("role") == "verify")
+        self.assertCountEqual(verify["after"], [t["id"] for t in by_rows.values()])
+        self.assertTrue(all(i in tasks for i in verify["after"]))
+
+    def test_skipped_row_is_never_recreated(self):
+        # A child the person skipped (its Task kept, `skipped` set) is a kept gap (proposal 6.12): a rerun
+        # never re-creates it, even once its Task is removed by hand. The first rerun stamps a kept-gap
+        # marker on the Feature children entry so the gap is remembered after the Task is gone.
+        self.run_fanout()
+        with st.Store(self.loc) as s:
+            t = next(t for t in s.data["tasks"] if t.get("rows") == ["1.1"])
+            t["skipped"] = True
+            s.dirty = True
+        r = self.run_fanout()
+        self.assertEqual(r["created"]["children"], 0)
+        self.assertEqual(r["recreated"], [])
+        entry = next(c for c in self.read()["features"][0]["children"] if c["rows"] == ["1.1"])
+        self.assertTrue(entry.get("skipped"))  # the kept-gap marker was stamped
+        # remove the skipped child's Task by hand; a rerun still does not re-create it
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            gone = next(c for c in feat["children"] if c["rows"] == ["1.1"])
+            s.data["tasks"] = [t for t in s.data["tasks"] if t["id"] != gone["ref"]]
+            s.dirty = True
+        r2 = self.run_fanout()
+        self.assertEqual(r2["created"]["children"], 0)
+        self.assertEqual(r2["recreated"], [])
+        rows = {tuple(c["rows"]) for c in self.read()["features"][0]["children"]}
+        self.assertIn(("1.1",), rows)  # the kept-gap entry stays
+        # the Verify Task and the dependent (2.1) drop the dead skipped ref, never wait on nothing
+        tasks = {t["id"]: t for t in self.read()["tasks"]}
+        verify = next(t for t in tasks.values() if t.get("role") == "verify")
+        self.assertTrue(all(i in tasks for i in verify["after"]))
+        wire = next(t for t in tasks.values() if t.get("rows") == ["2.1"])
+        self.assertTrue(all(i in tasks for i in (wire.get("after") or [])))
 
 
 # ---- placement with chain affinity (section 6.13), via the dry run ----------------------------
