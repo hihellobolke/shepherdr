@@ -12,6 +12,7 @@ core/menus.js: spaces-chat tasks tasks-menu menu-tasks new-menu-tasks pane-chat 
 core/asks.js: chat jump spaces-chat tabs-tasks tasks workspace-status-chat toasts
 core/needs.js: chat jump spaces-chat tabs-tasks tasks workspace-status-chat toasts
 core/tasks.js: chat jump tasks
+core/features.js: tasks jump chat
 core/notify.js: chat spaces-chat tabs-tasks tasks shepherdr-settings workspace-status-chat
 parked.js: chat spaces-chat tabs-tasks workspace-status-chat
 keyholder.js: chat tasks
