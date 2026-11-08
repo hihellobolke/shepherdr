@@ -109,15 +109,19 @@ function folderOf(space) {
 //   spaces: { <space id>: { folder, name, machine, ...SETTINGS } } }
 // with SETTINGS = { coordinator, worker, reviewer: { agent, model, effort, fast, perm },
 //   tasks: { merge: "auto"|"checks"|"ask", review_rounds, must_fix: "blocker"|"major"|"minor", max_running,
-//            archive_after (days Done tasks stay in the lists; 0: never archived) },
+//            archive_after (days Done tasks stay in the lists; 0: never archived),
+//            flow: "classic"|"openspec", verify_rounds, risky_paths, owns_exempt, retro: "off"|"ask"|"automatic",
+//            retro_prompt, retro_save: "outside"|"repo"|"pr", may_change (the OpenSpec flow settings; docs/openspec-flow.md, the contract) },
+//   retro: { agent, model, effort } (the retro agent, a role of its own; empty follows the Reviewer),
 //   automations: { enabled }, agents: { reactions, feedback, feedback_repo } }, every key optional. A machine is "local" (this computer) or its
 // name; a space on another machine is "<machine>/<id>". The settings window pushes each other
 // machine its share (with "here": its name) for its herdr-task. Settings edits only Everywhere and
 // spaces now; a machine's layer holds its machine-only rows (machine, home) and is still read for
 // anything it set for all its spaces before machine scope went.
 export const SHEPHERDR_FILE = () => `${home()}/.herdr/shepherdr.json`;
-export const SHEPHERDR_DEFAULTS = { tasks: { merge: "ask", review_rounds: 0, must_fix: "major", max_running: 10, archive_after: 7 }, automations: { enabled: true },
-  agents: { reactions: true, feedback: true, feedback_repo: "" } };
+export const SHEPHERDR_DEFAULTS = { tasks: { merge: "ask", review_rounds: 0, must_fix: "major", max_running: 10, archive_after: 7,
+    flow: "classic", verify_rounds: 2, risky_paths: [], owns_exempt: [], retro: "off", retro_prompt: "built-in", retro_save: "outside", may_change: [] },
+  automations: { enabled: true }, retro: {}, agents: { reactions: true, feedback: true, feedback_repo: "" } };
 export const LOCAL_MACHINE = "local";
 export async function readShepherdr() {
   try { return JSON.parse((await readTextFile(SHEPHERDR_FILE())) ?? "{}") ?? {}; } catch { return {}; }
@@ -139,7 +143,8 @@ export function shepherdrLayers(cfg, scope = null) {
 export function shepherdrFor(cfg, scope = null) {
   const layers = shepherdrLayers(cfg, scope).reverse();
   const out = {};
-  for (const role of ["coordinator", "worker", "reviewer"]) out[role] = layers.reduce((v, l) => l.obj[role] ?? v, null);
+  // retro is a role of its own (the retro agent); empty leaves callers to fall back to the Reviewer.
+  for (const role of ["coordinator", "worker", "reviewer", "retro"]) out[role] = layers.reduce((v, l) => l.obj[role] ?? v, null);
   // agents: Reactions set before they were for every agent (SHEP-42's assistant.reactions) count where a layer has no agents'
   const own = (l, k) => (k === "agents" && typeof l.obj.assistant?.reactions === "boolean" ? { reactions: l.obj.assistant.reactions, ...l.obj.agents } : l.obj[k] ?? {});
   for (const k of ["tasks", "automations", "agents"]) out[k] = Object.assign({ ...SHEPHERDR_DEFAULTS[k] }, ...layers.map((l) => own(l, k)));

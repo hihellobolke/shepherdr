@@ -39,7 +39,8 @@ import { webSection } from "./web-section.js";
 // into its starting prompt; Herdr runs nothing itself.
 import { SECTIONS, ROLES, NOTES, MERGE, MUST_FIX, ROUNDS, ARCHIVE, ABOUT, BACKUP, REACTIONS, STAR, starState, upgradeReactions, NOTIFY_ABOUT, TITLE, SPACE_TITLE,
   EVERYWHERE, CHANGED_HERE, RESET, EDIT_INSTRUCTIONS, USE_OTHER_CLI, LOADING_AGENTS, SAVED, sameAs as sameAsWords,
-  spacesOwn, otherCliWords, backupProblem, notifyMachineAbout, machineLabel, TASK_ROWS, LEVEL } from "./core/settings.js";
+  spacesOwn, otherCliWords, backupProblem, notifyMachineAbout, machineLabel, TASK_ROWS, LEVEL,
+  FLOW, VERIFY_ROUNDS, RETRO, RETRO_SAVE, MAY_CHANGE } from "./core/settings.js";
 
 const I = (name) => `mods/shepherdr-settings/${name}.svg`;
 // A page's title, and a Tasks row's (by its key, section.field).
@@ -57,6 +58,22 @@ const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
 const withValue = (opts, v, words) => (opts.some(([k]) => k === v) ? opts : [...opts, [v, words(v)]].sort((a, b) => a[0] - b[0]));
 const daysWord = (d) => plural(d, "day", "days");
 const roundsWord = (n) => plural(n, "round", "rounds");
+// Many-of choices (tasks.may_change): the same look as segmented(), but each chip toggles on its
+// own, and none is on when the list is empty.
+const multiChips = (id, options, values, onToggle) => {
+  const t = theme();
+  const chosen = Array.isArray(values) ? values : [];
+  return h_flex().h(H.sm).flex_none().p(2).gap(2).rounded(RADIUS.control).bg(t.raised)
+    .children(options.map(([v, label]) => {
+      const on = chosen.includes(v);
+      return h_flex().id(`${id}-${v}`).h_full().px(8).justify_center().items_center().rounded(RADIUS.control - 2)
+        .whitespace_nowrap().text_size(TEXT.label).flex_none().cursor_pointer()
+        .when(on, (el) => el.bg(t.background).text_color(t.foreground).font_medium())
+        .when(!on, (el) => el.text_color(t.muted).hover((s) => s.text_color(t.foreground)))
+        .on_click((e, cx) => { cx.stop_propagation(); onToggle(on ? chosen.filter((x) => x !== v) : [...chosen, v], e, cx); cx.notify(); })
+        .child(label);
+    }));
+};
 // A pushed copy's mark: a machine whose file lacks it keeps its own settings, and is left alone.
 const PUSH = `f="$HOME/.herdr/shepherdr.json"; mkdir -p "$HOME/.herdr" || exit 1
 if [ -f "$f" ] && ! grep -q '"pushed_from"' "$f"; then echo own; exit 0; fi
@@ -111,11 +128,29 @@ export default class ShepherdrSettings extends View {
       note.box.on("focus", (_e, cx) => { this.noteFocus = n.id; cx.notify(); });
       note.box.on("blur", (_e, cx) => { this.noteFocus = null; this.saveNotes(cx); });
     }
+    // The OpenSpec flow's two text rows (docs/openspec-flow.md, the contract): Risky paths, one glob
+    // per line (tasks.risky_paths, a list), and Retro prompt (tasks.retro_prompt, one line). Each
+    // saves like a note: a moment after typing stops, on leaving the box and on close.
+    this.risky = { box: TextareaState.new({ placeholder: "" }), saved: "", gen: 0, savedAt: 0, focus: false };
+    this.risky.box.set_auto_grow(2, 8);
+    this.risky.box.on("change", (_e, cx) => {
+      const gen = ++this.risky.gen;
+      cx.notify();
+      cx.timer.after(500, (cx) => { if (gen === this.risky.gen) this.saveFlow(cx); });
+    });
+    this.risky.box.on("focus", (_e, cx) => { this.risky.focus = true; cx.notify(); });
+    this.risky.box.on("blur", (_e, cx) => { this.risky.focus = false; this.saveFlow(cx); });
+    this.retroPrompt = { box: InputState.new({ placeholder: "" }), saved: "", savedAt: 0, focus: false };
+    this.retroPrompt.box.on("change", (_e, cx) => cx.notify());
+    this.retroPrompt.box.on("focus", (_e, cx) => { this.retroPrompt.focus = true; cx.notify(); });
+    this.retroPrompt.box.on("blur", (_e, cx) => { this.retroPrompt.focus = false; this.saveFlow(cx); });
+    this.retroPrompt.box.on("submit", (_e, cx) => this.saveFlow(cx));
     cx.spawn(async (cx) => {
       await this.load();
       try { this.data = await models.loadChoices(null); } catch { this.data = null; }
       this.resetRoles();
       this.resetNotes();
+      this.resetFlow();
       if (this.scope) await this.folderOf(this.scope);
       cx.notify();
       await this.pushRemotes();
@@ -280,14 +315,14 @@ export default class ShepherdrSettings extends View {
 
   // Into a space's own settings (null: Everywhere's). A page the space doesn't have goes to Agents.
   pickScope(id, cx) {
-    const saving = Promise.all([this.flushNotes(), autopilotFlush(this)]);
+    const saving = Promise.all([this.flushNotes(), this.flushFlow(), autopilotFlush(this)]);
     this.scope = id;
     this.listOpen = null;
     this.levelOpen = false;
     if (!this.shows(this.section)) this.section = "agents";
     this.secFor();
     this.handle.focus();
-    cx.spawn(async (cx) => { await saving; if (id) await this.folderOf(id); await this.load(); this.resetRoles(); this.resetNotes(); cx.notify(); });
+    cx.spawn(async (cx) => { await saving; if (id) await this.folderOf(id); await this.load(); this.resetRoles(); this.resetNotes(); this.resetFlow(); cx.notify(); });
   }
 
   // Secrets' Add is for the space whose settings these are, else Everywhere.
@@ -323,11 +358,16 @@ export default class ShepherdrSettings extends View {
       sel ??= this.data?.defaults ?? null;
       this.roles[r.id] = { ...(this.roles[r.id] ?? {}), sel: sel ? { ...sel } : null, data: this.data, saved: JSON.stringify(sel), unset };
     }
+    // The retro agent (retro.*), a role of its own: unset, it follows the Reviewer (shown as the
+    // Reviewer's model). Its own value, once set, is written to the `retro` section.
+    const own = eff.retro && Object.keys(eff.retro).length ? eff.retro : null;
+    const rsel = own ?? this.roles.reviewer?.sel ?? null;
+    this.roles.retro = { ...(this.roles.retro ?? {}), sel: rsel ? { ...rsel } : null, data: this.data, saved: JSON.stringify(rsel), unset: !own };
   }
 
   // A model button's choice changed (it changes coord.sel itself): write it to this scope.
   saveRoles(cx) {
-    for (const r of ROLES) {
+    for (const r of [...ROLES, { id: "retro" }]) {
       const c = this.roles[r.id];
       if (!c?.sel) continue;
       const now = JSON.stringify(c.sel);
@@ -377,10 +417,75 @@ export default class ShepherdrSettings extends View {
     });
   }
 
+  // The OpenSpec flow's text boxes show what applies in this scope: Risky paths one glob per line,
+  // Retro prompt empty when it follows the built-in steps.
+  resetFlow(only = null) {
+    const k = shepherdrFor(this.cfg, this.scope).tasks;
+    if (only === null || only === "risky_paths") {
+      const globs = Array.isArray(k.risky_paths) ? k.risky_paths : [];
+      this.risky.saved = globs.join("\n");
+      this.risky.box.set_value(this.risky.saved);
+    }
+    if (only === null || only === "retro_prompt") {
+      const rp = k.retro_prompt ?? "built-in";
+      this.retroPrompt.saved = rp === "built-in" ? "" : rp;
+      this.retroPrompt.box.set_value(this.retroPrompt.saved);
+    }
+  }
+
+  // Writes the flow text rows changed since they were saved to `scope` (taken when called). A value
+  // equal to what the scope would inherit unsets it, so it follows again (as this.set() does).
+  // Resolves with the fields it wrote.
+  flushFlow(scope = this.scope) {
+    const changed = [];
+    const consider = (field, value) => {
+      const inh = this.chain("tasks", field, scope).slice(1).find((x) => x.value !== undefined);
+      changed.push({ field, value, follows: JSON.stringify(value) === JSON.stringify(inh?.value) });
+    };
+    if (this.risky.box.value() !== this.risky.saved) {
+      this.risky.saved = this.risky.box.value();
+      consider("risky_paths", this.risky.saved.split("\n").map((s) => s.trim()).filter(Boolean));
+    }
+    if (this.retroPrompt.box.value() !== this.retroPrompt.saved) {
+      this.retroPrompt.saved = this.retroPrompt.box.value();
+      consider("retro_prompt", this.retroPrompt.saved.trim() || "built-in");
+    }
+    if (!changed.length) return (this.flowWriting ?? Promise.resolve()).then(() => []);
+    this.flowWriting = this.apply((next) => {
+      for (const { field, value, follows } of changed) {
+        if (follows) this.drop(this.layerOf(next, scope), "tasks", field);
+        else { const tg = this.target(next, scope); tg.tasks = { ...(tg.tasks ?? {}), [field]: value }; }
+      }
+    });
+    return this.flowWriting.then((ok) => (ok ? changed.map((c) => c.field) : []));
+  }
+
+  // Saves the flow text rows, then "Saved" beside each one written, for two seconds.
+  saveFlow(cx) {
+    cx.spawn(async (cx) => {
+      const fields = await this.flushFlow();
+      if (!fields.length) return;
+      const at = Date.now();
+      if (fields.includes("risky_paths")) this.risky.savedAt = at;
+      if (fields.includes("retro_prompt")) this.retroPrompt.savedAt = at;
+      cx.notify();
+      cx.timer.after(2100, (cx) => cx.notify());
+    });
+  }
+
+  resetFlowField(field, cx) {
+    cx.spawn(async (cx) => {
+      await this.apply((next) => this.drop(this.layerOf(next), "tasks", field));
+      // Only the reset row's box, so an edit typed in the other row while the write was pending stays.
+      this.resetFlow(field);
+      cx.notify();
+    });
+  }
+
   // Escape, a click beside the window, and Herdr's own close: a note typed a moment ago is
   // still saved.
   close() {
-    const saving = Promise.all([this.flushNotes(), autopilotFlush(this)]);
+    const saving = Promise.all([this.flushNotes(), this.flushFlow(), autopilotFlush(this)]);
     this.sec?.value.set_value("");
     closeOverlay(props().overlay);
     return saving;
@@ -543,7 +648,9 @@ export default class ShepherdrSettings extends View {
       toggleSwitch("backup", on, flip), this.scoped("backup", "agent"));
   }
 
-  tasks(t) {
+  tasks(t, cx) {
+    // The Retro agent's model button changes its choice in place; write it like the Agents page does.
+    this.saveRoles(cx);
     const k = shepherdrFor(this.cfg, this.scope).tasks;
     const step = (field, d, lo, hi) => (_e, cx) => this.set("tasks", field, Math.max(lo, Math.min(hi, (k[field] ?? 0) + d)), cx);
     const rounds = Math.max(0, parseInt(k.review_rounds, 10) || 0);
@@ -552,6 +659,11 @@ export default class ShepherdrSettings extends View {
     const autoOn = shepherdrFor(this.cfg, this.scope).automations.enabled !== false;
     const base = baseRow(this, t);
     const branch = branchRow(this, t);
+    // The OpenSpec flow settings (section 6.16 of the proposal). A space on classic shows them too;
+    // they only shape a Feature. Verify rounds is clamped to the 1 to 5 the contract allows.
+    const flow = k.flow ?? "classic";
+    const verify = Math.min(5, Math.max(1, parseInt(k.verify_rounds, 10) || 2));
+    const retroMode = k.retro ?? "off";
     return v_flex()
       .child(this.title(t, page("tasks")))
       .child(this.row(t, rowTitle("tasks.merge"), ABOUT["tasks.merge"],
@@ -580,10 +692,82 @@ export default class ShepherdrSettings extends View {
         this.scoped("tasks", "worktrees")))
       .when(Boolean(base), (el) => el.child(base))
       .when(Boolean(branch), (el) => el.child(branch))
+      // OpenSpec flow ---------------------------------------------------------------------------
+      .child(this.heading(t, "OpenSpec flow"))
+      .child(this.row(t, rowTitle("tasks.flow"), ABOUT["tasks.flow"],
+        segmented("flow", FLOW, flow, (v, _e, cx) => this.set("tasks", "flow", v, cx)), this.scoped("tasks", "flow")))
+      .child(this.row(t, rowTitle("tasks.verify_rounds"), ABOUT["tasks.verify_rounds"],
+        segmented("verify", VERIFY_ROUNDS, verify, (v, _e, cx) => this.set("tasks", "verify_rounds", v, cx)),
+        this.scoped("tasks", "verify_rounds")))
+      .child(this.riskyRow(t))
+      .child(this.row(t, rowTitle("tasks.retro"), ABOUT["tasks.retro"],
+        segmented("retro", RETRO, retroMode, (v, _e, cx) => this.set("tasks", "retro", v, cx)), this.scoped("tasks", "retro")))
+      .child(this.retroPromptRow(t))
+      .child(this.retroAgentRow(t, cx))
+      .child(this.row(t, rowTitle("tasks.retro_save"), ABOUT["tasks.retro_save"],
+        segmented("retrosave", RETRO_SAVE, k.retro_save ?? "outside", (v, _e, cx) => this.set("tasks", "retro_save", v, cx)),
+        this.scoped("tasks", "retro_save")))
+      // What a flow agent may change on its own: only shown once a retro can run (as the web app does).
+      .when(retroMode !== "off", (el) => el.child(this.row(t, rowTitle("tasks.may_change"), ABOUT["tasks.may_change"],
+        multiChips("maychange", MAY_CHANGE, Array.isArray(k.may_change) ? k.may_change : [],
+          (v, _e, cx) => this.set("tasks", "may_change", v, cx)), this.scoped("tasks", "may_change"))))
+      // End OpenSpec flow -----------------------------------------------------------------------
       .child(this.row(t, rowTitle("automations.enabled"), ABOUT["automations.enabled"],
         toggleSwitch("auto", autoOn, (next, _e, cx) => this.set("automations", "enabled", next, cx)),
         this.scoped("automations", "enabled")))
       .children(NOTES.map((n) => this.noteRow(t, n)));
+  }
+
+  // Risky paths (tasks.risky_paths): a space's globs, one per line. A Task whose owned paths match
+  // one is high risk, so you accept its merge yourself. Empty: none.
+  riskyRow(t) {
+    const r = this.risky;
+    const saved = Date.now() - r.savedAt < 2000;
+    const box = div().relative().w_full()
+      .child(Textarea.new(r.box).w_full().px(10).py(8).rounded(RADIUS.control).border(1)
+        .border_color(r.focus ? t.accent : t.input).bg(t.background)
+        .text_size(TEXT.body).line_height("19px").text_color(t.foreground))
+      .when(!r.box.value(), (el) => el.child(div().absolute().top(9).left(11).right(11)
+        .text_size(TEXT.body).line_height("19px").text_color(t.dim).child("One glob per line, e.g. src/auth/**")));
+    return this.row(t, rowTitle("tasks.risky_paths"), ABOUT["tasks.risky_paths"],
+      saved ? div().text_size(TEXT.label).text_color(t.dim).child(SAVED) : null,
+      this.scoped("tasks", "risky_paths", (cx) => this.resetFlowField("risky_paths", cx)), box);
+  }
+
+  // Retro prompt (tasks.retro_prompt): the built-in steps, a skill name or a file path. Empty box:
+  // the built-in steps.
+  retroPromptRow(t) {
+    const r = this.retroPrompt;
+    const saved = Date.now() - r.savedAt < 2000;
+    const box = div().relative().w(240)
+      .child(Input.new(r.box).w_full().h(30).px(10).rounded(RADIUS.control).border_1()
+        .border_color(r.focus ? t.accent : t.input).bg(t.background).text_size(TEXT.body).text_color(t.foreground))
+      .when(!r.box.value(), (el) => el.child(div().absolute().top(6).left(11).right(11).truncate()
+        .text_size(TEXT.body).text_color(t.dim).child("built-in")));
+    const control = v_flex().items_end().gap(5).child(box)
+      .when(saved, (el) => el.child(div().text_size(TEXT.label).text_color(t.dim).child(SAVED)));
+    return this.row(t, rowTitle("tasks.retro_prompt"), ABOUT["tasks.retro_prompt"], control,
+      this.scoped("tasks", "retro_prompt", (cx) => this.resetFlowField("retro_prompt", cx)));
+  }
+
+  // Retro agent (the retro.* role): the model the retro runs on. Unset, it follows the Reviewer,
+  // and its button shows the Reviewer's model; on Everywhere, "Use the Reviewer's" puts it back.
+  retroAgentRow(t, cx) {
+    const c = this.roles.retro;
+    // While it follows the Reviewer, keep its shown model in step with the Reviewer's current one
+    // (it may have changed on the Agents page since resetRoles). Move `saved` with it so this is a
+    // display refresh, never a write of a Retro override.
+    if (c?.unset) {
+      const rv = this.roles.reviewer?.sel ?? null;
+      c.sel = rv ? { ...rv } : null;
+      c.saved = JSON.stringify(rv);
+    }
+    const control = h_flex().gap(8).items_center()
+      .child(c?.sel ? models.modelButton(t, c, {}, cx) : div().text_size(TEXT.label).text_color(t.dim).child(LOADING_AGENTS))
+      .when(!this.scope && c && !c.unset,
+        (el) => el.child(button("retro-reviewers", "Use the Reviewer's", { kind: "plain", onClick: (_e, cx) => this.reset("retro", null, cx) })));
+    return this.row(t, "Retro agent", "The agent, model and effort the retro runs on. Empty follows the Reviewer.",
+      control, this.scoped("retro", null));
   }
 
   // A note: its title and what it's for, then the text box under them, as wide as the page.
@@ -691,7 +875,7 @@ export default class ShepherdrSettings extends View {
         cx.notify();
       })));
     const body = this.section === "agents" ? this.agents(t, cx)
-      : this.section === "tasks" ? this.tasks(t)
+      : this.section === "tasks" ? this.tasks(t, cx)
       : this.section === "secrets" ? secretsSection(this, t)
       : this.section === "window" ? layoutSection(this, t)
       : this.section === "web" ? webSection(this, t)
