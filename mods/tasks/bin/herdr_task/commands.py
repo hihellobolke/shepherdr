@@ -651,6 +651,24 @@ def cmd_reviewed(args):
 VERIFY_LEVELS = ("blocker", "major", "minor")  # a verify finding's level (C5)
 
 
+def valid_finding(x):
+    """Whether one verify finding matches the C5 shape: a JSON object with a level of blocker,
+    major or minor, a non-empty title, and (optionally) a string detail, a list-of-strings paths
+    and a string-or-null row. Malformed findings are rejected so only well-formed ones reach the
+    Verify Task, where the web, the retro and the digest read them."""
+    if not isinstance(x, dict) or x.get("level") not in VERIFY_LEVELS:
+        return False
+    if not (isinstance(x.get("title"), str) and x["title"].strip()):
+        return False
+    if "detail" in x and not isinstance(x["detail"], str):
+        return False
+    paths = x.get("paths")
+    if paths is not None and not (isinstance(paths, list) and all(isinstance(p, str) for p in paths)):
+        return False
+    row = x.get("row")
+    return row is None or isinstance(row, str)
+
+
 def verify_task_of(s, feature_ref):
     """The Verify Task a `verify-report` applies to (C4): the one of `--feature`, else the single
     running Verify Task in the folder. Raises when the folder has none, or has more than one and no
@@ -686,10 +704,10 @@ def cmd_verify_report(args):
                 findings = json.load(f)
         except (OSError, ValueError) as e:
             raise Fail(f"Couldn't read the findings file {args.findings_file!r}: {e}")
-        if not isinstance(findings, list) or not all(
-                isinstance(x, dict) and x.get("level") in VERIFY_LEVELS for x in findings):
+        if not isinstance(findings, list) or not all(valid_finding(x) for x in findings):
             raise Fail("The findings file must be a JSON list of findings, each a JSON object with a "
-                       "level of blocker, major or minor (the contract's findings shape).")
+                       "level of blocker, major or minor, a title, and (optionally) a string detail, a "
+                       "list of string paths and a string or null row (the contract's findings shape).")
     with open_store(args) as s:
         t = verify_task_of(s, getattr(args, "feature", None))
         t["verify_pass"] = bool(args.passed)
@@ -698,7 +716,8 @@ def cmd_verify_report(args):
         ref = s.ref(t)
     blockers = sum(1 for x in findings if x.get("level") == "blocker")
     how = "passed" if args.passed else f"reported {len(findings)} finding(s), {blockers} blocker(s)"
-    say(args, {"ok": True, "task": ref, "findings": len(findings), "blockers": blockers}, f"{ref}: verify {how}.")
+    # The success envelope is exactly C5/C6: {ok, findings, blockers}.
+    say(args, {"ok": True, "findings": len(findings), "blockers": blockers}, f"{ref}: verify {how}.")
 
 
 def cmd_review_more(args):

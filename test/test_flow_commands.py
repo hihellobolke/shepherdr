@@ -492,7 +492,7 @@ class FlowHooks(unittest.TestCase):
     def test_verify_report_pass(self):
         fid, vref, vid = self._feature_with_verify()
         got = self.call(self.commands.cmd_verify_report, passed=True)
-        self.assertEqual(got, {"ok": True, "task": vref, "findings": 0, "blockers": 0})
+        self.assertEqual(got, {"ok": True, "findings": 0, "blockers": 0})  # exactly the C5/C6 envelope
         t = self.task(vid)
         self.assertIs(t["verify_pass"], True)
         self.assertEqual(t["findings"], [])
@@ -539,9 +539,31 @@ class FlowHooks(unittest.TestCase):
 
     def test_verify_report_picks_the_feature(self):
         fid, vref, vid = self._feature_with_verify(extra_verify=True)
-        got = self.call(self.commands.cmd_verify_report, passed=True, feature=vref.rsplit("-", 1)[0] + f"-{fid}")
-        self.assertEqual(got["task"], vref)
+        self.call(self.commands.cmd_verify_report, passed=True, feature=vref.rsplit("-", 1)[0] + f"-{fid}")
         self.assertIs(self.task(vid)["verify_pass"], True)
+
+    def test_verify_report_rejects_a_finding_missing_its_title(self):
+        self._feature_with_verify()
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w") as f:
+            json.dump([{"level": "major"}], f)  # no title
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(findings_file=path))
+
+    def test_verify_report_rejects_type_confused_fields(self):
+        self._feature_with_verify()
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w") as f:
+            json.dump([{"level": "major", "title": 17, "detail": [], "paths": 123, "row": {}}], f)
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(findings_file=path))
+
+    def test_valid_finding_accepts_the_contract_shapes(self):
+        self.assertTrue(self.commands.valid_finding(
+            {"level": "blocker", "title": "Auth bypass", "detail": "d", "paths": ["src/a.ts"], "row": "2.2"}))
+        self.assertTrue(self.commands.valid_finding(
+            {"level": "minor", "title": "nit", "detail": "d", "paths": [], "row": None}))
+        self.assertTrue(self.commands.valid_finding({"level": "major", "title": "just a title"}))
 
     # ---- list --feature (C4, C8) ----------------------------------------------------------
 
