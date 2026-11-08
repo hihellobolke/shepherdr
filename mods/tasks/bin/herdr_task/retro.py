@@ -61,20 +61,17 @@ def retro_template():
 
 def _retro_role(s, space=None):
     """The agent pick the retro Task runs with: the `retro` role, else the Reviewer's. When neither
-    names an agent, the Reviewer's effective default stands in - the other CLI from the worker, as
-    the reviewer a task gets does - so the retro reads with fresh eyes and never silently inherits
-    the worker's model or effort."""
+    names an agent, the retro falls back to the same CLI a reviewer gets - the other CLI from the
+    worker's effective agent - so it reads with fresh eyes and never silently inherits the worker's
+    model or effort. This reuses the launcher's own resolver (`worker_argv` then `agent_key`, as
+    `settings.task_settings` picks the reviewer's CLI), so every worker configuration is handled the
+    one way, not a second-guessed copy of it."""
     cfg = settings.settings_for(s, space)
     pick = dict(cfg.get("retro") or {})
     if not pick:
         pick = dict(cfg.get("reviewer") or {})
     if not pick.get("agent") and not pick.get("argv"):
-        # The worker's own CLI, resolved the way the launcher does: its `argv`'s command wins over
-        # its `agent` (argv_for/worker_argv read argv first), else `agent`, else claude. The retro
-        # runs on the other CLI, so it never reads with the same CLI as the code it reviews, whatever
-        # mix of `agent` and `argv` the settings layers leave on the worker.
-        worker = cfg.get("worker") or {}
-        worker_cli = settings.agent_key(worker["argv"]) if worker.get("argv") else (worker.get("agent") or "claude")
+        worker_cli = settings.agent_key(settings.worker_argv(s, {}, space))
         pick["agent"] = settings.other_cli(worker_cli)
     return pick
 
