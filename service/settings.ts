@@ -425,14 +425,15 @@ export class Settings {
       }
       if (machine && !Object.keys(layer).length) delete next.machines[machine];
     } else if (key === "tasks.may_change") {
-      // several of its choices at once (agents_md, specs), comma-joined; kept in the contract's order; empty follows above
+      // several of its choices at once (agents_md, specs), comma-joined; kept in the contract's order. An empty pick is
+      // stored as [] (nothing may change, C1), not deleted: a space can say "nothing" even when Everywhere allows some.
+      // Reset (word null, or setting it back to what it would inherit) deletes the override, as the window's Reset does.
       if (word === null) put("tasks", "may_change", null);
       else {
         const on = word.split(",").map((x) => x.trim()).filter(Boolean);
         const allowed = new Set(MAY_CHANGE.map(([v]: any) => v));
         if (on.some((x) => !allowed.has(x))) throw new Error("Not one of its choices.");
-        const v = MAY_CHANGE.map(([x]: any) => x).filter((x: any) => on.includes(x));
-        put("tasks", "may_change", v.length ? v : null);
+        put("tasks", "may_change", MAY_CHANGE.map(([x]: any) => x).filter((x: any) => on.includes(x)));
       }
     } else if (task) {
       const [, , , choices] = task;
