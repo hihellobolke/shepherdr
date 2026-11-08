@@ -318,7 +318,10 @@ class ForcedConflict(Base):
         git(wt, "fetch", "-q", "origin", "main")
         git(wt, "-c", "core.editor=true", "merge", "-q", "-X", "ours", "origin/main")
         git(wt, "push", "-q", "--force-with-lease", "origin", "task/HAT-30-c")
-        # Now the merge of the resolved head goes through (the detected conflict was not sticky).
+        # gh pr view recomputes mergeable from the resolved head, so the consumer sees it recover.
+        r = self.gh("pr", "view", "1", "--repo", "octo/demo", "--json", "mergeable")
+        self.assertEqual(json.loads(r.stdout)["mergeable"], "MERGEABLE")
+        # And the merge of the resolved head goes through (the detected conflict was not sticky).
         r = self.gh("pr", "merge", "1", "--repo", "octo/demo", "--squash")
         self.assertEqual(r.returncode, 0, r.stderr)
         pr = self.fakes.find_pr(number=1)
@@ -507,14 +510,27 @@ class SecondMachine(Base):
         r = self.hc("exec", "--on", "vm-b", "--", sys.executable, "-c", probe)
         self.assertEqual(json.loads(r.stdout)["store"], m["store"])
 
-    def test_exec_keeps_the_real_home_but_runs_in_the_machine_dir(self):
-        # base.guard refuses hc under a changed HOME, so a remote herdr-task needs the real HOME; a
-        # remote command's relative paths are isolated by running in the machine's own directory.
+    def test_exec_runs_with_the_machine_home_and_dir(self):
+        # The remote command's HOME and working directory are the machine's own scratch, so everything
+        # it reaches (its $HOME, relative paths) stays on that simulated machine, never the real one.
         m = self.fakes.add_machine("vm-b")
         r = self.hc("exec", "--on", "vm-b", "--", "sh", "-c", "echo $HOME; pwd")
         home, cwd = r.stdout.strip().splitlines()
-        self.assertEqual(os.path.realpath(home), os.path.realpath(os.environ["HOME"]))
+        self.assertEqual(os.path.realpath(home), os.path.realpath(m["home"]))
         self.assertEqual(os.path.realpath(cwd), os.path.realpath(m["home"]))
+
+    def test_exec_launches_the_machines_own_herdr_task_copy(self):
+        # `herdr-task --on <machine>` runs `"$HOME/.local/bin/herdr-task"` (cli.remote_run); $HOME is
+        # the machine's scratch home, so it runs the copy installed there, not the real one.
+        m = self.fakes.add_machine("vm-b")
+        dest = os.path.join(m["home"], ".local/bin/herdr-task")
+        os.makedirs(os.path.dirname(dest))
+        with open(dest, "w") as f:
+            f.write("#!/bin/sh\necho machine-copy-ran\n")
+        os.chmod(dest, 0o755)
+        r = self.hc("exec", "--on", "vm-b", "--", "sh", "-c", 'exec "$HOME/.local/bin/herdr-task" "$@"',
+                    "herdr-task", "ping")
+        self.assertEqual(r.stdout.strip(), "machine-copy-ran")
 
 
 # ---- the call log and isolation ---------------------------------------------------------------

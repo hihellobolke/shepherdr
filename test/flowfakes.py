@@ -410,12 +410,24 @@ def _rollup(pr):
 
 
 def _live_head(state, pr):
-    """A pull request with its head sha refreshed from the remote while it is open, so a child that
-    rebased or pushed corrections after the pull request opened is reflected (what `gh pr view`
-    returns live). A merged pull request keeps the head sha frozen at the moment it merged."""
-    if pr["state"] == "OPEN":
-        return {**pr, "headRefOid": _sha(state["origin"], pr["head"]) or pr["headRefOid"]}
-    return pr
+    """A pull request with its head sha and mergeable flag refreshed from the remote while it is open,
+    so a child that rebased or pushed corrections after the pull request opened is reflected (what
+    `gh pr view` returns live): once a conflicting head is resolved and pushed, `mergeable` goes back
+    to `MERGEABLE`. A scripted conflict (`force_conflict`) stays `CONFLICTING`. A merged pull request
+    keeps its head sha and flag frozen at the moment it merged."""
+    if pr["state"] != "OPEN":
+        return pr
+    live = {**pr, "headRefOid": _sha(state["origin"], pr["head"]) or pr["headRefOid"]}
+    if not pr.get("force_conflict"):
+        live["mergeable"] = _mergeable_now(state, pr)
+    return live
+
+
+def _mergeable_now(state, pr):
+    """Whether the head still merges cleanly into the base, by a dry `git merge-tree` on the bare
+    origin (0 clean, non-zero on conflict)."""
+    r = _git(state["origin"], "merge-tree", "--write-tree", pr["base"], pr["head"], check=False)
+    return "MERGEABLE" if r.returncode == 0 else "CONFLICTING"
 
 
 def _pr_json(pr, fields):
@@ -746,12 +758,14 @@ def _hc_exec(state_dir, argv):
     """`hc exec --on <machine> [--timeout T] -- <cmd...>`: run the command as if on that machine, or
     answer connection refused when the machine is down.
 
-    The command runs in the machine's own scratch directory (its working directory) with its store
-    and settings redirected there, but with the real `HOME` left intact: a remote `herdr-task` calls
-    `base.guard`, which refuses `hc` when `HOME` is not the account's own, so a changed `HOME` would
-    stop the real remote `herdr-task` from running. `cli.remote_run`'s own paths are relative
-    (`test -d .config/...`, `chmod .local/bin/herdr-task`), so running in the machine's working
-    directory keeps them on that simulated machine and never on the real one."""
+    The command runs with the machine's own `HOME` (its scratch directory), working directory, store
+    and settings, all under the scratch root, so everything a remote command reaches stays on that
+    simulated machine and never on the real one: `cli.remote_run` launches the remote `herdr-task`
+    through `"$HOME/.local/bin/herdr-task"` and does `test -d .config/...` and `chmod`, which must
+    resolve to the copy and paths on that machine. The flow's remote command, `feature-status`, reads
+    the machine's store and does not call `hc`, so `base.guard` (which refuses `hc` under a HOME that
+    is not the account's own) is not reached; a remote command that did call `hc` could not be
+    simulated on one box and is out of scope."""
     flags, _, after = _parse_flags(argv, {"--on", "--timeout"}, bare=("--stdin", "--observe"))
     machine = flags.get("--on")
     state = _read_state(state_dir)
@@ -762,8 +776,10 @@ def _hc_exec(state_dir, argv):
             return 1
         home = rec["home"]
         env = dict(os.environ)
+        env["HOME"] = home
         env["HERDR_TASK_STORE"] = rec["store"]
         env["HERDR_TASK_SETTINGS"] = os.path.join(home, ".herdr", "shepherdr.json")
+        env["HERDR_TASK_WORKTREES"] = os.path.join(home, ".herdr", "worktrees")
         stdin = sys.stdin.read() if flags.get("--stdin") else None
         r = subprocess.run(after, env=env, cwd=home, input=stdin, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True)
