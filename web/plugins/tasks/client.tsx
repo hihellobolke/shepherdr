@@ -82,7 +82,7 @@ import {
   field,
 } from '@client/ui.tsx'
 import { doneNewestFirst, machineName, type Automation, type Feature, type FeatureAction, type Place, type Snapshot, type Task } from '@shared/types.ts'
-import { featureGroups, type FeatureGroup } from '@client/groups.ts'
+import { featureChildren, featureGroups, type FeatureGroup } from '@client/groups.ts'
 import { useFlip } from '@client/motion.ts'
 import { RowMenu, useRowMenu, type RowMenuState } from '@client/rowmenu.tsx'
 import * as MN from '@core/menus.js'
@@ -498,7 +498,7 @@ function FeatureGroupBlock({ feature, tasks, note, order, listKey, shut, first }
     <div data-flip={key} data-heading={feature.ref} className={clsx('px-1.5 phone:px-2', first ? 'pt-1.5' : 'pt-3')}>
       <div className="flex min-h-11 w-full items-center gap-2 rounded-row px-1 phone:px-2">
         {/* the heading folds the Feature's tasks away; Alt/Option takes no siblings (a Feature stands on its own) */}
-        <button type="button" aria-expanded={!shut} aria-label={`${feature.ref} ${feature.title}, ${bits}${note ? `, ${note}` : ''}`}
+        <button type="button" aria-expanded={!shut} aria-label={`${feature.ref} ${feature.title}${feature.attention ? ', needs you' : ''}, ${bits}${note ? `, ${note}` : ''}`}
           onClick={() => toggleShut(listKey, key)}
           className="press group/h flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-row px-1 text-left outline-none select-none hover:bg-hover keys:focus-visible:shadow-[inset_0_0_0_1.5px_var(--color-focus)]">
           <Chevron aria-hidden className={clsx(ic, 'shrink-0 text-fg3 group-hover/h:text-fg')} />
@@ -587,11 +587,16 @@ function TaskList(_: { placeId: string }) {
     )
   }
   // OpenSpec flow (proposal section 6.17): group each folder's Features, their child Tasks nested under one summary row.
-  // A Feature shows when it has a child in view, or (searching) when it or a child matches. Its children are then pulled
-  // out of the status, space and machine groups below (baseSnap), but a pinned or needs-you child stays cross-cutting in
-  // Pinned and Needs you, so no Task shows twice. A classic space has no Features, so feats is empty and the list is
-  // unchanged. Scoping is by folder and machine (groups.ts featureChildren), since a Feature id repeats across stores.
-  const feats = featureGroups(snap.features ?? [], live, snap.host, (f) => !!q && matches(q, f.ref, f.title, f.phaseLabel))
+  // Scope the Features to the view first (by folder and machine, groups.ts featureChildren; a Feature id repeats across
+  // stores): a Feature belongs here when the view holds any of its Tasks, archived ones included. So a Feature stays
+  // visible with its Merge feature action even after its children are all done and archived, and a Feature from another
+  // space or machine never shows, not even when its ref matches a search. In view, every scoped Feature shows; searching,
+  // only those the search matches (by the Feature or a child). Its children are pulled out of the status, space and
+  // machine groups below (baseSnap), but a pinned or needs-you child stays cross-cutting in Pinned and Needs you, so no
+  // Task shows twice. A classic space has no Features, so feats is empty and the list is unchanged.
+  const inView = snap.tasks.filter((t) => inList(snap, view.chips, t.place))
+  const scopedFeatures = (snap.features ?? []).filter((f) => featureChildren(f, inView, snap.host).length > 0)
+  const feats = featureGroups(scopedFeatures, live, snap.host, (f) => (q ? matches(q, f.ref, f.title, f.phaseLabel) : true))
   const underFeature = new Set(feats.flatMap((g) => g.tasks.map((t) => t.id)))
   // a Feature heading names its machine and space only as far as more than one shown Feature contributes each
   const multiFeatMachine = new Set(feats.map((g) => g.feature.machine ?? snap.host)).size > 1
@@ -619,8 +624,9 @@ function TaskList(_: { placeId: string }) {
   // the cross-cutting groups (Pinned, Needs you) stay at the top; the Feature rows come after them; then the rest
   const crossGroups = groups.filter((g) => g.key === 'pinned' || g.key === 'need')
   const restGroups = groups.filter((g) => g !== archivedGroup && g.key !== 'pinned' && g.key !== 'need')
-  // what the keyboard walks: the rows on screen, in the order they show (Pinned, Needs you, Features, then the rest)
-  const order = [...crossGroups.flatMap((g) => g.tasks), ...feats.flatMap((g) => (featShut(g) ? [] : g.tasks)), ...restGroups.flatMap((g) => g.tasks)]
+  // what the keyboard walks: the rows on screen, in the order they show (Pinned, Needs you, Features, the rest, then the
+  // Archived matches a search puts last)
+  const order = [...crossGroups.flatMap((g) => g.tasks), ...feats.flatMap((g) => (featShut(g) ? [] : g.tasks)), ...restGroups.flatMap((g) => g.tasks), ...(archivedGroup?.tasks ?? [])]
   const machines = [...new Set(groups.flatMap((g) => (g.machine ? [g.machine.id] : [])))]
   const machineShut = (id: string) => !q && shut.includes(`${key}|m:${id}`)
   const nothing = !groups.length && !feats.length && !autos.length
