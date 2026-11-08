@@ -63,16 +63,26 @@ def close(s, feature):
 
     wt, created = _acquire(main, feature["branch"])
     try:
-        ticked, no_child = _tick(s, feature, wt)
-        result["ticked"], result["no_child"] = ticked, no_child
-        if no_child:
-            feature["attention"] = "row-no-child"
-            s.dirty = True
-            result["attention"] = feature["attention"]
-            return result
-
-        archive_change(wt, feature["change"])
-        result["archived"] = True
+        change = feature["change"]
+        # Resume safely. Closing can re-enter after it has already ticked and archived (a base
+        # conflict, then its Integration Task merges and verify passes; or a push/PR that failed
+        # after the archive commit). The archive step moved the live change folder, so on a re-entry
+        # only the later steps are left: do not tick or archive again, just merge the base and open
+        # the pull request.
+        if _live_change(wt, change):
+            ticked, no_child = _tick(s, feature, wt)
+            result["ticked"], result["no_child"] = ticked, no_child
+            if no_child:
+                feature["attention"] = "row-no-child"
+                s.dirty = True
+                result["attention"] = feature["attention"]
+                return result
+            archive_change(wt, change)
+            result["archived"] = True
+        elif _archived_change(wt, change):
+            result["archived"] = True
+        else:
+            raise Fail(f"no tasks.md for {change} on {feature['branch']} (neither live nor archived)")
 
         merged = merge_base_in(wt, feature)
         if merged.get("conflict"):
@@ -105,10 +115,24 @@ def tick_merged_rows(s, feature):
         _release(main, wt, created)
 
 
+def _change_dir(folder, change):
+    return os.path.join(folder, "openspec", "changes", change)
+
+
+def _live_change(folder, change):
+    """The change is still under `openspec/changes/<change>` (not archived yet)."""
+    return os.path.isfile(os.path.join(_change_dir(folder, change), "tasks.md"))
+
+
+def _archived_change(folder, change):
+    """The change has already been archived under `openspec/changes/archive/<change>`."""
+    return os.path.isfile(os.path.join(folder, "openspec", "changes", "archive", change, "tasks.md"))
+
+
 def _tick(s, feature, folder):
     """The tick work in a checked-out `folder`; returns `(ticked_rows, rows_with_no_merged_child)`."""
     change = feature["change"]
-    path = os.path.join(folder, "openspec", "changes", change, "tasks.md")
+    path = os.path.join(_change_dir(folder, change), "tasks.md")
     try:
         with open(path) as f:
             text = f.read()
@@ -175,7 +199,9 @@ def archive_change(folder, change):
         raise Fail("openspec is not installed here; cannot archive the change")
     if r.returncode != 0:
         raise Fail((r.stderr or r.stdout).strip() or f"openspec archive {change} failed")
-    git(folder, "add", "-A")
+    # Stage only the archive's own effect (everything lives under `openspec/`), never any unrelated
+    # modified or untracked file that happens to sit in the worktree.
+    git(folder, "add", "-A", "--", "openspec")
     _commit(folder, f"Archive {change}")
 
 
@@ -192,8 +218,13 @@ def merge_base_in(folder, feature):
     target = base
     if feature.get("mode") == "remote":
         remote = remote_of(folder)
-        if git(folder, "fetch", "--quiet", remote, base)[0]:
-            target = f"{remote}/{base}"
+        # The whole point of closing is to integrate the real (remote) base. A failed fetch must not
+        # fall back to a stale local base: that could merge clean and move the Feature to ready while
+        # the remote base still conflicts. Stop instead; the next tick retries the fetch.
+        ok, _, err = git(folder, "fetch", "--quiet", remote, base)
+        if not ok:
+            raise Fail(f"could not fetch {remote}/{base}: {err or 'fetch failed'}")
+        target = f"{remote}/{base}"
     r = run(["git", "-C", folder, "merge", "--no-edit", target])
     if r.returncode == 0:
         return {"conflict": False}
@@ -313,6 +344,12 @@ def _acquire(main, branch):
     out there; otherwise adds a short-lived worktree (removed by `_release`)."""
     existing = _worktree_of(main, branch)
     if existing and os.path.isdir(existing):
+        # A worktree already checked out on the feature branch: reuse it, but never when it is dirty.
+        # Closing commits with `git add`, so unrelated staged, modified or untracked work there would
+        # land in a closing commit. Refuse instead and leave the person's work alone.
+        if run(["git", "-C", existing, "status", "--porcelain"]).stdout.strip():
+            raise Fail(f"the worktree for {branch} ({existing}) has uncommitted changes; "
+                       f"closing will not commit them. Clean or commit them first.")
         return existing, False
     holder = tempfile.mkdtemp(prefix="herdr-closing-")
     path = os.path.join(holder, "wt")

@@ -301,6 +301,50 @@ class BaseConflict(Base):
             self.assertEqual(sum(1 for c in f["children"] if c.get("role") == "integration"), 1)
 
 
+class Resume(Base):
+    def _archive_on_branch(self):
+        """Mimic a prior close that ticked and archived the change on the feature branch, before it
+        hit a base conflict that has since been resolved."""
+        self.git("checkout", "-q", BRANCH)
+        src = os.path.join(self.repo, "openspec", "changes", CHANGE)
+        dst = os.path.join(self.repo, "openspec", "changes", "archive", CHANGE)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "archived earlier")
+        self.git("checkout", "-q", "main")
+
+    def test_close_resumes_after_the_archive_step(self):
+        """Re-entering closing when the change is already archived skips tick and archive, merges the
+        base and reaches ready, instead of failing to find the moved tasks.md (reviewer blocker)."""
+        self.seed_main()
+        self.make_feature_branch()
+        self._archive_on_branch()
+        ref = self.build_store(ALL_ROWS)
+        with store.Store(self.loc) as s:
+            result = closing.close(s, s.find_feature(ref))
+        self.assertEqual(result["ticked"], [])      # nothing to tick on a resume
+        self.assertTrue(result["archived"])         # recognised as already archived
+        self.assertFalse(result["conflict"])
+        self.assertEqual(result["phase"], "ready")
+
+    def test_close_refuses_a_dirty_feature_worktree(self):
+        """A worktree already checked out on the feature branch with uncommitted work is never
+        committed into a closing commit (reviewer blocker)."""
+        self.seed_main()
+        self.make_feature_branch()
+        holder = tempfile.mkdtemp(prefix="feat-wt-")
+        self.addCleanup(shutil.rmtree, holder, True)
+        wt = os.path.join(holder, "wt")
+        self.git("worktree", "add", "--quiet", wt, BRANCH)
+        self.addCleanup(lambda: self.git("worktree", "remove", "--force", wt))
+        self.write("junk.txt", "unrelated work\n", cwd=wt)  # untracked, uncommitted
+        ref = self.build_store(ALL_ROWS)
+        with store.Store(self.loc) as s:
+            with self.assertRaises(Fail):
+                closing.close(s, s.find_feature(ref))
+
+
 class RowNoChild(Base):
     def test_a_row_with_no_merged_child_shows_needs_you(self):
         self.seed_main()
@@ -379,6 +423,32 @@ class Steps(Base):
         self.addCleanup(lambda: self.git("worktree", "remove", "--force", wt))
         r = closing.merge_base_in(wt, {"base": "main", "branch": BRANCH, "mode": "local"})
         self.assertFalse(r["conflict"])
+
+    def test_archive_change_stages_only_openspec(self):
+        """An unrelated untracked file in the worktree is never swept into the archive commit."""
+        self.seed_main()
+        self.make_feature_branch()
+        wt_holder = tempfile.mkdtemp(prefix="wt-")
+        self.addCleanup(shutil.rmtree, wt_holder, True)
+        wt = os.path.join(wt_holder, "wt")
+        self.git("worktree", "add", "--quiet", wt, BRANCH)
+        self.addCleanup(lambda: self.git("worktree", "remove", "--force", wt))
+        self.write("junk.txt", "unrelated\n", cwd=wt)
+        closing.archive_change(wt, CHANGE)
+        self.assertEqual(self.show("junk.txt"), "")  # not committed to the branch
+        self.assertEqual(self.git("log", "-1", "--format=%s", BRANCH), f"Archive {CHANGE}")
+
+    def test_merge_base_in_raises_when_a_remote_fetch_fails(self):
+        """Remote mode with no reachable remote stops instead of merging a stale local base."""
+        self.seed_main()
+        self.make_feature_branch()
+        wt_holder = tempfile.mkdtemp(prefix="wt-")
+        self.addCleanup(shutil.rmtree, wt_holder, True)
+        wt = os.path.join(wt_holder, "wt")
+        self.git("worktree", "add", "--quiet", wt, BRANCH)
+        self.addCleanup(lambda: self.git("worktree", "remove", "--force", wt))
+        with self.assertRaises(Fail):
+            closing.merge_base_in(wt, {"base": "main", "branch": BRANCH, "mode": "remote"})
 
     def test_archive_change_moves_and_commits(self):
         self.seed_main()
