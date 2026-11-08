@@ -146,15 +146,15 @@ def run(s, change, machines=None, amend=False, start=True):
         raise Fail(p.get("error") or "the work table is not valid")
     feature = _feature_for(s, change)
 
+    space = _spec_space(s, feature)
     cancelled = _amend_cancel(s, feature, p["packages"]) if amend else []
     if amend:
-        _amend_reconcile_risk(s, feature, p["packages"])
+        _amend_reconcile_risk(s, feature, p["packages"], space)
 
     existing = _children_by_rows(feature)
     # Only a package that still has to be created can be refused for its placement; a child already on
     # another machine (its machine preserved in the plan) is left alone, not re-refused.
     _refuse_remote_creation([pkg for pkg in p["packages"] if frozenset(pkg["rows"]) not in existing])
-    space = _spec_space(s, feature)
     created = 0
     queued_at = now()
     for entry in p["packages"]:
@@ -727,12 +727,17 @@ def _started(task):
     return task.get("state") not in ("todo", "queued", "scheduled", "cancelled")
 
 
-def _amend_reconcile_risk(s, feature, packages):
+def _amend_reconcile_risk(s, feature, packages, space):
     """On an amendment, bring an existing child's risk and merge policy in line with its row (section
     6.6, contract C2: a high-risk Task uses merge=ask). This applies to a started child too: merge
     policy only gates the merge, so raising it to `ask` keeps a newly-risky change from merging without
     the person, and it does not disturb the running work. Only the owned paths of a running child are
-    left unchanged (that is `_amend_warnings`' job)."""
+    left unchanged (that is `_amend_warnings`' job).
+
+    Risk is computed against the child's own (retained) owned paths, not only the row's new owns: a
+    child that keeps risky owned paths must keep its approval gate even when the amended row's own paths
+    became low risk, so an amendment cannot quietly remove the gate."""
+    risky = settings_for(s, space)["tasks"].get("risky_paths") or []
     pkg_by_rows = {frozenset(pkg["rows"]): pkg for pkg in packages}
     for c in feature.get("children", []):
         if c.get("machine"):
@@ -741,9 +746,13 @@ def _amend_reconcile_risk(s, feature, packages):
         t = s.task_by_id(c["ref"])
         if not pkg or not t:
             continue
-        if pkg["risk"] != t.get("risk"):
-            t["risk"] = pkg["risk"]
-            set_task(t, "merge", pkg["merge"])
+        column_high = pkg["risk"] == "high" and pkg["risk_reason"] == "risk column is high"
+        owns_risky = any(_risky_match(p, risky) for p in (t.get("owns") or []))
+        risk = "high" if column_high or owns_risky else "low"
+        merge = "ask" if risk == "high" else "checks"
+        if t.get("risk") != risk or (t.get("set") or {}).get("merge") != merge:
+            t["risk"] = risk
+            set_task(t, "merge", merge)
             s.dirty = True
 
 

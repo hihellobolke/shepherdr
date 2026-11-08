@@ -642,6 +642,45 @@ class AmendTest(Base):
         self.assertEqual(child["owns"], ["src/h.ts"])  # unchanged under the running child
 
 
+# ---- an amendment must not remove a still-risky child's approval gate -------------------------
+
+class RiskDowngradeTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.make_feature()
+        with open(settings_mod.SETTINGS, "w") as f:
+            json.dump({"everywhere": {"tasks": {"risky_paths": ["security/**"]}}}, f)
+        self.addCleanup(lambda: os.path.exists(settings_mod.SETTINGS) and os.remove(settings_mod.SETTINGS))
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Base | src/base.ts |  | low | S |\n"
+            "| 1.1 | Auth | security/auth.py | 0.1 | low | S |\n"
+        )
+        self.run_fanout()
+
+    def test_amendment_keeps_the_gate_when_owns_stay_risky(self):
+        # 1.1 is high because it owns a risky path; its child is running. An amendment changes the row's
+        # owns to a low-risk path, but the running child keeps its risky owned paths, so its approval
+        # gate (merge=ask) must stay: an amendment cannot quietly let a risky change auto-merge.
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertEqual(child["set"]["merge"], "ask")  # high at creation
+        with st.Store(self.loc) as s:
+            t = next(t for t in s.data["tasks"] if t.get("rows") == ["1.1"])
+            t["state"], t["started"] = "running", 1700000000000
+            s.dirty = True
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Base | src/base.ts |  | low | S |\n"
+            "| 1.1 | Auth | ui/login.ts | 0.1 | low | S |\n")
+        self.run_fanout(amend=True)
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertEqual(child["risk"], "high")             # still risky by its retained owns
+        self.assertEqual(child["set"]["merge"], "ask")      # the gate stays
+        self.assertEqual(child["owns"], ["security/auth.py"])  # owns untouched on the running child
+
+
 # ---- risk from risky paths (section 6.6) -----------------------------------------------------
 
 class RiskyPathTest(Base):
@@ -761,11 +800,16 @@ class CmdFanoutTest(Base):
         self.assertEqual(self.read(), before)  # nothing created
 
     def test_real_run_creates(self):
-        rc, out = self._capture(Args(change=self.change, folder=self.repo, json=True))
+        # --no-start: cmd_fanout only wakes the scheduler when it queued tasks, and a test must not
+        # touch the real scheduler terminal (it is not isolated by the throwaway store). The start path
+        # itself is covered by RunTest against fanout.run.
+        rc, out = self._capture(Args(change=self.change, folder=self.repo, json=True, no_start=True))
         self.assertEqual(rc, 0)
         p = json.loads(out)
         self.assertEqual(p["created"]["children"], 4)
-        self.assertEqual(len([t for t in self.read()["tasks"] if t.get("role") == "child"]), 4)
+        children = [t for t in self.read()["tasks"] if t.get("role") == "child"]
+        self.assertEqual(len(children), 4)
+        self.assertTrue(all(t["state"] == "todo" for t in children))  # created, not started
 
     def test_invalid_table_exit_1(self):
         self.write_table("## Work table\n\nnothing\n")
