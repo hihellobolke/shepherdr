@@ -19,7 +19,7 @@ You merge into the feature branch, never into main.
 
 `herdr-task ready` compares your diff against the base.
 A changed path outside your owned paths refuses ready and lists the paths.
-Lockfiles and generated files are exempt.
+A short built-in list of lockfiles and generated files is exempt, and the repo can add to it; nothing else outside your owned paths is.
 The same check runs inside `sync-branch`.
 
 ## Keep your branch current
@@ -32,10 +32,10 @@ That is normal and safe when you use one command, never a hand rebase:
 It backs your branch up, turns on `rerere`, and rebases your branch onto the feature branch.
 It never touches a file outside your owned paths, and it never merges a lockfile or a generated file by hand.
 
-Read its result and act on the `reason`:
+Read its result and act on it (with `--json` the outcome is the `reason` field):
 
 - `clean`: you are current. A clean rebase keeps your review valid.
-- `conflict`: it aborted and restored your branch. It lists the conflicted files, the ones outside your owned paths, and the lockfiles to regenerate. Resolve on your branch, regenerate lockfiles (do not merge them by hand), and commit.
+- `conflict`: it aborted and restored your branch, so your working tree is clean again, with no conflict markers. The report lists the conflicted files, which of them fall outside your owned paths, and the lockfiles to regenerate. To recover: regenerate the flagged lockfiles and generated files and commit them (never merge them by hand); for a conflict in a file you own, rebase your own branch onto the feature branch yourself, resolve it only within your owned paths, and commit; then run `sync-branch` again. If any conflicted file is outside your owned paths, do not touch it: set your status line to "needs owns change" and ask the Assistant.
 - `owned-paths`: your own diff already reaches outside your owned paths. Fix that first (above).
 - `checks-failed`: the rebase was clean but the project checks failed on the changed paths. Fix them.
 

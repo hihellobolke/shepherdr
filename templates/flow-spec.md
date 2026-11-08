@@ -59,4 +59,4 @@ Fix the table until both pass clean.
 The Accept card shows the dry-run summary, so the person reads the risk marks before they accept.
 
 Do not run `fanout` for real and do not start any Child Task.
-Plan approval runs fan-out by itself once the person accepts.
+Plan approval normally runs fan-out by itself once the person accepts, unless the Feature was created with fan-out turned off.
