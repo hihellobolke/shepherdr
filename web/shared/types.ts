@@ -289,6 +289,52 @@ export interface TaskAgent {
   note: string
 }
 
+/** one of a Feature's two human actions (core/features.js FEATURE_ACTIONS): Merge feature, or Add a fix round */
+export interface FeatureAction {
+  /** the action id the web sends back: 'feature-merge' or 'feature-fix-round' */
+  id: string
+  label: string
+}
+
+/** An OpenSpec-flow Feature as the snapshot carries it (docs/openspec-flow.md contract C2 and C9): the stored Feature
+ *  record, ref-enriched with `ref`, `folder` and `machine`, plus the computed featureRow summary fields (phaseLabel,
+ *  merged, total, findings, actions). The heavy record fields (children, digests, created) are left out of the snapshot;
+ *  the web groups tasks under a Feature by each task's own `feature` id. */
+export interface Feature {
+  /** the integer id from the folder counter (shared with Tasks; a ref is a Feature or a Task, never both) */
+  id: number
+  /** computed from the folder prefix, like a task row's ref: 'HAT-12' */
+  ref: string
+  title: string
+  /** the OpenSpec change folder name under openspec/changes/ */
+  change?: string
+  branch?: string
+  base?: string
+  mode?: string
+  /** one of the seven phases: planning, building, verifying, closing, ready, done, cancelled */
+  phase: string
+  /** the phase in the person's words (core/features.js PHASE_LABEL) */
+  phaseLabel: string
+  /** a reason code for Needs you, or '' */
+  attention?: string
+  spec_task?: number | null
+  verify_task?: number | null
+  fix_rounds?: number
+  auto_fanout?: boolean
+  /** how many children merged */
+  merged: number
+  /** the child count */
+  total: number
+  /** the open verify findings count */
+  findings: number
+  /** the human actions offered now: Merge feature when phase is ready, Add a fix round when attention is verify-open */
+  actions: FeatureAction[]
+  /** the folder whose store holds the Feature, on its machine */
+  folder: string
+  /** the machine the Feature lives on (null: this machine) */
+  machine: string | null
+}
+
 export interface Task {
   /** short name, as people say it: GTM-15 */
   id: string
@@ -355,6 +401,13 @@ export interface Task {
   browser?: { ready: boolean; hint?: string }
   /** what its row says it is in (3.0's Tasks): the space working in its list's folder, else the list's name */
   listName?: string
+  /** OpenSpec flow (docs/openspec-flow.md C2): the id of the Feature this Task belongs to, how the web and the window
+   *  group it under its Feature with core/features.js groupByFeature. Absent on a classic Task. */
+  feature?: number
+  /** its flow role: 'spec', 'child', 'verify', 'fix', 'integration' or 'retro'. Absent on a classic Task. */
+  role?: string
+  /** its flow risk: 'low' or 'high'. Absent on a classic Task. */
+  risk?: string
 }
 
 /** An automation as a project's Tasks lists it: its name, when it runs, the task it adds */
@@ -1194,6 +1247,10 @@ export interface Snapshot {
   /** the machines, as headings over their spaces, in the sidebar's order */
   machines: Machine[]
   tasks: Task[]
+  /** every OpenSpec-flow Feature of every machine, each ref-enriched with its featureRow summary (service/model.ts
+   *  featuresOf). Each task row carries its own `feature` id; the web and the window group tasks under a Feature with
+   *  core/features.js groupByFeature. Empty on a space with flow=classic. */
+  features: Feature[]
   automations: Record<string, Automation[]>
   /** every artifact, of every machine */
   artifacts: Artifact[]
@@ -1251,6 +1308,10 @@ export type Action =
   | { type: 'artifact-note'; place: string; artifact: string; v: number; note: string; target?: string }
   | { type: 'artifact-say'; place: string; artifact: string; v: number; text: string }
   | { type: 'artifact-delete'; place: string; artifact: string }
+  /** a Feature's Merge feature action (only in phase ready): runs `herdr-task feature merge <ref>` */
+  | { type: 'feature-merge'; feature: string; folder: string; machine?: string | null }
+  /** a Feature's Add a fix round action (only when its attention is verify-open): runs `herdr-task feature fix-round <ref>` */
+  | { type: 'feature-fix-round'; feature: string; folder: string; machine?: string | null }
   /** Mark up's notes from the shared browser, sent together into the task's chat */
   | { type: 'browser-notes'; cid?: string; chat: string; url: string; title?: string; viewport?: { w: number; h: number }; notes: BrowserNote[] }
   | { type: 'mode'; place: string; mode: Mode; keepWorkers?: boolean }

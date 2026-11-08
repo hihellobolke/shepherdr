@@ -18,6 +18,8 @@ import * as N from "../core/notify.js";
 const { spaceLevel } = N as any;
 import * as AP from "../core/autopilot.js";
 const { everywhereOf, pilotFor, levelOf, STARTER, currentBeat } = AP as any;
+// The shared OpenSpec-flow Feature-row summary (core/features.js): featuresOf builds each Feature's snapshot entry with it.
+import { featureRow } from "../core/features.js";
 
 const SHARED = join(HOME, ".config", "herdr-app", "shared.json");
 const SETTINGS = process.env.HERDR_TASK_SETTINGS || join(HOME, ".herdr", "shepherdr.json");
@@ -34,6 +36,33 @@ export const sh = (hub: Hub, script: string, args: string[], on: string | null) 
 
 type List = any;
 
+/** The OpenSpec-flow Features of every folder, for the snapshot (docs/openspec-flow.md C9). Each list's store file
+ *  already carries a `features` list (store.py), so this reads it beside the list's tasks. Every Feature is enriched
+ *  with its `ref` (from the folder prefix, the same way a task row gets its ref), its `folder` and `machine`, and the
+ *  computed `featureRow` summary fields (phaseLabel, merged, total, findings, actions). The heavy record fields
+ *  (children, digests, created) are left out of the snapshot; the web and the window group tasks under a Feature by each
+ *  task row's own `feature` id. A space with flow=classic has no `features` list, so this returns `[]` for it. */
+export function featuresOf(lists: List[], rows: any[]): any[] {
+  return lists.flatMap((list) =>
+    (Array.isArray(list.features) ? list.features : []).map((f: any) => {
+      const machine = list.machine ?? null;
+      const ref = `${list.prefix}-${f.id}`;
+      // the full record (with its children and digests) goes to featureRow: it counts merged-of-total from the record
+      // (so remote children on other machines count too), and the open findings from this Feature's Verify Task row
+      const full = { ...f, ref, folder: list.folder, machine };
+      // the rows featureRow needs: this Feature's Tasks in its own store. featureRow reads only the Verify Task off them
+      // (its findings), and that Task lives in the Feature's own store; merged/total come from the record. So scope by
+      // folder AND machine - a Feature id and folder path can collide with an unrelated machine's store (each machine's
+      // counter is separate, docs/openspec-flow.md C2), and mixing them would read the wrong store's findings.
+      const children = rows.filter((r) => r.feature === f.id && r.folder === list.folder && (r.machine ?? null) === machine);
+      const summary = featureRow(full, children);
+      // the snapshot entry is lean: the record without children/digests/created, plus ref/folder/machine and the summary
+      const { children: _children, digests: _digests, created: _created, ...lean } = full;
+      return { ...lean, ...summary };
+    }),
+  );
+}
+
 export class Model {
   private lists = new Map<string | null, List[]>();   // machine (null: here) -> its task lists
   private docs = new Map<string | null, any>();       // machine -> its herdr-app document
@@ -43,7 +72,7 @@ export class Model {
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   /** Told each build: what the screen's snapshot is made from (compat.ts). */
-  onBuild: ((b: { spaces: any[]; sections: any[]; rows: any[]; machines: string[]; known: { name: string; state: string }[]; automations: any[] }) => void) | null = null;
+  onBuild: ((b: { spaces: any[]; sections: any[]; rows: any[]; features: any[]; machines: string[]; known: { name: string; state: string }[]; automations: any[] }) => void) | null = null;
 
   /** The service's shared document (the person's pins, sidebar and Notify, in step with the window: lib/bridge.js). */
   doc: () => Record<string, any> = () => ({});
@@ -252,6 +281,12 @@ export class Model {
         // needs the person
         said: w?.text ? { text: w.text, done: w.done ?? null, left: w.left ?? null, paused: !!w.paused } : null,
         machine: list.machine, folder: list.folder, slug: list.slug, id: task.id, list: list.name,
+        // the OpenSpec-flow fields of C2, carried only for a flow Task so a classic row is byte-for-byte unchanged: its
+        // Feature id (how the web and featuresOf group it under its Feature), its role and risk, and a Verify Task's
+        // findings (core/features.js reads them off the Verify row for the Feature's open-findings count)
+        ...(task.feature != null ? { feature: task.feature } : {}),
+        ...(task.role ? { role: task.role } : {}), ...(task.risk ? { risk: task.risk } : {}),
+        ...(Array.isArray(task.findings) ? { findings: task.findings } : {}),
         // the space whose Assistant started it (herdr-task keeps it): the window counts and lists it there
         space: task.space ? (list.machine ? `${list.machine}/${task.space}` : task.space) : null,
         worker, archived: !!task.archived, pinned: pins.has(taskKey(list, task)),
@@ -269,6 +304,10 @@ export class Model {
       };
     }));
     this.live.put("tasks", rows);
+    // the folders' OpenSpec-flow Features, beside the tasks (docs/openspec-flow.md C9): the snapshot carries them so the
+    // web and the window can group tasks under their Feature (empty for a folder with no Features, e.g. flow=classic)
+    const features = featuresOf(lists, rows);
+    this.live.put("features", features);
 
     const bar = sidebarOf(this.value("spaces-chat"));
     const seen = this.shared["chat.seen"] ?? {};
@@ -299,6 +338,6 @@ export class Model {
     this.live.put("spaces", { spaces, sections: bar.sections });
     // each list's automations (herdr-task auto), with the folder and machine they belong to, for 3.0's Automations group
     const automations = lists.flatMap((l: any) => (Array.isArray(l.automations) ? l.automations : []).map((a: any) => ({ ...a, folder: l.folder, machine: l.machine ?? null, list: l.name })));
-    this.onBuild?.({ spaces, sections: bar.sections, rows, machines: this.machines, known: this.known, automations });
+    this.onBuild?.({ spaces, sections: bar.sections, rows, features, machines: this.machines, known: this.known, automations });
   }
 }
