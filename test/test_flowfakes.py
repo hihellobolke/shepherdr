@@ -465,6 +465,15 @@ class SecondMachine(Base):
         self.assertEqual(r.returncode, 1)
         self.assertIn("connection refused", r.stderr)
 
+    def test_exec_on_an_unregistered_machine_is_refused_and_runs_nothing(self):
+        # An unknown machine must not fall through to a local run (which would use the real HOME and
+        # could launch the real installed herdr-task): it is refused, and the command never runs.
+        marker = os.path.join(self.root, "ran-marker")
+        r = self.hc("exec", "--on", "nope", "--", "sh", "-c", f"touch {marker}")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no such machine", r.stderr)
+        self.assertFalse(os.path.exists(marker))
+
     def test_machine_ls_lists_the_registered_machines(self):
         self.fakes.add_machine("vm-b")
         self.fakes.add_machine("vm-c")

@@ -769,8 +769,13 @@ def _hc_exec(state_dir, argv):
     flags, _, after = _parse_flags(argv, {"--on", "--timeout"}, bare=("--stdin", "--observe"))
     machine = flags.get("--on")
     state = _read_state(state_dir)
-    if machine and machine in state["machines"]:
-        rec = state["machines"][machine]
+    if machine:
+        rec = state["machines"].get(machine)
+        if rec is None:
+            # An unregistered machine is never run here (that would use the real HOME and could launch
+            # the real installed herdr-task): it is refused, as hc would for a machine it cannot reach.
+            sys.stderr.write(f"hc: {machine}: no such machine\n")
+            return 1
         if rec.get("down"):
             sys.stderr.write(f"hc: {machine}: connection refused\n")
             return 1
@@ -786,7 +791,7 @@ def _hc_exec(state_dir, argv):
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         return r.returncode
-    # No such machine (or none named): run the command here.
+    # No `--on`: a local exec on the home machine (the caller's own controlled environment).
     if after:
         r = subprocess.run(after, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         sys.stdout.write(r.stdout)
