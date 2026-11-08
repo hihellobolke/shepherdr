@@ -471,15 +471,19 @@ class TestStoreIsolation(unittest.TestCase):
         self.addCleanup(shutil.rmtree, home, ignore_errors=True)
         # Import herdr_task.store (which freezes the store root from the env) BEFORE the probe test's
         # module loads, exactly as an earlier test file does in a full suite run. Then run the probe
-        # and report whether it passed and what landed in the default store.
+        # and report whether it passed and what landed in the real ~/.herdr (tasks, settings,
+        # worktrees), all of which resolve under the throwaway HOME here.
         code = (
             "import sys, os, json, unittest\n"
             "sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2])\n"
             "import herdr_task.store as st\n"
             "res = unittest.TextTestRunner(verbosity=0).run("
             "unittest.TestLoader().loadTestsFromName(sys.argv[3]))\n"
-            "tasks = os.path.join(st.HOME, '.herdr', 'tasks')\n"
-            "leaked = sorted(os.listdir(tasks)) if os.path.isdir(tasks) else []\n"
+            "herdr = os.path.join(st.HOME, '.herdr')\n"
+            "listing = lambda p: sorted(os.listdir(p)) if os.path.isdir(p) else []\n"
+            "leaked = {'tasks': listing(os.path.join(herdr, 'tasks')),\n"
+            "          'worktrees': listing(os.path.join(herdr, 'worktrees')),\n"
+            "          'settings': ['shepherdr.json'] if os.path.exists(os.path.join(herdr, 'shepherdr.json')) else []}\n"
             "print('RESULT:' + json.dumps({'ok': res.wasSuccessful(), 'leaked': leaked}))\n"
         )
         env = {k: v for k, v in os.environ.items()
@@ -492,9 +496,9 @@ class TestStoreIsolation(unittest.TestCase):
                              f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
         out = json.loads(line[len("RESULT:"):])
         self.assertTrue(out["ok"], f"the isolation probe {self.PROBE} did not pass:\n{r.stdout}\n{r.stderr}")
-        self.assertEqual(out["leaked"], [], "a test wrote to the default store instead of its throwaway "
-                         "root; a full suite run would leak into the real ~/.herdr/tasks like this: "
-                         + ", ".join(out["leaked"]))
+        hits = [f"{where} ({', '.join(names)})" for where, names in sorted(out["leaked"].items()) if names]
+        self.assertEqual(hits, [], "a test wrote to the default roots instead of its throwaway ones; "
+                         "a full suite run would leak into the real ~/.herdr like this: " + "; ".join(hits))
 
 
 if __name__ == "__main__":
