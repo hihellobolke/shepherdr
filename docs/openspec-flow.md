@@ -252,11 +252,13 @@ Keys are stable.
     }
   ],
   "verify_task": { "after": ["HAT-14", "HAT-15"] },
+  "recreated": [],
   "warnings": []
 }
 ```
 
 - `risk_reason` is `""` for a low-risk row; for a high-risk row it is `risk column is high` or `owns matches risky path <glob>`.
+- `recreated` lists the packages whose child was removed by hand (`herdr-task rm`) and that this run re-creates, each `{ "package", "rows", "ref" }` in package order. It is empty on a first run and on an ordinary rerun. A brand-new row is an ordinary addition (in `packages`), not a re-creation; a row recorded skipped is a kept gap (proposal 6.12) and is never re-created, so it is never here.
 - When the table is invalid, the shape is `{"change": "...", "valid": false, "code": "<code>", "error": "<message>"}`, with `code` one of `missing-id`, `unknown-dep`, `cycle`, `empty-owns`, `size-l`, `bad-risk`, `bad-table` (C6).
 
 `feature-status`:

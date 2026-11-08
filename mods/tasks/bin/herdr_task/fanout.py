@@ -10,6 +10,12 @@ first Verify Task that waits for them all, and queues them so the existing queue
 free up. It is idempotent: a second run adds only the missing children (property of section 6.7), and
 `--amend` reads an updated table, adds the new rows and cancels an unstarted child of a removed row.
 
+A rerun keeps the links the Assistant added by hand (proposal 6.8), local and cross-machine: fan-out
+records which `after`/`after_ext` edges it owns (`flow_after`/`flow_after_ext`) and replaces only those,
+so an Assistant `--after` wait, including a cross-machine one, survives every rerun. A child removed by
+hand (`herdr-task rm` leaves a stale `children` entry) is a missing child, re-created and reported in
+the plan's `recreated`; a row recorded skipped is a kept gap (section 6.12) and is never re-created.
+
 `check_plan` is the plan guard that `ready` runs on a spec Task (contract C8): `openspec validate`
 plus a dry run must both pass before the plan can be approved. The spec worker runs `ready` in its own
 worktree, so `check_plan` reads the work table and validates from that worktree, not from the main
@@ -84,6 +90,11 @@ def plan(s, change, machines=None, amend=False, folder=None):
         pkg["machine"] = machine_of[pkg["id"]]
 
     refs = _predict_refs(s, feature, packages)
+    # A skipped kept gap whose Task was removed holds nothing up: the run links no one to it and the
+    # Verify Task does not wait for it (`_deps_split`, `_live_children`), so the preview leaves its dead
+    # ref out too, keeping the plan and the real run in step (contract C5).
+    dead_rows = _dead_gap_rows(s, feature)
+    dead_pkgs = {pkg["id"] for pkg in packages if frozenset(pkg["rows"]) in dead_rows}
 
     out = []
     for pkg in packages:
@@ -100,12 +111,12 @@ def plan(s, change, machines=None, amend=False, folder=None):
             "machine": machine,
             "branch": _child_branch(s, feature, refs[pkg["id"]]["ref"], pkg),
             "base": feature["branch"],
-            "after": _plan_after(pkg, packages, refs, machine),
+            "after": _plan_after(pkg, packages, refs, machine, dead_pkgs),
             "merge": "ask" if pkg["risk"] == "high" else "checks",
             "brief": _child_brief(s, feature, change, pkg),
         })
 
-    verify_after = [refs[p["id"]]["ref_q"] for p in packages]
+    verify_after = [refs[p["id"]]["ref_q"] for p in packages if p["id"] not in dead_pkgs]
     if amend:
         # A started or remote child of a removed row is kept, and the Verify Task still waits for it;
         # show that in the preview so the plan matches what Verify will wait for.
@@ -118,8 +129,18 @@ def plan(s, change, machines=None, amend=False, folder=None):
         "waves": waves,
         "packages": out,
         "verify_task": {"after": verify_after},
+        "recreated": _recreated_preview(s, feature, packages, refs),
         "warnings": _amend_warnings(s, feature, packages) if amend else [],
     }
+
+
+def _recreated_preview(s, feature, packages, refs):
+    """The packages whose child was removed by hand (`herdr-task rm`) and that a run re-creates, as
+    {"package", "rows", "ref"} in package order (C5, additive). A skipped row is a kept gap, so it is
+    never here; a brand-new row is an ordinary addition, not a re-creation, so it is not here either."""
+    removed = {frozenset(c.get("rows") or []) for c in _removed_children(s, feature)}
+    return [{"package": pkg["id"], "rows": pkg["rows"], "ref": refs[pkg["id"]]["ref_q"]}
+            for pkg in packages if frozenset(pkg["rows"]) in removed]
 
 
 def dry_run_json(plan_dict):
@@ -138,9 +159,11 @@ def run(s, change, machines=None, amend=False, start=True):
     and `"cancelled"` when an amendment cancelled children.
 
     Idempotent: a child already recorded on the Feature (matched by its work-package rows) is left as
-    it is, so a second run only fills the gaps. With `amend`, an unstarted child of a row the table no
-    longer has is cancelled, a started one is kept with a warning, and a running child's owns are never
-    changed (section 6.7)."""
+    it is, so a second run only fills the gaps. A child removed by hand (`herdr-task rm`) is a missing
+    child: its stale entry is dropped and it is re-created, listed in the plan's `recreated` (section
+    6.7). A row recorded skipped is a kept gap (section 6.12): it is never re-created. With `amend`, an
+    unstarted child of a row the table no longer has is cancelled, a started one is kept with a warning,
+    and a running child's owns are never changed (section 6.7)."""
     p = plan(s, change, machines, amend)
     if not p.get("valid"):
         raise Fail(p.get("error") or "the work table is not valid")
@@ -150,6 +173,11 @@ def run(s, change, machines=None, amend=False, start=True):
     cancelled = _amend_cancel(s, feature, p["packages"]) if amend else []
     if amend:
         _amend_reconcile_risk(s, feature, p["packages"], space)
+
+    # A child the person skipped is remembered as a kept gap; one removed by hand (`herdr-task rm`) is a
+    # missing child its stale entry is dropped for, so the create loop below re-creates it (section 6.7).
+    _stamp_skipped(s, feature)
+    _drop_removed(s, feature)
 
     existing = _children_by_rows(feature)
     # Only a package that still has to be created can be refused for its placement; a child already on
@@ -238,6 +266,8 @@ def _say_plan(args, p):
         lines.append(f"  {pkg['package']} ({', '.join(pkg['rows'])}){where}{risk}")
         lines.append("    herdr-task add " + " ".join(_add_flags(p["feature"], pkg)))
     lines.append(f"  verify after {', '.join(p['verify_task']['after']) or '(nothing)'}")
+    for rc in p.get("recreated") or []:
+        lines.append(f"  re-create {rc['package']} ({', '.join(rc['rows'])}): its child was removed by hand")
     for w in p.get("warnings") or []:
         lines.append(f"  warning: {w}")
     if "created" in p:
@@ -425,8 +455,11 @@ def _predict_refs(s, feature, packages):
     """For the plan display, a map from package id to {ref, ref_q, machine}. An existing child keeps
     its real ref and machine; a missing one is predicted from the folder counter in package order,
     with this folder's prefix. These predictions are for the dry-run preview only; a real run links by
-    the children it actually creates (`_link_home_children`, `_ensure_verify`)."""
-    existing = _children_by_rows(feature)
+    the children it actually creates (`_link_home_children`, `_ensure_verify`).
+
+    A child removed by hand (`herdr-task rm`) is not "existing", so it is predicted a fresh ref and the
+    plan previews it as re-created, matching the real run that re-creates it (`_removed_children`)."""
+    existing = _present_by_rows(s, feature)
     nxt = s.data.get("next", 1)
     refs = {}
     for pkg in packages:
@@ -440,13 +473,16 @@ def _predict_refs(s, feature, packages):
     return refs
 
 
-def _plan_after(pkg, packages, refs, machine):
+def _plan_after(pkg, packages, refs, machine, skip=()):
     """The after refs shown in the plan: the child of each package it depends on, machine-qualified
     when it sits on another machine (proposal section 6.13). A root package comes after nothing: the
     fan-out trigger only runs once the spec Task has merged onto the feature branch (contract C8), so
-    the children branch from a feature branch that already holds the plan."""
+    the children branch from a feature branch that already holds the plan. A dependency in `skip` (a
+    skipped kept gap whose Task is gone) is left out, matching the real run which links to no one dead."""
     out = []
     for pid in _pkg_depends(pkg, packages):
+        if pid in skip:
+            continue
         dep = refs[pid]
         out.append(dep["ref_q"] if dep["machine"] != machine else dep["ref"])
     return out
@@ -565,8 +601,13 @@ def _dep_children(feature, entry, packages):
 def _deps_split(s, feature, entry, packages):
     """What a package's child comes after: (home task ids, external wait records) for the children of its
     predecessor packages. A predecessor on another machine becomes an `after_ext` record built directly
-    (its machine, its id, the folder prefix) with no cross-machine query, so fan-out stays lock-safe."""
-    return _local_and_ext(s, _dep_children(feature, entry, packages))
+    (its machine, its id, the folder prefix) with no cross-machine query, so fan-out stays lock-safe.
+
+    A predecessor that is a skipped kept gap whose Task was removed by hand (section 6.12) is left out:
+    a skipped row unblocks its dependents, so its dependent waits for nothing dead."""
+    deps = [c for c in _dep_children(feature, entry, packages)
+            if c.get("machine") or s.task_by_id(c["ref"]) is not None]
+    return _local_and_ext(s, deps)
 
 
 def _local_and_ext(s, children):
@@ -613,28 +654,50 @@ def _no_loop(s, task, ids):
         todo.extend(by_id.get(i, {}).get("after") or [])
 
 
+def _flow_ext_keys(task):
+    """The (machine, id) keys of the cross-machine waits fan-out owns on `task` (`flow_after_ext`, stored
+    as [machine, id] pairs because JSON has no tuples), as tuples for set membership."""
+    return [(k[0], k[1]) for k in (task.get("flow_after_ext") or [])]
+
+
+def _desired_ext(task, new):
+    """The `after_ext` a Task should end with: fan-out's current cross-machine deps (`new`, keeping any
+    polling state the queue already stored for one still wanted), plus the cross-machine waits fan-out did
+    not add (an Assistant's `--after machine:REF`, proposal 6.8), kept across reruns. A wait fan-out owns
+    (`flow_after_ext`) but no longer wants is dropped; one it never owned is preserved."""
+    managed = set(_flow_ext_keys(task))
+    new_keys = {(e["machine"], e["id"]) for e in new}
+    kept = [e for e in (task.get("after_ext") or [])
+            if (e.get("machine"), e.get("id")) not in managed
+            and (e.get("machine"), e.get("id")) not in new_keys]
+    return _merge_ext(task.get("after_ext"), new) + kept
+
+
 def _desired_links(task, home_ids, ext):
-    """The `after` and `after_ext` a Task should end with: its fan-out-managed home deps (`home_ids`)
-    plus the edges fan-out did not add (the Assistant's, proposal 6.8, kept across reruns), and the
-    external waits merged with any polling state already stored."""
+    """The `after` and `after_ext` a Task should end with: its fan-out-managed home deps (`home_ids`) and
+    cross-machine deps (`ext`), plus the links fan-out did not add (the Assistant's, proposal 6.8, kept
+    across reruns, local and cross-machine), the external ones merged with any polling state already
+    stored."""
     managed = set(task.get("flow_after") or [])
     kept = [i for i in (task.get("after") or []) if i not in managed and i not in home_ids]
     after = [i for i in home_ids if i] + kept
-    return after, _merge_ext(task.get("after_ext"), ext)
+    return after, _desired_ext(task, ext)
 
 
 def _links_match(task, home_ids, ext):
     after, after_ext = _desired_links(task, home_ids, ext)
     return ((task.get("after") or []) == after
             and _ext_key(task.get("after_ext")) == _ext_key(after_ext)
-            and (task.get("flow_after") or []) == list(home_ids))
+            and (task.get("flow_after") or []) == list(home_ids)
+            and _flow_ext_keys(task) == [(e["machine"], e["id"]) for e in ext])
 
 
 def _reconcile_after(s, task, home_ids, ext):
     """Set a Task's fan-out-managed home deps (`home_ids`) and cross-machine waits (`ext`), keeping the
-    edges fan-out did not add and never querying another machine (lock-safe). `flow_after` records which
-    home deps fan-out owns, so a later rerun replaces only those and leaves an Assistant-added `--after`
-    in place (proposal 6.8)."""
+    links fan-out did not add and never querying another machine (lock-safe). `flow_after` records which
+    home deps fan-out owns and `flow_after_ext` which cross-machine waits, so a later rerun replaces only
+    those and leaves an Assistant-added `--after` in place, whether it is local or cross-machine
+    (proposal 6.8)."""
     if _links_match(task, home_ids, ext):
         return
     after, after_ext = _desired_links(task, home_ids, ext)
@@ -645,6 +708,11 @@ def _reconcile_after(s, task, home_ids, ext):
     else:
         task.pop("after_ext", None)
     task["flow_after"] = list(home_ids)
+    flow_ext = [[e["machine"], e["id"]] for e in ext]
+    if flow_ext:
+        task["flow_after_ext"] = flow_ext
+    else:
+        task.pop("flow_after_ext", None)
     s.dirty = True
 
 
@@ -685,7 +753,7 @@ def _ensure_verify(s, feature, change, space, start, queued_at):
     Returns True when a Verify Task was created. The Verify Task waits for every child, on this machine
     (directly) and on others (external waits built without a cross-machine query), so verify covers all
     children (contract C7)."""
-    home_ids, ext = _local_and_ext(s, feature.get("children", []))
+    home_ids, ext = _local_and_ext(s, _live_children(s, feature))
     if feature.get("verify_task"):
         t = s.task_by_id(feature["verify_task"])
         if t:
@@ -827,6 +895,74 @@ def _children_by_rows(feature):
     """A map from a child's work-package row set (frozenset) to its Feature `children` entry, so a
     rerun matches a package to the child that already does it (idempotent fan-out)."""
     return {frozenset(c.get("rows") or []): c for c in feature.get("children", [])}
+
+
+def _present_by_rows(s, feature):
+    """A map from row set to the Feature `children` entry that counts as already created, so a rerun does
+    not re-create it (property of section 6.7: "a second run skips children that exist"). Present means a
+    remote child, a home child whose Task still exists, or a home child recorded skipped (a kept gap of
+    section 6.12, even if its Task was later removed). A home child whose Task was removed by hand
+    (`herdr-task rm`) and that is not skipped is absent: a missing child a rerun re-creates."""
+    return {frozenset(c.get("rows") or []): c for c in feature.get("children", []) if _present(s, c)}
+
+
+def _present(s, child):
+    if child.get("machine") or child.get("skipped"):
+        return True
+    return s.task_by_id(child["ref"]) is not None
+
+
+def _removed_children(s, feature):
+    """The home child entries whose Task was removed by hand (`herdr-task rm`) and that are not a kept
+    (skipped) gap: a rerun drops the stale entry and re-creates the child."""
+    return [c for c in feature.get("children", [])
+            if not c.get("machine") and not c.get("skipped") and s.task_by_id(c["ref"]) is None]
+
+
+def _live_children(s, feature):
+    """The children the Verify Task waits for: remote children and home children whose Task exists. A home
+    child recorded skipped whose Task is gone (a kept gap, section 6.12) holds nothing up, so a dead ref is
+    left out of the Verify Task's `after`."""
+    return [c for c in feature.get("children", [])
+            if c.get("machine") or s.task_by_id(c["ref"]) is not None]
+
+
+def _dead_gap_rows(s, feature):
+    """The row sets of skipped kept gaps whose Task was removed by hand: a home child recorded skipped with
+    no live Task. The run links no one to them and the Verify Task does not wait for them, so the plan
+    preview leaves their dead refs out too (plan matches run)."""
+    return {frozenset(c.get("rows") or []) for c in feature.get("children", [])
+            if not c.get("machine") and c.get("skipped") and s.task_by_id(c["ref"]) is None}
+
+
+def _stamp_skipped(s, feature):
+    """Keep each home child entry's `skipped` marker in step with its Task, so a child the person skipped
+    is remembered as a kept gap even if its Task is later removed by hand; a later rerun then does not
+    re-create it (section 6.12). A dangling entry (no Task) keeps whatever marker a prior run stamped."""
+    for c in feature.get("children", []):
+        if c.get("machine"):
+            continue
+        t = s.task_by_id(c["ref"])
+        if t is None:
+            continue
+        if t.get("skipped") and not c.get("skipped"):
+            c["skipped"] = True
+            s.dirty = True
+        elif not t.get("skipped") and c.get("skipped"):
+            del c["skipped"]
+            s.dirty = True
+
+
+def _drop_removed(s, feature):
+    """Drop the stale `children` entries of children removed by hand (so the create loop re-creates them,
+    not leaving two entries for one row set). Returns their refs, in children order, for the plan report."""
+    gone = _removed_children(s, feature)
+    if not gone:
+        return []
+    refs = [_ref_of(s, c) for c in gone]
+    feature["children"] = [c for c in feature.get("children", []) if not any(c is g for g in gone)]
+    s.dirty = True
+    return refs
 
 
 def _child_record(s, child):
