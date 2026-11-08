@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import shutil
@@ -25,6 +26,33 @@ from .star import cmd_star
 from .home import cmd_home
 from .assistant_settings import cmd_session_note
 from .feedback import cmd_feedback
+
+
+# ---- OpenSpec flow commands (C4) ------------------------------------------------------------
+# The flow modules (feature.py, fanout.py, branchsync.py, feature_status.py, retro_data.py,
+# retro.py, flow_init.py) and commands.cmd_verify_report are added by the other OpenSpec flow
+# tasks. This module only parses their commands, subcommands and flags, and dispatches to the
+# contract's `<module>.cmd_<name>(args)` with a lazy import. Until a module lands, the command
+# exits with a clear "not available yet" error.
+
+def flow(module, func, label):
+    """A dispatcher that imports a flow module only when its command runs; a clear error until
+    the module (or its entry function) lands. A real import error inside a module that has landed
+    is left to propagate, so it is not hidden behind the "not available yet" message."""
+    def run(args):
+        try:
+            mod = importlib.import_module(f".{module}", __package__)
+        except ModuleNotFoundError as e:
+            if e.name in (module, f"{__package__}.{module}"):
+                raise Fail(f"{label} is not available yet")
+            raise
+        try:
+            fn = getattr(mod, func)
+        except AttributeError:
+            raise Fail(f"{label} is not available yet")
+        return fn(args)
+    run.flow_target = (module, func)  # the contract entry it dispatches to, for introspection
+    return run
 
 
 # ---- another machine ------------------------------------------------------------------------
@@ -144,6 +172,25 @@ def main():
         print(VERSION)
         return 0
 
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return 1
+    try:
+        args.fn(args)
+    except Fail as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"herdr-task: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def build_parser():
+    """The full argument parser. Separated from main() so parsing can be exercised in-process
+    (tests, and any caller that wants the namespace) without running a command."""
     p = argparse.ArgumentParser(prog="herdr-task", description="Herdr's tasks: add, start and finish work for a folder.",
                                 epilog="Run on another machine's folder: herdr-task --on <machine> <command> ...")
     sub = p.add_subparsers(dest="cmd")
@@ -191,6 +238,7 @@ def main():
     c = cmd("list", cmd_list, "list tasks", id=False)
     c.add_argument("--all", action="store_true", help="every folder's tasks on this machine")
     c.add_argument("--archived", action="store_true", help="the archived tasks instead (Done ones archive themselves after a week), latest first")
+    c.add_argument("--feature", help="only this Feature's Tasks, shown as its tree (HAT-12 > HAT-14)")
     c = cmd("add", cmd_add, "add a task; prints its id", id=False)
     c.add_argument("title")
     c.add_argument("--prompt")
@@ -204,6 +252,13 @@ def main():
                                    "machine's with the machine first (vm-b:HAT-12)")
     c.add_argument("--space", help="the space it's for, whose settings it takes (default: yours)")
     when_opts(c)
+    # OpenSpec flow (C4): the Feature fields of a flow Task. Parsed here; commands.py stores them.
+    c.add_argument("--feature", help="the Feature this Task belongs to (sets its role to child unless --role is given)")
+    c.add_argument("--role", choices=["spec", "child", "verify", "fix", "integration", "retro"],
+                   help="the Task's flow role (requires --feature)")
+    c.add_argument("--owns", action="append", metavar="GLOB[,GLOB...]",
+                   help="the Task's owned paths, comma-separated; repeatable, values add up")
+    c.add_argument("--risk", choices=["low", "high"], help="the Task's risk (default: low)")
     c = cmd("show", cmd_show, "one task")
     c.add_argument("--evidence", action="store_true", help="with what its Accept card shows: commits, changed files, checks and its proof")
     c = cmd("start", cmd_start, "start a task's agent (no tab: an hc child of the space's coordinator)")
@@ -460,16 +515,86 @@ def main():
     c.add_argument("--folder")
     c.set_defaults(fn=cmd_track, json=False)
 
-    args = p.parse_args(argv)
-    if not getattr(args, "fn", None):
-        p.print_help()
-        return 1
-    try:
-        args.fn(args)
-    except Fail as e:
-        if getattr(args, "json", False):
-            print(json.dumps({"error": str(e)}))
-        else:
-            print(f"herdr-task: {e}", file=sys.stderr)
-        return 1
-    return 0
+    # ---- OpenSpec flow (C4) ----------------------------------------------------------------
+    # Every flow command, subcommand and flag, each dispatching to the contract's
+    # `<module>.cmd_<name>` through flow(); the module is added by another task, so until it
+    # lands the command exits with a clear "not available yet" error.
+
+    fe = sub.add_parser("feature", help="an OpenSpec Feature: its spec Task, children, Verify Task and merge").add_subparsers(dest="feature_cmd")
+
+    def feature_cmd(name, help, ref=True):
+        c = fe.add_parser(name, help=help)
+        if ref:
+            c.add_argument("ref", help="the Feature's ref (HAT-12) or id")
+        c.add_argument("--folder")
+        c.add_argument("--json", action="store_true")
+        c.set_defaults(fn=flow("feature", "cmd_feature", "feature"), feature_cmd=name)
+        return c
+
+    c = feature_cmd("add", "create the Feature, its feature branch and the spec Task", ref=False)
+    c.add_argument("title")
+    c.add_argument("--base", help="the branch the Feature merges into (default: main)")
+    c.add_argument("--change", help="the OpenSpec change name (default: generated from the title)")
+    c.add_argument("--mode", choices=["remote", "local"], help="remote (GitHub) or local, one machine only (default: detected)")
+    c.add_argument("--no-auto-fanout", dest="auto_fanout", action="store_false",
+                   help="don't fan out by itself on Plan approval for this Feature")
+    feature_cmd("list", "every Feature in the folder", ref=False)
+    c = feature_cmd("show", "one Feature's full state: the record, each child's state and its digest")
+    c.add_argument("--on", help="the machine the Feature is on")
+    feature_cmd("sync", "merge the base branch into the feature branch early")
+    feature_cmd("cancel", "stop running children, remove queued ones; keep the feature branch")
+    feature_cmd("merge", "the person's Merge feature action (phase ready only)")
+    feature_cmd("fix-round", "the person's Add a fix round action")
+
+    c = sub.add_parser("fanout", help="turn an approved work table into child Tasks")
+    c.add_argument("change", help="the OpenSpec change name")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--dry-run", action="store_true", help="create nothing; print the plan")
+    c.add_argument("--machines", help="place packages across these machines, comma-separated: a,b,c")
+    c.add_argument("--amend", action="store_true", help="read an updated table and add only new rows (cancel unstarted children of removed rows)")
+    c.add_argument("--no-start", dest="start", action="store_false", help="create the Tasks but don't start them")
+    c.set_defaults(fn=flow("fanout", "cmd_fanout", "fanout"))
+
+    c = sub.add_parser("sync-branch", help="a worker rebases its worktree onto the feature branch before ready")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--base", help="the feature branch to rebase onto (default: the Task's base)")
+    c.set_defaults(fn=flow("branchsync", "cmd_sync_branch", "sync-branch"))
+
+    c = sub.add_parser("feature-status", help="the states and digests of a Feature's children on one machine")
+    c.add_argument("ref", help="the Feature's ref (HAT-12)")
+    c.add_argument("--on", help="the machine")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=flow("feature_status", "cmd_feature_status", "feature-status"))
+
+    c = sub.add_parser("verify-report", help="a Verify Task reports its result")
+    g = c.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true", help="no findings")
+    g.add_argument("--findings-file", help="a JSON list of findings (the findings shape of the contract)")
+    c.add_argument("--feature", help="the Feature's ref when the folder has more than one")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=flow("commands", "cmd_verify_report", "verify-report"))
+
+    c = sub.add_parser("retro-data", help="the retro JSON for a Feature")
+    c.add_argument("ref", help="the Feature's ref (HAT-12)")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=flow("retro_data", "cmd_retro_data", "retro-data"))
+
+    c = sub.add_parser("retro", help="start a retro for a Feature now, with the retro agent settings")
+    c.add_argument("ref", help="the Feature's ref (HAT-12)")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=flow("retro", "cmd_retro", "retro"))
+
+    fl = sub.add_parser("flow", help="prepare a repo for the OpenSpec flow").add_subparsers(dest="flow_cmd")
+    c = fl.add_parser("init", help="openspec init, the skill check and the pinned skill copies")
+    c.add_argument("--update", action="store_true", help="move the pinned skill copies to a newer commit")
+    c.add_argument("--folder")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=flow("flow_init", "cmd_flow_init", "flow init"))
+
+    return p
