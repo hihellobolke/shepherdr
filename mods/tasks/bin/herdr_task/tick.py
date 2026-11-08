@@ -10,22 +10,31 @@ import time
 
 from .base import Fail, guard, hc_json, now, PR_EVERY, run, SHELLS, STORE
 from .settings import machine_name, worker_argv
+from . import settings as settings_mod
 from .agents import agent_log, agent_running, busy_again, detail, held_ask, live_agents, status_word, task_status
 from .provider import NUDGE, provider_cut, provider_error, PROVIDER_WAITS
 from .sessions import find_lost_logs, refresh_sessions, session_of
 from .github import already_merged, finish, github, merged_here, pr_merged, pr_pending, pr_problem, pr_view, watch_main
-from .launch import default_space
+from .launch import coordinator_in, default_space
 from .store import locate, read_list, Store, store_files
 from .queues import machine_hold, refresh_ext, running_count, set_hold, waiting_ext, waiting_for
 from .archive import archive_pass
 from .browsers import browser_pass
 from .output import progress_clock, say
 from .commands import back_to_work, begin, merge_now, MERGE_FAILED
+from . import news
 from .news import news_pass, typing
 from .takeover import cant_go_on, takeover
 from .ghnews import main_pass, pr_deliver, pr_news
 from .scheduler import SCHEDULER
 from .revive import revive_pass
+from . import phases
+from . import fanout
+from . import closing
+from . import feature_status
+from . import digest
+from . import retro
+from . import feature as feature_mod
 
 
 def at_work(s, t):
@@ -416,6 +425,451 @@ def retry_pass(report):
         os.replace(tmp, RETRIES)
 
 
+# ---- the Feature pass (OpenSpec flow, T19) --------------------------------------------------
+# Each tick drives every live Feature in a folder (contract C8): it brings its children's states
+# and digests to the home machine (feature_status.gather), stores a digest when a child ends, fires
+# the fan-out trigger once the spec merge has landed (fanout.run), restarts a failed or stalled
+# child once (the queue starts it again), moves the phase through phases.phase_of, counts fix rounds
+# and raises Needs you once they run out, runs the closing steps (closing.close), starts a retro when
+# a done Feature's setting is automatic (retro.start), and tells the Feature's Assistant the wave and
+# phase-change summaries plus the one-by-one exception events (the news module). A classic folder has
+# no `features`, so the whole pass is a no-op for it, and a classic Task is never touched.
+
+# The child-level exception reasons tick.py writes into a child's `attention` for phases.phase_of to
+# read (the module leaves these to the caller, contract C8). A generic needs-you (the child asked the
+# person something that is not a plan or owns request) and a risky Task waiting are news-only events.
+CHILD_EXCEPTIONS = ("failed", "stalled", "needs-plan", "needs-owns")
+
+# The flow roles whose Tasks phases.phase_of reads as a Feature's children (the spec Task is not one).
+_CHILD_ROLES = ("child", "verify", "fix", "integration")
+
+# The phases in which the children are worth gathering and the phase rules worth running. A Feature in
+# planning has no children yet; a ready, done or cancelled one has nothing left for the tick to move.
+_ACTIVE_PHASES = (phases.BUILDING, phases.VERIFYING, phases.CLOSING)
+
+# The human-facing phase words, the same labels as core/features.js PHASE_LABEL (contract C9).
+PHASE_WORDS = {
+    "planning": "Planning", "building": "Building", "verifying": "Verifying",
+    "closing": "Closing", "ready": "Ready to merge", "done": "Done", "cancelled": "Cancelled",
+}
+
+
+def _live_feature(d):
+    """True when a folder's store list has a Feature the tick still has to drive, so a folder whose
+    only work is a Feature in building, verifying or closing (its spec Task already merged, no queued
+    Task) is still looked at. A just-done Feature is looked at once more, for the retro decision
+    (`retro_handled`), then left alone. A classic folder has no `features`, so this is False for it."""
+    for f in d.get("features") or []:
+        phase = f.get("phase")
+        if phase == phases.CANCELLED:
+            continue
+        if phase != phases.DONE or not f.get("retro_handled"):
+            return True
+    return False
+
+
+def features_tick(s, report):
+    """One folder's Features (contract C8). A classic folder has no `features`, so this is a no-op.
+
+    Each Feature is driven on its own; one Feature's trouble is recorded and never stops the others or
+    the rest of the tick."""
+    for feature in list(s.data.get("features") or []):
+        try:
+            one_feature(s, feature, report)
+        except Exception as e:  # one Feature's trouble never stops the others or the tick
+            report.setdefault("feature_error", []).append(f"{s.ref(feature)}: {e}")
+
+
+def one_feature(s, feature, report):
+    """Drive one Feature through this tick (contract C8)."""
+    phase_before = feature.get("phase")
+    if phase_before == phases.CANCELLED:
+        return
+    if phase_before == phases.DONE:
+        _maybe_retro(s, feature, report)
+        return
+
+    gathered = _gather(s, feature, report) if phase_before in _ACTIVE_PHASES else {"children": []}
+    _store_digests(s, feature, gathered)
+
+    # The fan-out trigger: once the Plan is approved (building), fan-out is on for this Feature, and
+    # the approved work table has landed on the feature branch, turn it into child Tasks. It runs once
+    # (the children then exist); a deferred spec merge simply delays it to a later tick.
+    if (phase_before == phases.BUILDING and feature.get("auto_fanout", True)
+            and not feature.get("children") and feature_mod.spec_merged(s, feature)):
+        _fanout(s, feature, report)
+
+    children = _flow_children(s, feature, gathered)
+
+    # Count the fix rounds used (contract T19): every Verify Task past the first is one fix round (the
+    # Assistant adds a new Verify Task per round, proposal 6.11). The person's Add a fix round sets the
+    # same count when it adds its Verify Task, so this never fights it.
+    verifies = [t for t in children if t.get("role") == "verify"
+                and t.get("state") != "cancelled" and not t.get("cancelled")]
+    rounds = max(0, len(verifies) - 1)
+    if int(feature.get("fix_rounds") or 0) != rounds:
+        feature["fix_rounds"] = rounds
+        s.dirty = True
+
+    # Restart a failed or stalled child once, and flag the person-blocking child exceptions, before the
+    # phase rules read the children's `attention`.
+    _child_pass(s, feature, children, report)
+
+    new_phase, attention = phases.phase_of(feature, children)
+    if new_phase == phases.VERIFYING:
+        override = _verify_handling(s, feature, children, report)
+        if override is not None:
+            attention = override
+    _apply_phase(s, feature, new_phase, attention)
+
+    if feature.get("phase") == phases.CLOSING:
+        _closing(s, feature, report)
+
+    _waves_pass(s, feature, children, report)
+    _phase_news(s, feature, phase_before, report)
+
+
+# ---- gather, digests and fan-out ------------------------------------------------------------
+
+def _gather(s, feature, report):
+    """Bring the children's states and digests to the home machine (contract C8). Best effort: a
+    failure to reach a machine is recorded and never stops the tick, and a home-only Feature just
+    collects its own children."""
+    machines = [c.get("machine") for c in feature.get("children") or [] if c.get("machine")]
+    try:
+        return feature_status.gather(s, feature, machines)
+    except Exception as e:  # a bad machine never stops the Feature pass
+        report.setdefault("feature_gather_error", []).append(f"{s.ref(feature)}: {e}")
+        return {"children": [], "unreachable": machines}
+
+
+def _store_digests(s, feature, gathered):
+    """Write the digest of every child that has ended into `feature.digests` (contract C8, keyed by
+    `digest.child_key`). `gather` carries a home child's digest (built by `feature_status.collect`)
+    and a remote child's digest (built on its own machine), so both are stored the one way."""
+    by_ref = {c.get("ref"): c.get("digest") for c in (gathered.get("children") or []) if c.get("digest")}
+    if not by_ref:
+        return
+    digests = feature.setdefault("digests", {})
+    for entry in feature.get("children") or []:
+        d = by_ref.get(f"{s.prefix}-{entry.get('ref')}")
+        if d and digests.get(digest.child_key(entry)) != d:
+            digests[digest.child_key(entry)] = d
+            s.dirty = True
+
+
+def _fanout(s, feature, report):
+    """Fire the fan-out trigger (contract C8). `fanout.run` is idempotent, so a tick that fires twice
+    creates no duplicates; a bad work table is recorded and the Feature stays in building."""
+    try:
+        res = fanout.run(s, feature.get("change"), start=True)
+    except Fail as e:
+        report.setdefault("feature_fanout_error", []).append(f"{s.ref(feature)}: {e}")
+        return
+    made = (res.get("created") or {}).get("children", 0)
+    report.setdefault("feature_fanout", []).append({"feature": s.ref(feature), "created": made})
+    _send_feature_news(s, feature, "fanout",
+                       f"{s.ref(feature)}: fan-out started {made} child task{'s' if made != 1 else ''}.",
+                       report, once=f"fanout:{feature.get('change')}")
+
+
+# ---- the children the phase rules read ------------------------------------------------------
+
+def _flow_children(s, feature, gathered):
+    """The flow Task records `phases.phase_of` needs, one per Feature child plus the Verify and Fix
+    Tasks (contract C7). A home child, Verify, Fix or Integration Task is its real Task record in this
+    store. A remote child's Task lives only on its own machine (proposal 6.13), so it is synthesized
+    from the gathered feature-status (its live state) and its stored digest (its end state)."""
+    records = [t for t in s.data.get("tasks") or []
+               if t.get("feature") == feature.get("id") and t.get("role") in _CHILD_ROLES]
+    by_ref = {c.get("ref"): c for c in (gathered.get("children") or [])}
+    for entry in feature.get("children") or []:
+        if entry.get("machine") is None:
+            continue
+        records.append(_remote_record(entry, by_ref.get(f"{s.prefix}-{entry.get('ref')}")))
+    return records
+
+
+def _remote_record(entry, status):
+    """A synthetic child record for a remote child, from its gathered status and its digest. The
+    record carries only what the phase rules read: role, rows, and the state (`merged`/`skipped`/
+    `cancelled`/`failed`/running) the digest or the live state says."""
+    rec = {"id": entry.get("ref"), "machine": entry.get("machine"),
+           "role": entry.get("role") or "child", "rows": list(entry.get("rows") or [])}
+    dstate = ((status or {}).get("digest") or {}).get("state")
+    live_state = (status or {}).get("state")
+    if dstate == "merged":
+        rec["state"], rec["merged"] = "done", True
+    elif dstate == "skipped":
+        rec["state"], rec["skipped"] = live_state or "running", True
+    elif dstate == "cancelled":
+        rec["state"], rec["cancelled"] = "cancelled", True
+    elif dstate == "failed":
+        rec["state"], rec["attention"] = "failed", "failed"
+    else:
+        rec["state"] = live_state or "running"
+    return rec
+
+
+# ---- the child exception pass (retries, attention, one-by-one events) ------------------------
+
+def _child_pass(s, feature, children, report):
+    """Set each home child's flow exception (contract C8), restart a failed or stalled one once, and
+    send the one-by-one events (proposal 6.14). Only the work-package children (role `child`) take a
+    retry or raise a child exception; the Verify and Fix Tasks are read by the phase rules instead. A
+    remote child is restarted on its own machine, not here."""
+    for t in children:
+        if t.get("machine") is not None or t.get("role") != "child":
+            continue
+        if phases.is_satisfied(t) or t.get("state") in ("done", "cancelled"):
+            _clear_flow_attention(s, t)
+            continue
+        live = [detail(k) for k in live_agents(s.key(t))]
+        ev = _child_exception(s, t, live)
+        if ev in ("failed", "stalled") and int(t.get("retries") or 0) < 1:
+            _retry_child(s, t, ev, live, report)
+        elif ev in CHILD_EXCEPTIONS:
+            if t.get("attention") != ev:
+                t["attention"] = ev
+                s.dirty = True
+            _child_news(s, feature, t, ev, report, once=f"{ev}:{t['id']}")
+        elif ev == "needs-you":
+            _child_news(s, feature, t, "needs-you", report, once=f"needs-you:{t['id']}")
+        else:
+            _clear_flow_attention(s, t)
+        if t.get("risk") == "high" and t.get("state") == "ready" and not t.get("merged"):
+            _child_news(s, feature, t, "risky-waiting", report, once=f"risky:{t['id']}")
+
+
+def _clear_flow_attention(s, t):
+    """Drop a flow exception once the child has moved on, without touching a classic attention (a
+    pull-request problem `facts` set)."""
+    if t.get("attention") in CHILD_EXCEPTIONS:
+        t.pop("attention", None)
+        s.dirty = True
+
+
+def _child_exception(s, t, live):
+    """The flow exception a home child is in now, or None (contract C8). `failed` and `stalled` come
+    from the same reading the Assistant's news uses (`news.news_state`, `stall_of`); a stall needs the
+    live-agent timing a pure rule cannot see. `needs-owns` and `needs-plan` are read from the child's
+    own status line (the worker sets it to "needs owns change" or "needs plan change" and stops); any
+    other person-blocking wait is a generic `needs-you`."""
+    running = [k for k in live if agent_running(k)]
+    v, event, stall = news.news_state(s, t, running)
+    if event == "failed":
+        return "failed"
+    if stall:
+        return "stalled"
+    if v.get("status") == "needs":
+        text = ((t.get("progress") or {}).get("text") or "").lower()
+        if "owns" in text:
+            return "needs-owns"
+        if "plan" in text or "contract" in text:
+            return "needs-plan"
+        return "needs-you"
+    return None
+
+
+def _retry_child(s, t, ev, live, report):
+    """Restart a failed or stalled child once, from its own branch (contract C8, proposal 6.12). Its
+    stuck agent is ended, its retry counted, its flow attention cleared, and it is put back in the
+    queue; the queue starts it again when there is room, so it never surfaces to the person on its
+    first failure."""
+    for k in live:
+        if k.get("address"):
+            run(["hc", "kill", k["address"]])
+    t["retries"] = int(t.get("retries") or 0) + 1
+    t.pop("attention", None)
+    for k in ("done_at", "ended_at", "merged"):
+        t.pop(k, None)
+    t["state"], t["queued_at"] = "queued", now()
+    t.setdefault("queue", {})
+    s.dirty = True
+    report.setdefault("feature_retry", []).append({"ref": s.ref(t), "event": ev, "retries": t["retries"]})
+
+
+# ---- verify, fix rounds and the Needs-you after the rounds ----------------------------------
+
+def _verify_handling(s, feature, children, report):
+    """The verifying-phase attention tick.py owns (contract C8, proposal 6.11). Returns the attention
+    to set, or None to keep what `phases.phase_of` returned.
+
+    When the current Verify Task reports findings, the Assistant is told once (the `verify-findings`
+    event) so it adds the Fix Tasks. While a fix round is still allowed (`fix_round_allowed`) the
+    Feature waits for that round; once the rounds are used up it shows Needs you with `verify-open`,
+    which offers the person the Add a fix round action (contract C9)."""
+    verify = _current_verify(feature, children)
+    if verify is None or verify.get("verify_pass") is None or verify.get("verify_pass"):
+        return None
+    findings = verify.get("findings") or []
+    if findings:
+        _send_feature_news(s, feature, "verify-findings",
+                           f"{s.ref(feature)}: verify found {len(findings)} issue{'s' if len(findings) != 1 else ''}.",
+                           report, once=f"verify-findings:{verify.get('id')}")
+    if _fix_in_flight(children):
+        return None
+    if findings and not phases.fix_round_allowed(feature, _verify_rounds(s, feature)):
+        return phases.ATTENTION_VERIFY_OPEN
+    return None
+
+
+def _current_verify(feature, children):
+    """The Feature's current Verify Task (the child whose id is `verify_task`), or None."""
+    vid = feature.get("verify_task")
+    if vid is None:
+        return None
+    return next((c for c in children if c.get("role") == "verify" and c.get("id") == vid), None)
+
+
+def _fix_in_flight(children):
+    """True when a Fix Task is still being worked, so the current round is not done yet."""
+    return any(c.get("role") == "fix" and c.get("state") in ("todo", "scheduled", "queued", "running", "ready")
+               and not phases.is_satisfied(c) for c in children)
+
+
+def _verify_rounds(s, feature):
+    """The `tasks.verify_rounds` setting for this Feature's space (the fix rounds it allows)."""
+    try:
+        return int(settings_mod.settings_for(s, _feature_space(s, feature))["tasks"].get("verify_rounds") or 2)
+    except Exception:
+        return 2
+
+
+# ---- closing and retro ----------------------------------------------------------------------
+
+def _closing(s, feature, report):
+    """Run the closing steps while the Feature is in closing (contract C8). closing.close is
+    idempotent and sets its own attention (`row-no-child`, `base-conflict`); a hard error is recorded
+    and never stops the tick."""
+    try:
+        closing.close(s, feature)
+    except Fail as e:
+        report.setdefault("feature_closing_error", []).append(f"{s.ref(feature)}: {e}")
+        return
+    report.setdefault("feature_closing", []).append(
+        {"feature": s.ref(feature), "phase": feature.get("phase"), "attention": feature.get("attention", "")})
+
+
+def _maybe_retro(s, feature, report):
+    """Start a retro when a done Feature's `tasks.retro` is automatic (contract C8). It runs once; the
+    `ask` mode is the Assistant's to offer, not the tick's. The decision is marked `retro_handled` so
+    a done Feature is not scanned again every tick, whatever the setting."""
+    if feature.get("retro_handled"):
+        return
+    try:
+        mode = settings_mod.settings_for(s, _feature_space(s, feature))["tasks"].get("retro")
+    except Exception:
+        mode = "off"
+    if mode == "automatic":
+        t = retro.start(s, feature)
+        if t is not None:
+            report.setdefault("feature_retro", []).append(s.ref(feature))
+    feature["retro_handled"] = True
+    s.dirty = True
+
+
+# ---- phase write, waves and news ------------------------------------------------------------
+
+def _apply_phase(s, feature, phase, attention):
+    """Write the phase and attention a tick decided (contract C8). The phase must be one of the seven
+    (`phases.PHASES`); an unknown one is a programming error and is left as it was."""
+    if phase not in phases.PHASES:
+        return
+    if feature.get("phase") != phase or feature.get("attention", "") != attention:
+        feature["phase"] = phase
+        feature["attention"] = attention
+        s.dirty = True
+
+
+def _waves_pass(s, feature, children, report):
+    """Tell the Assistant when a wave ends: one digest message when every child of a wave is merged or
+    skipped (proposal 6.14). A wave is the leading number of a child's row ids (`2.1` is wave 2). Each
+    wave is told once (`waves_told`)."""
+    waves = {}
+    for c in children:
+        if c.get("role") != "child":
+            continue
+        for rid in c.get("rows") or []:
+            waves.setdefault(str(rid).split(".", 1)[0], []).append(c)
+    told = feature.setdefault("waves_told", [])
+    for w in sorted(waves, key=lambda x: int(x) if x.isdigit() else 0):
+        kids = waves[w]
+        if w not in told and kids and all(phases.is_satisfied(c) for c in kids):
+            told.append(w)
+            s.dirty = True
+            _send_feature_news(s, feature, "wave",
+                               f"{s.ref(feature)}: wave {w} done, {len(kids)} task{'s' if len(kids) != 1 else ''} "
+                               f"merged or skipped.", report)
+
+
+def _phase_news(s, feature, phase_before, report):
+    """Tell the Assistant each phase change, one message (proposal 6.14). Sent only when the phase
+    actually moved this tick, so it is told once."""
+    phase_now = feature.get("phase")
+    if phase_now == phase_before:
+        return
+    _send_feature_news(s, feature, "phase",
+                       f"{s.ref(feature)} moved to {PHASE_WORDS.get(phase_now, phase_now)}: "
+                       f"{feature.get('title', '')}", report)
+
+
+def _feature_space(s, feature):
+    """The space a Feature's Tasks run in (the spec Task's, else any child's on this machine), or
+    None. The Feature record has no space of its own; its Tasks carry it."""
+    spec = s.task_by_id(feature.get("spec_task")) if feature.get("spec_task") else None
+    if spec and spec.get("space"):
+        return spec["space"]
+    for t in s.data.get("tasks") or []:
+        if t.get("feature") == feature.get("id") and t.get("space"):
+            return t["space"]
+    return None
+
+
+def _child_news(s, feature, t, event, report, once=None):
+    """One one-by-one child event for the Assistant (proposal 6.14)."""
+    title = " ".join(str(t.get("title") or "").split())
+    text = {
+        "failed": f"{s.ref(t)} failed and could not be restarted: {title}",
+        "stalled": f"{s.ref(t)} stalled and could not be restarted: {title}",
+        "needs-plan": f"{s.ref(t)} asks for a plan change: {title}",
+        "needs-owns": f"{s.ref(t)} asks for more owned paths: {title}",
+        "needs-you": f"{s.ref(t)} needs you: {title}",
+        "risky-waiting": f"{s.ref(t)} is a risky task waiting for your Accept: {title}",
+    }[event]
+    _send_feature_news(s, feature, event, text, report, once=once)
+
+
+def _feature_news_line(ref, event, text):
+    """One tagged news line for the Assistant, the `<herdr-news>` shape the chat recognises, keyed by
+    `feature` instead of `task` (proposal 6.14, contract C8)."""
+    def attr(x):
+        return (str(x).replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;"))
+    body = text.replace("<", "‹").replace(">", "›")
+    return f'<herdr-news feature="{attr(ref)}" event="{event}">{body}</herdr-news>'
+
+
+def _send_feature_news(s, feature, event, text, report, once=None):
+    """Send one line to the Feature's Assistant, held while the person is writing to it (as the task
+    news is). `once` dedupes a repeating event across ticks (stored under `feature.told`)."""
+    if once is not None:
+        told = feature.setdefault("told", {})
+        if told.get(once):
+            return
+        told[once] = now()
+        s.dirty = True
+    line = _feature_news_line(s.ref(feature), event, text)
+    report.setdefault("feature_news", []).append(
+        {"feature": s.ref(feature), "event": event, "text": text, "line": line})
+    space = _feature_space(s, feature)
+    to = coordinator_in(space) if space else None
+    if to:
+        try:
+            news.send_or_hold(to, line, how="news")
+        except Exception as e:  # never stops the Feature pass
+            report.setdefault("feature_news_error", []).append(str(e))
+
+
 def cmd_tick(args):
     """Starts queued tasks that can go now and finds merged ones. Cheap when nothing waits; one
     at a time (a second tick while one runs does nothing)."""
@@ -448,11 +902,15 @@ def cmd_tick(args):
     for p in store_files(args.folder):
         d = read_list(p)
         tasks = (d or {}).get("tasks") or []
-        if not d or not os.path.isdir(d.get("folder") or "") or not (d.get("main_watch") or any(
+        if not d or not os.path.isdir(d.get("folder") or "") or not (d.get("main_watch") or _live_feature(d) or any(
                 t.get("state") in ("queued", "scheduled", "ready") or (t.get("worktree") and t.get("state") == "running") for t in tasks)):
             continue
         with Store(locate(d["folder"])) as s:
             tick_store(s, report)
+            try:
+                features_tick(s, report)
+            except Exception as e:  # the Feature pass never stops the classic tick
+                report.setdefault("feature_error", []).append(f"{os.path.basename(s.loc['folder'])}: {e}")
     try:
         news_pass(report, args.folder)
     except Exception as e:  # never stops the queue
