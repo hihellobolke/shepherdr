@@ -268,7 +268,7 @@ compat.shared = { value: (k) => model.value(k), set: (k, v) => store.set(k, v) }
 store.on(() => model.rebuild());
 void store.load().catch(() => {});
 const snapshotOf = (b: Parameters<NonNullable<typeof model.onBuild>>[0]) => live.setSnapshot(alertNewAnd(compat.snapshot({
-  host: me?.host ?? "this machine", user: me?.name ?? "You", spaces: b.spaces, sections: b.sections, rows: b.rows, artifacts: artifacts.list, automations: b.automations,
+  host: me?.host ?? "this machine", user: me?.name ?? "You", spaces: b.spaces, sections: b.sections, rows: b.rows, features: b.features, artifacts: artifacts.list, automations: b.automations,
   settings: [...settings.sections(webNow ?? (me ? `https://${me.dns}/shepherdr/` : null), b.spaces.map((s: any) => ({ id: s.id, name: s.name, machine: s.machine ?? null })), b.machines, me?.host ?? "this machine",
     // Settings › Autopilot (Everywhere's and each space's own), while its add-on is on
     offList().includes("autopilot") ? null : { everywhere: model.pilotEverywhere, trigger: (id) => model.pilotKnown(id)?.trigger }),

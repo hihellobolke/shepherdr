@@ -145,6 +145,8 @@ async function run(cmd: string[]) {
   let p: ReturnType<typeof Bun.spawn<"ignore", "pipe", "pipe">>;
   // the window's herdr-app: SHEPHERDR_HERDR_APP in tests (as SHEPHERDR_HC for hc)
   if (cmd[0] === "herdr-app" && process.env.SHEPHERDR_HERDR_APP) cmd = [process.env.SHEPHERDR_HERDR_APP, ...cmd.slice(1)];
+  // herdr-task: SHEPHERDR_HERDR_TASK in tests (Bun.spawn ignores a PATH changed mid-test, so the fake is pointed to by env)
+  if (cmd[0] === "herdr-task" && process.env.SHEPHERDR_HERDR_TASK) cmd = [process.env.SHEPHERDR_HERDR_TASK, ...cmd.slice(1)];
   try { p = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", stdin: "ignore" }); }
   catch (e) { return { code: 127, stdout: "", stderr: String(e) }; }
   const [stdout, stderr] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
@@ -176,6 +178,13 @@ function addr(v: unknown) {
 function taskOf(b: any) {
   const ref = str(b.ref, 40), folder = str(b.folder, 4096), machine = b.machine == null ? null : str(b.machine, 80);
   if (!REF.test(ref) || !folder.startsWith("/") || (machine && !MACHINE.test(machine))) throw new Error("bad task");
+  return { ref, folder, machine };
+}
+// A Feature action names its Feature by ref directly (the web sends { feature, folder, machine }), as a task action names
+// its task; the same checks as taskOf.
+function featureOf(b: any) {
+  const ref = str(b.feature, 40), folder = str(b.folder, 4096), machine = b.machine == null ? null : str(b.machine, 80);
+  if (!REF.test(ref) || !folder.startsWith("/") || (machine && !MACHINE.test(machine))) throw new Error("bad feature");
   return { ref, folder, machine };
 }
 
@@ -607,6 +616,18 @@ export async function act(hub: Hub, b: any, compat: Compat): Promise<unknown> {
     const text = str(b.text ?? b.note, 4000).trim();
     if (!text) throw new Error("Nothing to send.");
     return compat.artifacts.say(str(b.artifact, 100), Number(b.v) || 1, text, typeof b.target === "string" ? b.target.slice(0, 300) : undefined);
+  }
+  // the person's two Feature actions (docs/openspec-flow.md C9), run through herdr-task as the other task actions are:
+  // Merge feature (phase ready) and Add a fix round (attention verify-open). Both return { ok: true } or throw the
+  // command's error, exactly as accept does.
+  if ((b?.type === "feature-merge" || b?.type === "feature-fix-round") && typeof b.feature === "string") {
+    const { ref, folder, machine } = featureOf(b);
+    const sub = b.type === "feature-merge" ? "merge" : "fix-round";
+    const r = await task(["feature", sub, ref], folder, machine);
+    let out: any = null;
+    try { out = JSON.parse(r.stdout); } catch {}
+    if (r.code !== 0 || out?.error) throw new Error(out?.error || r.stderr.trim().split("\n").pop() || `herdr-task feature ${sub} failed`);
+    return { ok: true };
   }
   switch (b?.type) {
     case "send": {
