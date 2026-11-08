@@ -102,8 +102,13 @@ def _find_feature(s, ref):
 
 
 def cmd_retro_data(args):
-    """The `retro-data` command entry: prints the retro JSON for a Feature (C5)."""
+    """The `retro-data` command entry: prints the retro JSON for a Feature (C5).
+
+    `build` runs the repo check script (up to CHECK_TIMEOUT) and shells `gh`, so it runs after
+    the store lock is released: the Feature is read under the lock, then `s` (its data and loc
+    stay in memory, read-only) is used to build without holding the lock, so a slow check never
+    blocks other writers of the store."""
     with open_store(args, write=False) as s:
         feature = _find_feature(s, args.id)
-        data = build(s, feature)
+    data = build(s, feature)
     say(args, data, json.dumps(data, indent=2))

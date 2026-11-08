@@ -38,6 +38,24 @@ def _claude_log(path):
             f.write(json.dumps(line) + "\n")
 
 
+def _codex_log(path):
+    """A small but real-shaped Codex rollout log: a timed custom tool call (apply_patch) and a
+    timed shell call, each with its output."""
+    lines = [
+        {"type": "response_item", "timestamp": "2026-11-08T00:00:00.000Z",
+         "payload": {"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch", "input": "*** Update File: x"}},
+        {"type": "response_item", "timestamp": "2026-11-08T00:00:04.000Z",
+         "payload": {"type": "custom_tool_call_output", "call_id": "c1", "output": "ok"}},
+        {"type": "response_item", "timestamp": "2026-11-08T00:00:05.000Z",
+         "payload": {"type": "function_call", "call_id": "c2", "name": "shell", "arguments": "{\"command\":[\"ls\"]}"}},
+        {"type": "response_item", "timestamp": "2026-11-08T00:00:06.000Z",
+         "payload": {"type": "function_call_output", "call_id": "c2", "output": "files"}},
+    ]
+    with open(path, "w") as f:
+        for line in lines:
+            f.write(json.dumps(line) + "\n")
+
+
 class DigestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -63,10 +81,14 @@ class DigestBase(unittest.TestCase):
 
 
 class ChildKey(DigestBase):
-    def test_local_and_remote(self):
-        self.assertEqual(self.digest.child_key({"id": 14, "machine": None}), "local:14")
-        self.assertEqual(self.digest.child_key({"id": 15, "machine": "vm-b"}), "vm-b:15")
+    def test_c2_child_entry_uses_ref(self):
+        # A Feature's `children` entry (C2) carries the numeric id in `ref`.
+        self.assertEqual(self.digest.child_key({"ref": 14, "machine": None, "role": "child"}), "local:14")
+        self.assertEqual(self.digest.child_key({"ref": 15, "machine": "vm-b", "role": "child"}), "vm-b:15")
+
+    def test_id_fallback(self):
         self.assertEqual(self.digest.child_key({"id": 16}), "local:16")
+        self.assertEqual(self.digest.child_key({"id": 17, "machine": "vm-c"}), "vm-c:17")
 
 
 class State(DigestBase):
@@ -167,6 +189,22 @@ class BuildWithLog(DigestBase):
         self.assertEqual(d["rebase_conflicts"], 1)
         self.assertEqual(d["time"], {"estimate_min": 30, "actual_min": 42})
         self.assertEqual(d["state"], "merged")
+
+    def test_codex_log_times_custom_and_shell_calls(self):
+        log = os.path.join(self.tmp, "rollout.jsonl")
+        _codex_log(log)
+        with self._store() as s:
+            t = self._task(s, feature=12, role="child", machine="vm-b", state="done", merged=True,
+                           agents=[{"log": log, "agent": "codex"}])
+            d = self.digest.build(s, t)
+        tools = {x["tool"]: x for x in d["top_tools"]}
+        # The custom tool (apply_patch) is timed, not just its output (the review finding).
+        self.assertIn("apply_patch", tools)
+        self.assertEqual(tools["apply_patch"]["ms"], 4000)
+        self.assertIn("shell", tools)
+        self.assertEqual(tools["shell"]["ms"], 1000)
+        # Longest first.
+        self.assertEqual(d["top_tools"][0]["tool"], "apply_patch")
 
 
 if __name__ == "__main__":

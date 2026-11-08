@@ -38,8 +38,12 @@ NOT_A_TOOL = {"AskUserQuestion"}
 def child_key(child):
     """The machine-qualified key for `feature.digests` (C2): `"<machine>:<id>"`, with `"local"`
     for the home machine. A child id is unique only within its own machine's store, so the key
-    is qualified by machine to keep two machines' children apart."""
-    return f"{child.get('machine') or 'local'}:{child['id']}"
+    is qualified by machine to keep two machines' children apart. A Feature's `children` entry
+    (C2) carries the numeric id in its `ref` field; a Task record carries it in `id`."""
+    cid = child.get("ref")
+    if cid is None:
+        cid = child.get("id")
+    return f"{child.get('machine') or 'local'}:{cid}"
 
 
 def build(s, task):
@@ -191,7 +195,7 @@ try {
         }
         if (c.some((b) => /\[Request interrupted/.test(typeof b?.content === "string" ? b.content : b?.text || ""))) out.events.stalled++;
       } else if (typeof c === "string" && /\[Request interrupted/.test(c)) out.events.stalled++;
-    } else if (l.type === "response_item" && (l.payload?.type === "function_call" || l.payload?.type === "local_shell_call") && !NOT_A_TOOL.has(l.payload?.name)) {
+    } else if (l.type === "response_item" && (l.payload?.type === "function_call" || l.payload?.type === "custom_tool_call" || l.payload?.type === "local_shell_call") && !NOT_A_TOOL.has(l.payload?.name)) {
       starts.set(String(l.payload.call_id ?? l.payload.id), { name: String(l.payload.name || "shell"), t });
     } else if (l.type === "response_item" && (l.payload?.type === "function_call_output" || l.payload?.type === "custom_tool_call_output")) {
       const s = starts.get(String(l.payload.call_id ?? l.payload.id));
