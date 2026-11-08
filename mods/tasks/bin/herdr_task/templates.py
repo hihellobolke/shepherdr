@@ -90,7 +90,19 @@ WORKER_MD_BEFORE_FLOW = WORKER_MD_BEFORE_FEEDBACK + FEEDBACK_RULE
 FLOW_POINTER_WORKER = ("- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries "
                        "a flow file (spec, child or verify), this task is part of a Feature: follow that file, which carries your "
                        "role's rules. A brief with no flow file is an ordinary task: work as usual.\n")
-WORKER_MD = WORKER_MD_BEFORE_FLOW + FLOW_POINTER_WORKER
+WORKER_MD_BEFORE_TRUST = WORKER_MD_BEFORE_FLOW + FLOW_POINTER_WORKER
+# Since a codex reviewer or helper in a fresh worktree carries its own trust (SHMD-34): a worktree codex
+# has never trusted shows its "Do you trust this directory?" prompt, which nobody answers, and the reviewer
+# exits at turn 0. Codex 0.167 keys that trust on the git repository root (the main checkout for a worktree),
+# not the worktree path, and ignores a quoted dotted-path -c key, so herdr-task fills the exact start command
+# (an inline `projects` table keyed on that root, plus --no-daemon) into the brief; the worker copies it and
+# never works it out. Never writes ~/.codex/config.toml. (launch.py codex_review_note / codex_trusted_root.)
+TRUST_OLD = "its command `codex --sandbox read-only --ask-for-approval never` or `claude --permission-mode plan`"
+TRUST_RULE = ("its command `codex --no-daemon -c '<the projects trust table your brief gives>' "
+              "--sandbox read-only --ask-for-approval never` (a fresh worktree is not trusted by codex, so without "
+              "the `-c` its \"Do you trust this directory?\" prompt kills the reviewer at turn 0: your brief fills in "
+              "the exact `-c` with the repository root; never edit ~/.codex/config.toml) or `claude --permission-mode plan`")
+WORKER_MD = WORKER_MD_BEFORE_TRUST.replace(TRUST_OLD, TRUST_RULE)
 
 REVIEWER_MD_BEFORE_SUBAGENT = """You review one Herdr task's work before it can merge. Read only: never edit files, commit or push.
 - Read the task, then the diff of its branch against its base, and run the project's checks.
@@ -125,7 +137,7 @@ OLD_WORKER_READY = """You work on one Herdr task. Stay within the task's scope a
 - When the work is finished, run the `herdr-task ready` command given at the end of your brief, with a short summary. That puts the task in Ready for the person, who accepts it. Never mark a task done yourself.
 """
 OLD_WORKER_MD = OLD_WORKER_READY.split("- When the work is finished")[0]
-OLD_WORKERS = (WORKER_MD_BEFORE_FLOW, WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
+OLD_WORKERS = (WORKER_MD_BEFORE_TRUST, WORKER_MD_BEFORE_FLOW, WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
 
 
 TEMPLATE_HEADS = {

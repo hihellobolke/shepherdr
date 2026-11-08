@@ -16,7 +16,7 @@ import sys
 import time
 
 from .base import ENTRY, Fail, git, hc_json, now, run, WORKTREES
-from .settings import agent_key, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, FLOW_WORDS, notes, notes_part, review_limits, settings_block, settings_for, TEMPLATES
+from .settings import agent_key, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, FLOW_WORDS, notes, notes_part, review_limits, reviewer_agent, settings_block, settings_for, TEMPLATES
 from .templates import FRONT, instructions
 from .agents import detail, LINE_MAX, live_agents, SUMMARY_MAX
 from .github import finish, remote_of
@@ -65,8 +65,30 @@ def own_rules(path):
     return rules
 
 
-def own_argv(argv):
-    """An agent's argv with its own herdr-task commands allowed (Claude Code and Codex)."""
+def codex_trusted_root(cwd):
+    """The folder Codex keys its directory trust on for a launch in `cwd`: the git repository root,
+    which for a linked worktree is the MAIN checkout (Codex resolves a worktree to it via the common
+    git dir and keys trust there, not on the worktree path), else `cwd` itself when it is not in a
+    repo. Verified against codex 0.167: trusting the worktree path is a no-op."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            return os.path.dirname(os.path.abspath(r.stdout.strip()))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.abspath(cwd)
+
+
+def own_argv(argv, cwd=None):
+    """An agent's argv with its own herdr-task commands allowed (Claude Code and Codex). A Codex
+    launch in `cwd` also carries that repo's trust for this launch only (SHMD-34): Codex has never
+    trusted a fresh worktree, so without it its "Do you trust this directory?" prompt kills the
+    agent at turn 0. The trust is set as an inline `projects` table (codex 0.167 ignores a quoted
+    dotted-path -c key), keyed on the folder Codex actually checks (codex_trusted_root). It is the
+    narrowest fix Codex allows, never writes ~/.codex/config.toml, and leaves the agent's own -s/-a
+    sandbox flags in charge."""
     path, out = own_path(), list(argv)
     k = agent_key(out)
     if k == "claude":
@@ -97,7 +119,11 @@ def own_argv(argv):
         ident = {"event_name": "permission_request", "hooks": [{"async": False, "command": hook, "timeout": ASK_TIMEOUT, "type": "command"}]}
         digest = hashlib.sha256(json.dumps(ident, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
         key = "/<session-flags>/config.toml:permission_request:0:0"
-        return out[:1] + ["-c", f"hooks.PermissionRequest=[{{hooks=[{{type=\"command\",command={json.dumps(hook)},timeout={ASK_TIMEOUT}}}]}}]",
+        # An inline projects table (not a quoted dotted-path key, which codex 0.167 ignores), keyed
+        # on the folder codex checks. It replaces the whole projects table for this launch only,
+        # which is fine for a task's own folder.
+        trust = ["-c", f'projects={{{json.dumps(codex_trusted_root(cwd))}={{trust_level="trusted"}}}}'] if cwd else []
+        return out[:1] + trust + ["-c", f"hooks.PermissionRequest=[{{hooks=[{{type=\"command\",command={json.dumps(hook)},timeout={ASK_TIMEOUT}}}]}}]",
                           "-c", f"hooks.state={{{json.dumps(key)}={{trusted_hash=\"sha256:{digest}\"}}}}"] + out[1:]
     return out
 
@@ -446,6 +472,23 @@ def flow_part(s, task, space=None):
     return body
 
 
+def codex_review_note(s, task, space=None, argv=None):
+    """The exact start command for a Codex reviewer, with the trusted folder filled in, so the
+    worker never works it out itself (SHMD-34). Codex has never trusted a fresh worktree and keys
+    its directory trust on the git repository root (the main checkout), so the command carries that
+    root's trust for this launch only. Empty unless review is on and the reviewer runs Codex."""
+    on, _ = review_limits(s, task)
+    if not on or reviewer_agent(s, task, space, argv) != "codex":
+        return ""
+    root = codex_trusted_root(s.loc["folder"])
+    table = f'projects={{{json.dumps(root)}={{trust_level="trusted"}}}}'
+    return ("Codex reviewer: start it with "
+            f"`codex --no-daemon -c '{table}' --sandbox read-only --ask-for-approval never \"<prompt>\"` "
+            "exactly as written. The inline `projects` table trusts the repository root for this launch only "
+            "(it replaces the whole projects table, which is fine for a read-only reviewer), so Codex's "
+            "\"Do you trust this directory?\" prompt can't kill the reviewer at turn 0; never edit ~/.codex/config.toml.")
+
+
 def brief(s, task, parent=None, space=None, argv=None):
     instructions("reviewer")  # the file its review's reviewer gets (WORKER_MD)
     start = notes_part("Before you start", notes(s, task, "start", space))
@@ -453,7 +496,8 @@ def brief(s, task, parent=None, space=None, argv=None):
         start += f"\n(The main folder is {s.loc['folder']}.)"
     body = "Your task, " + s.ref(task) + ":\n" + ((task.get("prompt") or "").strip() or task["title"])
     finish = notes_part("Before you say ready", notes(s, task, "finish", space))
-    return "\n\n".join(x for x in [instructions("worker"), flow_part(s, task, space), start, body, where_line(task), finish,
+    review_note = codex_review_note(s, task, space, argv)
+    return "\n\n".join(x for x in [instructions("worker"), flow_part(s, task, space), start, body, where_line(task), review_note, finish,
                                     closing_line(s, task, parent, argv), settings_block(s, task, space, argv)] if x)
 
 
@@ -631,9 +675,10 @@ def launch(s, task, argv, space, message=None, parent=None, resume=None, role=No
     which keeps it under a restarted coordinator) and herdr.role=reviewer for a reviewer, kept
     apart from the task's agents. Returns its record."""
     key = s.key(task)
+    folder = folder_for(s, task)
     cmd = list(resume or argv)
     if not role:
-        cmd = own_argv(cmd)
+        cmd = own_argv(cmd, folder)
     if message:
         cmd = cmd + [message]
     labels = ["--label", f"herdr.task={key}", "--label", f"herdr.task.space={bare(space)}",
@@ -646,7 +691,7 @@ def launch(s, task, argv, space, message=None, parent=None, resume=None, role=No
     rel = ["--parent", parent, "--outlive-parent"] if parent else ["--no-parent"]
     name = agent_name(s, task, "review" if role else None)
     # HERDR_BROWSER_TASK: which task's browser herdr-browser drives (HERD-57), for it and its children.
-    r = run(["hc", "run", "--bg", "--json", "--keep", "--cwd", folder_for(s, task), "--name", name,
+    r = run(["hc", "run", "--bg", "--json", "--keep", "--cwd", folder, "--name", name,
              *labels, *rel, "--", *low_priority(clean_env(["env", f"HERDR_BROWSER_TASK={key}", *in_shell(cmd)]), name)])
     try:
         out = json.loads(r.stdout)
