@@ -28,46 +28,15 @@ from herdr_task import base as base_mod  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
 from herdr_task import settings as settings_mod  # noqa: E402
 
-# A throwaway STORE and settings file, kept for this module's tests and restored after, so the real
-# ~/.herdr is never read or written and nothing leaks into later test files in a full `unittest
-# discover` run (test_repo's TestHygiene forbids mutating os.environ at import time). STORE and
-# SETTINGS are cached from the env at import (base.py, settings.py), before setUpModule runs, so the
-# module attributes are patched directly as well as the env (the env still matters for subprocess
-# calls).
-_PATCHES = []
-
-
-def setUpModule():
-    global _PATCHES
-    store_dir = tempfile.mkdtemp(prefix="herdr-fanout-store-")
-    settings_file = os.path.join(tempfile.mkdtemp(prefix="herdr-fanout-cfg-"), "shepherdr.json")
-    _PATCHES = [
-        mock.patch.dict(os.environ, {
-            "HERDR_TASK_STORE": store_dir,
-            "HERDR_TASK_SETTINGS": settings_file,
-        }),
-        mock.patch.object(settings_mod, "SETTINGS", settings_file),
-        mock.patch.object(st, "STORE", store_dir),
-        mock.patch.object(base_mod, "STORE", store_dir),
-    ]
-    for p in _PATCHES:
-        p.start()
-
-
-def tearDownModule():
-    for p in reversed(_PATCHES):
-        p.stop()
-    _PATCHES.clear()
-
-
-# The store root (store.STORE) and the settings path (settings.SETTINGS) are read from the
-# environment when herdr_task is first imported, which in a full `python3 -m unittest discover -s
-# test` run is whichever test file imports it first, not this one. Setting HERDR_TASK_STORE at
-# import time here would be too late then, and these tests would write to the person's real
-# ~/.herdr/tasks (SHMD-38). Point both at throwaway dirs for the whole module instead, patching the
-# already-bound module globals so the override holds whatever the import order, and set the env too
-# so any child process inherits the throwaway roots. The repo hygiene rule (test_repo.TestHygiene)
-# bans the old import-time os.environ mutation; this does it in setUpModule, undone in tearDownModule.
+# The store root (store.STORE / base.STORE) and the settings path (settings.SETTINGS) are read from
+# the environment once, when herdr_task is first imported, which in a full `python3 -m unittest
+# discover -s test` run is whichever test file imports it first, not this one. Setting
+# HERDR_TASK_STORE at import time here would be too late then, and these tests would write to the
+# person's real ~/.herdr/tasks (SHMD-38). Point both at throwaway dirs for the whole module instead,
+# patching the already-bound module globals so the override holds whatever the import order, and set
+# the env too so any child process inherits the throwaway roots. The repo hygiene rule
+# (test_repo.TestHygiene) bans the old import-time os.environ mutation; this does it in setUpModule,
+# undone in tearDownModule, and test_repo.TestStoreIsolation guards that the override actually holds.
 _patches = []
 _tmp_dirs = []
 
@@ -79,6 +48,7 @@ def setUpModule():
     settings_file = os.path.join(cfg_dir, "shepherdr.json")
     _patches.extend([
         mock.patch.object(st, "STORE", store_dir),
+        mock.patch.object(base_mod, "STORE", store_dir),
         mock.patch.object(settings_mod, "SETTINGS", settings_file),
         mock.patch.dict(os.environ, {"HERDR_TASK_STORE": store_dir, "HERDR_TASK_SETTINGS": settings_file}),
     ])

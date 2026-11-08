@@ -136,18 +136,31 @@ class FlowHooks(unittest.TestCase):
 
     def fake_module(self, name, **funcs):
         """Install a fake flow module (feature.py / fanout.py land in parallel) so a lazy
-        `from . import <name>` finds it; removed on cleanup, both from sys.modules and as an
-        attribute of the package, so nothing leaks into another test."""
+        `from . import <name>` finds it. commands.py binds that name through the package attribute
+        herdr_task.<name>, not sys.modules, so once another test file has already imported the real
+        module (e.g. test_fanout imports the real fanout, which sets herdr_task.fanout) a sys.modules
+        swap alone is bypassed and the real module runs. So set both sys.modules and the package
+        attribute, and restore both to whatever they were on cleanup, so nothing leaks either way."""
         import herdr_task
         mod = types.ModuleType(f"herdr_task.{name}")
         for k, v in funcs.items():
             setattr(mod, k, v)
+        missing = object()
+        prev_sys = sys.modules.get(f"herdr_task.{name}", missing)
+        prev_attr = getattr(herdr_task, name, missing)
         sys.modules[f"herdr_task.{name}"] = mod
+        setattr(herdr_task, name, mod)
 
         def clean():
-            sys.modules.pop(f"herdr_task.{name}", None)
-            if getattr(herdr_task, name, None) is mod:
-                delattr(herdr_task, name)
+            if prev_sys is missing:
+                sys.modules.pop(f"herdr_task.{name}", None)
+            else:
+                sys.modules[f"herdr_task.{name}"] = prev_sys
+            if prev_attr is missing:
+                if hasattr(herdr_task, name):
+                    delattr(herdr_task, name)
+            else:
+                setattr(herdr_task, name, prev_attr)
         self.addCleanup(clean)
         return mod
 
