@@ -70,6 +70,17 @@ class Parse(unittest.TestCase):
             worktable.parse_table(table(["| 1.1 | A | src/a.ts | low | S |"]))  # five cells
         self.assertEqual(cm.exception.code, worktable.BAD_TABLE)
 
+    def test_divider_must_have_six_cells(self):
+        text = ("## Work table\n\n| id | title | owns | depends | risk | size |\n| --- |\n"
+                "| 1.1 | A | src/a.ts |  | low | S |\n")
+        with self.assertRaises(WorkTableError) as cm:
+            worktable.parse_table(text)
+        self.assertEqual(cm.exception.code, worktable.BAD_TABLE)
+
+    def test_owns_keeps_empty_members_for_the_check(self):
+        rows = worktable.parse_table(table(["| 1.1 | A | src/a.ts,,src/b.ts |  | low | S |"]))
+        self.assertEqual(rows[0]["owns"], ["src/a.ts", "", "src/b.ts"])
+
     def test_stops_at_blank_line(self):
         text = table(["| 1.1 | A | src/a.ts |  | low | S |"]) + "\nSome prose | with a pipe\n"
         rows = worktable.parse_table(text)
@@ -117,6 +128,14 @@ class Check(unittest.TestCase):
         rows = worktable.parse_table(table(["| 1.1 | A |  |  | low | S |"]))
         self._code(rows, worktable.EMPTY_OWNS)
 
+    def test_empty_owns_entry_trailing_comma(self):
+        rows = worktable.parse_table(table(["| 1.1 | A | src/a.ts, |  | low | S |"]))
+        self._code(rows, worktable.EMPTY_OWNS)
+
+    def test_empty_owns_entry_double_comma(self):
+        rows = worktable.parse_table(table(["| 1.1 | A | src/a.ts,,src/b.ts |  | low | S |"]))
+        self._code(rows, worktable.EMPTY_OWNS)
+
     def test_size_l(self):
         rows = worktable.parse_table(table(["| 1.1 | A | src/a.ts |  | low | L |"]))
         self._code(rows, worktable.SIZE_L)
@@ -153,6 +172,31 @@ class Overlap(unittest.TestCase):
         ]))
         worktable.add_overlap_links(rows)
         self.assertEqual(rows[1]["depends"], ["1.1"])
+
+    def test_two_globs_sharing_a_file_overlap(self):
+        # Neither glob is a literal matching the other, but both match src/parser/types.ts.
+        rows = worktable.parse_table(table([
+            "| 1.1 | A | src/*/types.ts |  | low | S |",
+            "| 1.2 | B | src/parser/*.ts |  | low | S |",
+        ]))
+        worktable.add_overlap_links(rows)
+        self.assertEqual(rows[1]["depends"], ["1.1"])
+
+    def test_double_star_overlap(self):
+        rows = worktable.parse_table(table([
+            "| 1.1 | A | web/** |  | low | S |",
+            "| 1.2 | B | web/src/App.tsx |  | low | S |",
+        ]))
+        worktable.add_overlap_links(rows)
+        self.assertEqual(rows[1]["depends"], ["1.1"])
+
+    def test_distinct_subtrees_do_not_overlap(self):
+        rows = worktable.parse_table(table([
+            "| 1.1 | A | web/generated/** |  | low | S |",
+            "| 1.2 | B | web/src/App.tsx |  | low | S |",
+        ]))
+        worktable.add_overlap_links(rows)
+        self.assertEqual(rows[1]["depends"], [])
 
     def test_no_overlap_no_link(self):
         rows = worktable.parse_table(table([

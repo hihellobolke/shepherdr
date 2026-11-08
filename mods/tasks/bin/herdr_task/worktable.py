@@ -72,7 +72,8 @@ def parse_table(text):
         if "|" not in line:
             continue
         if [c.lower() for c in _cells(line)] == _HEADER:
-            if i + 1 < len(lines) and _is_divider(_cells(lines[i + 1])):
+            div = _cells(lines[i + 1]) if i + 1 < len(lines) else []
+            if _is_divider(div) and len(div) == len(_HEADER):
                 header_at = i
                 break
     if header_at is None:
@@ -91,10 +92,13 @@ def parse_table(text):
                 f"work table row has {len(cells)} columns, expected 6: {line.strip()}",
             )
         rid, title, owns, depends, risk, size = cells
+        # owns keeps its members, empty ones included, so check_table can reject them (C3: no empty
+        # entry); a wholly blank cell is an empty owns list.
+        owns_members = [p.strip() for p in owns.split(",")]
         rows.append({
             "id": rid,
             "title": title,
-            "owns": [p.strip() for p in owns.split(",") if p.strip()],
+            "owns": [] if owns_members == [""] else owns_members,
             "depends": [d.strip() for d in depends.split(",") if d.strip()],
             "risk": risk,
             "size": size,
@@ -122,6 +126,8 @@ def check_table(rows):
     for row in rows:
         if not row["owns"]:
             raise WorkTableError(EMPTY_OWNS, f"row {row['id']} has an empty owns")
+        if any(p == "" for p in row["owns"]):
+            raise WorkTableError(EMPTY_OWNS, f"row {row['id']} has an empty owns entry")
     for row in rows:
         if row["size"] == "L":
             raise WorkTableError(SIZE_L, f"row {row['id']} is size L and must be split")
@@ -196,12 +202,32 @@ def tick(tasks_md, row_id):
 # ---- internals ------------------------------------------------------------------------------
 
 def _owns_overlap(a, b):
-    """True when two owns lists could touch the same path: an equal entry, or one entry matches the
-    other as a glob."""
+    """True when two owns lists could touch the same path: any entry of one could match a path the
+    other also matches."""
     for pa in a:
         for pb in b:
-            if pa == pb or fnmatch.fnmatch(pa, pb) or fnmatch.fnmatch(pb, pa):
+            if _patterns_overlap(pa, pb):
                 return True
+    return False
+
+
+def _patterns_overlap(a, b):
+    """True when two path-or-glob patterns can match a common path. Compares them segment by segment
+    (split on `/`), so two globs that share a concrete file (for example src/*/types.ts and
+    src/parser/*.ts, both src/parser/types.ts) count as overlapping, not only a glob against a literal
+    path. A `**` segment matches zero or more path segments."""
+    return _match_segments(a.split("/"), b.split("/"))
+
+
+def _match_segments(a, b):
+    if a and a[0] == "**":
+        return _match_segments(a[1:], b) or (bool(b) and _match_segments(a, b[1:]))
+    if b and b[0] == "**":
+        return _match_segments(a, b[1:]) or (bool(a) and _match_segments(a[1:], b))
+    if not a or not b:
+        return not a and not b
+    if a[0] == b[0] or fnmatch.fnmatch(a[0], b[0]) or fnmatch.fnmatch(b[0], a[0]):
+        return _match_segments(a[1:], b[1:])
     return False
 
 
