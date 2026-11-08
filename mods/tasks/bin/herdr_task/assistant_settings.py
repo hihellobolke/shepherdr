@@ -7,13 +7,14 @@ one hidden notice line per setting that changed for its space, several at once i
 never for a save that changed nothing there. Other agents (task workers, automation runs, agent
 tabs) aren't told the block: their brief is fixed; they get only Reactions (reactions.py)."""
 
+import copy
 import hashlib
 import json
 import os
 import sys
 
 from .base import addon_off, hc_json, MAX_RUNNING, now, run, STORE
-from .settings import DEFAULTS, LOCAL_MACHINE, MUST_WORDS, SETTINGS, agent_key, bare, read_settings
+from .settings import DEFAULTS, FLOW_WORDS, LOCAL_MACHINE, MUST_WORDS, RETRO_WORDS, SETTINGS, agent_key, bare, read_settings
 from .launch import coordinators, is_coordinator
 from . import reactions
 
@@ -29,6 +30,17 @@ MERGE_SHORT = {"ask": "ask the person first (they accept it in the Tasks panel, 
                "auto": "on its own (Herdr merges a ready task)"}
 BY = {"space": "set for this space", "machine": "this machine's setting", "everywhere": "your setting everywhere"}
 NOTICE_END = "Nothing to answer: reply only <hc no-reply/>."
+# The OpenSpec flow facts, in the Assistant's own descriptive style (the same facts as the Settings
+# block's Flow and Retro lines). Both rows show only when the setting is not its default, so a space
+# that stays on the classic flow with retro off keeps the block byte for byte as before.
+FLOW_WORDS_ASSIST = {"classic": "classic", "openspec": "openspec (Features: a spec worker, fan-out to children, verify, then close)"}
+RETRO_WORDS_ASSIST = {"off": "off", "ask": "ask me (I ask before a retro runs after a Feature is done)",
+                      "automatic": "automatic (a retro runs by itself after a Feature is done)"}
+# A Flow or Retro row leaves the block when its setting goes back to Herdr's default, so a running
+# Assistant would otherwise never hear it was turned off. These stand in for the gone row in the
+# change notice (settings_pass), saying it is back to the default.
+RESET_ROWS = {"flow": {"key": "flow", "label": "Flow", "text": FLOW_WORDS_ASSIST["classic"], "value": "classic", "by": None, "scope": "everywhere"},
+              "retro": {"key": "retro", "label": "Retro", "text": RETRO_WORDS_ASSIST["off"], "value": "off", "by": None, "scope": "everywhere"}}
 
 
 def space_of(k):
@@ -53,7 +65,8 @@ def layers(d, space):
 
 def resolve(ls):
     """The values that apply, from DEFAULTS and the layers (most specific wins)."""
-    out = {k: dict(v) for k, v in DEFAULTS.items()}
+    # A deep copy so a caller that mutates a list value never reaches DEFAULTS (see settings_for).
+    out = copy.deepcopy(DEFAULTS)
     for _, layer in ls:
         for k, v in layer.items():
             if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -104,7 +117,7 @@ def rows(space, d=None, auto=None):
         offering = (cfg.get("agents") or {}).get("feedback") is not False
         from .feedback import feedback_repo
         repo = feedback_repo(d)
-        return [
+        out = [
             ("review", "Review", review, "on" if rounds > 0 else "off",
              [("tasks", "review_rounds"), ("tasks", "must_fix"), ("reviewer", None)]),
             ("merge", "Merge", MERGE_SHORT[merge], merge, [("tasks", "merge")]),
@@ -129,6 +142,14 @@ def rows(space, d=None, auto=None):
              if offering else "off (never offer feedback for Shepherdr; file nothing)", "on" if offering else "off",
              [("agents", "feedback"), ("agents", "feedback_repo")]),
         ]
+        # The Flow and Retro facts, each shown only when it is not its default (contract C1).
+        flow = t.get("flow") if t.get("flow") in FLOW_WORDS else "classic"
+        if flow != "classic":
+            out.append(("flow", "Flow", FLOW_WORDS_ASSIST[flow], flow, [("tasks", "flow")]))
+        retro = t.get("retro") if t.get("retro") in RETRO_WORDS else "off"
+        if retro != "off":
+            out.append(("retro", "Retro", RETRO_WORDS_ASSIST[retro], retro, [("tasks", "retro")]))
+        return out
     have = lines(resolve(ls), (on, every, direction))
     default = {x[0]: x[2] for x in lines(resolve([]), (False, every, ""))}
     out = []
@@ -140,7 +161,7 @@ def rows(space, d=None, auto=None):
                        for sec, f in parts)
         setters = [name for name, layer in ls if sets(layer)]
         scope = setters[-1] if setters else "everywhere"
-        by = setters[-1] if setters and text != default[key] else None
+        by = setters[-1] if setters and text != default.get(key) else None
         out.append({"key": key, "label": label, "text": text, "value": value, "by": by, "scope": scope})
     return out
 
@@ -246,6 +267,8 @@ def settings_pass(report, quiet):
             changed = [{"key": "all"}]
         else:
             changed = [r for r in rs if had.get(r["key"]) != now_digest[r["key"]]]
+            # A Flow or Retro row that left the block (back to its default) is told as a reset.
+            changed += [RESET_ROWS[kk] for kk in had if kk not in now_digest and kk in RESET_ROWS]
             if not changed:  # a line no longer said: just note it
                 run(["hc", "label", addr, f"{LABEL}={digest(rs)}"])
                 continue
