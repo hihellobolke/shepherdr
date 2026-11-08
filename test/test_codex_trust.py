@@ -7,9 +7,11 @@ so the trust must be set as an inline `projects` table keyed on that root. herdr
 reviewer start command into the brief (codex_review_note), its own codex worker launch carries the
 same trust (own_argv), and an unchanged old worker template upgrades to today's words."""
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -122,6 +124,15 @@ class HerdrTaskOwnLaunch(unittest.TestCase):
         out = L.own_argv(["claude"], "/tmp/wt")
         self.assertFalse(any("trust_level" in str(x) for x in out))
 
+    def test_the_table_is_valid_toml_even_with_a_non_ascii_path(self):
+        # an emoji in the path must stay literal, not become a \uXXXX surrogate escape TOML rejects
+        with mock.patch.object(L, "codex_trusted_root", lambda c: "/tmp/\U0001f680/repo"):
+            out = L.own_argv(["codex", "--no-daemon"], "/tmp/wt")
+        arg = out[out.index("-c") + 1]
+        self.assertIn("\U0001f680", arg)
+        parsed = tomllib.loads(arg)  # the -c value is a TOML assignment; it must parse
+        self.assertEqual(parsed, {"projects": {"/tmp/\U0001f680/repo": {"trust_level": "trusted"}}})
+
 
 class ReviewNoteInTheBrief(unittest.TestCase):
     """codex_review_note gives the worker the exact reviewer command with the root filled in, only
@@ -151,6 +162,27 @@ class ReviewNoteInTheBrief(unittest.TestCase):
         with mock.patch.object(L, "review_limits", lambda s, t: (False, 0)), \
                 mock.patch.object(L, "reviewer_agent", lambda s, t, sp, a: "codex"):
             self.assertEqual(L.codex_review_note(self._s(), {"id": 1}, "sp1", ["claude"]), "")
+
+    def _note_cmd(self, root):
+        with mock.patch.object(L, "review_limits", lambda s, t: (True, 2)), \
+                mock.patch.object(L, "reviewer_agent", lambda s, t, sp, a: "codex"), \
+                mock.patch.object(L, "codex_trusted_root", lambda c: root):
+            note = L.codex_review_note(self._s(), {"id": 1}, "sp1", ["claude"])
+        # the command the worker copies sits between the first pair of backticks
+        return note.split("`")[1]
+
+    def test_the_command_shell_parses_when_the_path_has_an_apostrophe(self):
+        # a repo path like /tmp/O'Brien/repo must not break the single-quoting the worker runs
+        cmd = self._note_cmd("/tmp/O'Brien/repo")
+        argv = shlex.split(cmd)  # would raise "No closing quotation" if mis-quoted
+        arg = argv[argv.index("-c") + 1]
+        self.assertEqual(tomllib.loads(arg), {"projects": {"/tmp/O'Brien/repo": {"trust_level": "trusted"}}})
+
+    def test_the_command_is_valid_toml_when_the_path_has_a_non_ascii_char(self):
+        cmd = self._note_cmd("/tmp/\U0001f680/repo")
+        argv = shlex.split(cmd)
+        arg = argv[argv.index("-c") + 1]
+        self.assertEqual(tomllib.loads(arg), {"projects": {"/tmp/\U0001f680/repo": {"trust_level": "trusted"}}})
 
 
 if __name__ == "__main__":

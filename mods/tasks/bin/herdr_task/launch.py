@@ -122,7 +122,9 @@ def own_argv(argv, cwd=None):
         # An inline projects table (not a quoted dotted-path key, which codex 0.167 ignores), keyed
         # on the folder codex checks. It replaces the whole projects table for this launch only,
         # which is fine for a task's own folder.
-        trust = ["-c", f'projects={{{json.dumps(codex_trusted_root(cwd))}={{trust_level="trusted"}}}}'] if cwd else []
+        # ensure_ascii=False so a non-BMP char in the path stays literal (TOML rejects json's \uXXXX
+        # surrogate escapes); this is an argv element, so no shell quoting is needed.
+        trust = ["-c", f'projects={{{json.dumps(codex_trusted_root(cwd), ensure_ascii=False)}={{trust_level="trusted"}}}}'] if cwd else []
         return out[:1] + trust + ["-c", f"hooks.PermissionRequest=[{{hooks=[{{type=\"command\",command={json.dumps(hook)},timeout={ASK_TIMEOUT}}}]}}]",
                           "-c", f"hooks.state={{{json.dumps(key)}={{trusted_hash=\"sha256:{digest}\"}}}}"] + out[1:]
     return out
@@ -481,9 +483,12 @@ def codex_review_note(s, task, space=None, argv=None):
     if not on or reviewer_agent(s, task, space, argv) != "codex":
         return ""
     root = codex_trusted_root(s.loc["folder"])
-    table = f'projects={{{json.dumps(root)}={{trust_level="trusted"}}}}'
+    # ensure_ascii=False: a non-BMP char (an emoji in the path) must stay literal, as TOML rejects
+    # json's \uXXXX surrogate escapes. shlex.quote: the worker runs this in a shell, and a path with
+    # an apostrophe would otherwise break the single-quoting.
+    table = f'projects={{{json.dumps(root, ensure_ascii=False)}={{trust_level="trusted"}}}}'
     return ("Codex reviewer: start it with "
-            f"`codex --no-daemon -c '{table}' --sandbox read-only --ask-for-approval never \"<prompt>\"` "
+            f"`codex --no-daemon -c {shlex.quote(table)} --sandbox read-only --ask-for-approval never \"<prompt>\"` "
             "exactly as written. The inline `projects` table trusts the repository root for this launch only "
             "(it replaces the whole projects table, which is fine for a read-only reviewer), so Codex's "
             "\"Do you trust this directory?\" prompt can't kill the reviewer at turn 0; never edit ~/.codex/config.toml.")
