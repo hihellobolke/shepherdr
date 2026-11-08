@@ -325,53 +325,37 @@ class RunTest(Base):
             with self.assertRaises(Fail):
                 fanout.run(s, self.change)
 
-    def test_ext_key_ignores_polling_fields(self):
-        # set_after stamps state/checked onto an after_ext record; the idempotency comparison must look
-        # only at identity (machine + id), or every rerun would re-query the machine.
-        stored = [{"ref": "vm-b:HAT-5", "machine": "vm-b", "prefix": "HAT", "id": 5,
-                   "state": "running", "checked": 123}]
-        fresh = [{"ref": "vm-b:HAT-5", "machine": "vm-b", "prefix": "HAT", "id": 5}]
-        self.assertEqual(fanout._ext_key(stored), fanout._ext_key(fresh))
-        self.assertNotEqual(fanout._ext_key(stored), fanout._ext_key([{"machine": "vm-c", "id": 5}]))
+    def test_home_child_ids_excludes_other_machines(self):
+        children = [
+            {"ref": 50, "machine": None, "rows": ["0.1"]},
+            {"ref": 51, "machine": "vm-b", "rows": ["1.1"]},
+            {"ref": 52, "machine": None, "rows": ["1.2"]},
+        ]
+        self.assertEqual(fanout._home_child_ids(children), [50, 52])
 
-    def test_verify_relink_idempotent_with_a_remote_child(self):
-        # A Verify Task that already waits for a remote child (its after_ext stamped with polling
-        # fields) must not be rewritten on a rerun, so no needless cross-machine call is made.
+    def test_verify_links_home_only_and_leaves_ext_to_the_integration(self):
+        # Fan-out never queries another machine under the store lock, so it links the Verify Task to the
+        # home children only and leaves any cross-machine after_ext (added by the integration) untouched.
+        # A rerun with such an after_ext present makes no change and no cross-machine call.
         self.run_fanout()
         with st.Store(self.loc) as s:
             feat = s.data["features"][0]
-            # make 2.1's child a remote leaf, and point the Verify Task at the children as set_after would
             leaf = next(c for c in feat["children"] if c["rows"] == ["2.1"])
-            leaf["machine"] = "vm-b"
+            leaf["machine"] = "vm-b"  # as if the integration placed this leaf elsewhere
             verify = s.task_by_id(feat["verify_task"])
-            home_ids = [c["ref"] for c in feat["children"] if not c.get("machine")]
-            verify["after"] = home_ids
+            verify["after"] = [c["ref"] for c in feat["children"] if not c.get("machine")]
             verify["after_ext"] = [{"ref": f"vm-b:{s.prefix}-{leaf['ref']}", "machine": "vm-b",
                                     "prefix": s.prefix, "id": leaf["ref"], "state": "running", "checked": 1}]
             s.dirty = True
         with st.Store(self.loc) as s:
             feat = s.data["features"][0]
             before = json.loads(json.dumps(s.task_by_id(feat["verify_task"])))
-            made = fanout._ensure_verify(s, feat, self.change, None, True, 0)  # must not reach vm-b or rewrite
+            made = fanout._ensure_verify(s, feat, self.change, None, True, 0)  # no vm-b call, no rewrite
         self.assertFalse(made)
-        with st.Store(self.loc, write=False) as s:
-            self.assertEqual(s.task_by_id(s.data["features"][0]["verify_task"]), before)
-
-    def test_verify_waits_for_children_on_every_machine(self):
-        # A Verify Task must wait for children on other machines too, not only the home ones. Seed a
-        # remote child entry and check the split the Verify Task's after is built from.
-        with st.Store(self.loc) as s:
-            feat = s.data["features"][0]
-            feat["children"] = [
-                {"ref": 50, "machine": None, "package": "0.1", "rows": ["0.1"], "role": "child"},
-                {"ref": 51, "machine": "vm-b", "package": "1.1", "rows": ["1.1"], "role": "child"},
-            ]
-            home_ids, ext = fanout._local_and_ext(s, feat["children"])
-            self.assertEqual(home_ids, [50])
-            self.assertEqual(len(ext), 1)
-            self.assertEqual(ext[0]["machine"], "vm-b")
-            self.assertTrue(ext[0]["ref"].startswith("vm-b:"))
-            self.assertEqual(ext[0]["id"], 51)
+        after = self.read()["tasks"]
+        verify = next(t for t in after if t.get("role") == "verify")
+        self.assertEqual(verify, before)                       # unchanged
+        self.assertTrue(verify.get("after_ext"))               # the integration's link is preserved
 
 
 # ---- placement with chain affinity (section 6.13), via the dry run ----------------------------
