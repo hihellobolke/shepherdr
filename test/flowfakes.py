@@ -1,0 +1,804 @@
+"""Fake `hc` and `gh` for the OpenSpec flow end-to-end tests (task T23h).
+
+The end-to-end tests (T23r remote, T23l local) run real `herdr-task` against a throwaway repo.
+Those tests must never reach the person's real herdr-core (`hc`), their real GitHub (`gh`) or their
+real home.
+This module builds the stand-ins they use.
+
+It writes two executables, a fake `hc` and a fake `gh`, into a scratch `bin/` directory that the
+tests put first on `PATH` (and it points `HERDR_TASK_GH` at the fake `gh`, which `base.py` reads).
+Both fakes record every call they get and simulate only what the flow uses:
+
+- a child agent that commits to its task branch and runs `herdr-task ready` (the fake `hc run`
+  starts it, so a real worker CLI is never launched);
+- pull requests with checks, listed and viewed as `gh` prints them;
+- a squash merge into a bare remote, the same shape as a GitHub squash merge;
+- a second machine, reached through `hc exec --on <machine>`, running its own `herdr-task` on its
+  own store (the pattern of `AutomationFromAnotherMachine` in `test_herdr_task.py`).
+
+Each test can script, per child: a forced conflict, a failed child and a risky child.
+
+The harness object (`FlowFakes`) owns a scratch directory and never writes outside it.
+Everything the fakes share lives in one JSON state file (`FLOWFAKES_STATE`), guarded by a file
+lock, so concurrent background agents stay consistent.
+The same module runs as the fake executables (`python3 -I flowfakes.py hc|gh|agent ...`); the
+harness API and the fakes therefore read and write the state through the same code.
+"""
+
+import contextlib
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+
+# ---- paths and state --------------------------------------------------------------------------
+
+SELF = os.path.realpath(__file__)
+
+# A git identity carried in the environment, and global/system git config turned off, so the fakes
+# commit and merge in a scratch HOME with no git config at all (git checks the committer identity
+# before a merge, not only at commit time) and a person's own ~/.gitconfig never leaks in.
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "Flow Fake", "GIT_AUTHOR_EMAIL": "flow@example.invalid",
+    "GIT_COMMITTER_NAME": "Flow Fake", "GIT_COMMITTER_EMAIL": "flow@example.invalid",
+    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+}
+
+# A child agent's default behaviour when a test does not script one for its name.
+DEFAULT_AGENT = {"commit": True, "ready": True, "fail": False, "conflict": False, "risky": False,
+                 "owns": None, "message": None}
+
+
+def _state_dir():
+    d = os.environ.get("FLOWFAKES_STATE")
+    if not d:
+        raise RuntimeError("FLOWFAKES_STATE is not set: run through FlowFakes.env()")
+    return d
+
+
+@contextlib.contextmanager
+def _locked(state_dir):
+    """The state file, open for read-modify-write under an exclusive lock. Yields the loaded dict;
+    whatever it holds on exit is written back."""
+    lock = os.path.join(state_dir, "lock")
+    path = os.path.join(state_dir, "state.json")
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        with open(path) as f:
+            state = json.load(f)
+        box = {"state": state}
+        yield box
+        with open(path, "w") as f:
+            json.dump(box["state"], f, indent=2, sort_keys=True)
+
+
+def _read_state(state_dir):
+    with open(os.path.join(state_dir, "state.json")) as f:
+        return json.load(f)
+
+
+def _record(state_dir, prog, argv, cwd):
+    """Append one call to the call log (its own file, so it never contends with the state lock)."""
+    line = json.dumps({"prog": prog, "argv": list(argv), "cwd": cwd, "time": time.time()})
+    path = os.path.join(state_dir, "calls.jsonl")
+    with open(os.path.join(state_dir, "calls.lock"), "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        with open(path, "a") as f:
+            f.write(line + "\n")
+
+
+# ---- git helpers (used by the fakes and the harness) ------------------------------------------
+
+def _git(cwd, *args, check=True):
+    r = subprocess.run(["git", "-C", cwd, *args], env={**os.environ, **_GIT_ENV},
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()}")
+    return r
+
+
+def _sha(origin, branch):
+    """The tip of `branch` in the bare origin, or None when it has no such branch yet."""
+    r = _git(origin, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+    return r.stdout.strip() or None
+
+
+# ================================================================================================
+# The harness
+# ================================================================================================
+
+class FlowFakes:
+    """Builds the fakes in a scratch directory and drives them from the test.
+
+    Typical use:
+
+        with tempfile.TemporaryDirectory() as root:
+            fakes = FlowFakes(root).start()
+            env = fakes.env()            # PATH, HERDR_TASK_GH, FLOWFAKES_STATE, a scratch HOME
+            ...                          # run herdr-task / git with env
+            assert fakes.calls("gh")     # what gh was asked
+    """
+
+    def __init__(self, root, *, repo="octo/demo", default_branch="main", prefix="HAT"):
+        self.root = os.path.realpath(root)
+        self.repo = repo
+        self.default_branch = default_branch
+        self.prefix = prefix
+        self.bin_dir = os.path.join(self.root, "bin")
+        self.state_dir = os.path.join(self.root, "state")
+        self.origin = os.path.join(self.root, "origin.git")
+        self.home_repo = os.path.join(self.root, "repo")
+        self.home = os.path.join(self.root, "home")
+        self._gh_work = os.path.join(self.state_dir, "gh-work")
+        self._started = False
+
+    # -- lifecycle --
+
+    def start(self):
+        """Create the bin directory, the fakes, the state file, the bare remote and the home repo."""
+        for d in (self.bin_dir, self.state_dir, self.home):
+            os.makedirs(d, exist_ok=True)
+        self._write_fakes()
+        self._init_repo()
+        state = {
+            "repo": self.repo,
+            "default_branch": self.default_branch,
+            "origin": self.origin,
+            "gh_work": self._gh_work,
+            "pr_counter": 0,
+            "prs": [],
+            "default_check": "SUCCESS",
+            "machines": {},
+            "agents": {},
+        }
+        with open(os.path.join(self.state_dir, "state.json"), "w") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        open(os.path.join(self.state_dir, "calls.jsonl"), "w").close()
+        self._started = True
+        return self
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *exc):
+        return False
+
+    def _write_fakes(self):
+        py = sys.executable
+        for name in ("hc", "gh"):
+            path = os.path.join(self.bin_dir, name)
+            with open(path, "w") as f:
+                f.write(f'#!/bin/sh\nexec "{py}" -I "{SELF}" {name} "$@"\n')
+            os.chmod(path, 0o755)
+
+    def _init_repo(self):
+        _git(self.root, "init", "-q", "--bare", "-b", self.default_branch, self.origin)
+        _git(self.root, "clone", "-q", self.origin, self.home_repo)
+        # A first commit so the base branch exists on the remote.
+        readme = os.path.join(self.home_repo, "README.md")
+        with open(readme, "w") as f:
+            f.write("# demo\n")
+        _git(self.home_repo, "add", "README.md")
+        _git(self.home_repo, "commit", "-q", "-m", "first")
+        _git(self.home_repo, "push", "-q", "origin", self.default_branch)
+        # The merge work-clone (self._gh_work) is created on the first squash merge, so a test that
+        # never merges pays nothing for it.
+
+    # -- environment --
+
+    def env(self, extra=None, *, home=None, store=None, settings=None):
+        """The environment a test runs `herdr-task` or `git` under: the fakes first on `PATH`,
+        `HERDR_TASK_GH` at the fake `gh`, `FLOWFAKES_STATE` at the state directory, and a scratch
+        `HOME`, store and settings so nothing touches the real ones."""
+        home = home or self.home
+        env = dict(os.environ)
+        env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
+        env["HERDR_TASK_GH"] = os.path.join(self.bin_dir, "gh")
+        env["FLOWFAKES_STATE"] = self.state_dir
+        env["HOME"] = home
+        env["HERDR_TASK_STORE"] = store or os.path.join(home, ".herdr", "tasks")
+        env["HERDR_TASK_SETTINGS"] = settings or os.path.join(home, ".herdr", "shepherdr.json")
+        env.update(_GIT_ENV)  # a git identity and no global/system config, so git stays isolated too
+        if extra:
+            env.update(extra)
+        return env
+
+    # -- call log --
+
+    def calls(self, prog=None):
+        """Every recorded call, oldest first, each `{prog, argv, cwd, time}`; `prog` filters."""
+        path = os.path.join(self.state_dir, "calls.jsonl")
+        out = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return [c for c in out if prog is None or c["prog"] == prog]
+
+    def last_call(self, prog=None):
+        calls = self.calls(prog)
+        return calls[-1] if calls else None
+
+    def reset_calls(self):
+        open(os.path.join(self.state_dir, "calls.jsonl"), "w").close()
+
+    # -- GitHub control and inspection --
+
+    def prs(self):
+        return _read_state(self.state_dir)["prs"]
+
+    def find_pr(self, *, number=None, head=None, state=None):
+        for pr in self.prs():
+            if number is not None and pr["number"] != number:
+                continue
+            if head is not None and pr["head"] != head:
+                continue
+            if state is not None and pr["state"] != state:
+                continue
+            return pr
+        return None
+
+    def open_pr(self, head, *, base=None, title="", body=""):
+        """Open a pull request for a branch already pushed to the remote, as `gh pr create` would.
+        Returns the record."""
+        base = base or self.default_branch
+        with _locked(self.state_dir) as box:
+            pr = _new_pr(box["state"], head, base, title, body)
+        return pr
+
+    def set_checks(self, number, conclusion):
+        """Set a pull request's checks to `SUCCESS`, `FAILURE` or `PENDING` (the statusCheckRollup
+        `gh pr view` prints)."""
+        with _locked(self.state_dir) as box:
+            _pr_by_number(box["state"], number)["checks"] = conclusion
+
+    def set_mergeable(self, number, value):
+        """Force a pull request's mergeable flag (`MERGEABLE`, `CONFLICTING`, `UNKNOWN`). A
+        `CONFLICTING` pull request is the forced-conflict scenario for the closing step."""
+        with _locked(self.state_dir) as box:
+            _pr_by_number(box["state"], number)["mergeable"] = value
+
+    def base_sha(self, branch=None):
+        return _sha(self.origin, branch or self.default_branch)
+
+    # -- machines --
+
+    def add_machine(self, name, *, store=None, home=None):
+        """Register a second machine reached through `hc exec --on <name>`. It runs its own
+        `herdr-task` on its own store and home, all inside the scratch directory."""
+        mhome = home or os.path.join(self.root, "machines", name)
+        os.makedirs(mhome, exist_ok=True)
+        mstore = store or os.path.join(mhome, ".herdr", "tasks")
+        os.makedirs(mstore, exist_ok=True)
+        rec = {"name": name, "store": mstore, "home": mhome, "down": False}
+        with _locked(self.state_dir) as box:
+            box["state"]["machines"][name] = rec
+        return rec
+
+    def set_down(self, name, down=True):
+        """A machine the home machine cannot reach: its `hc exec` answers connection refused."""
+        with _locked(self.state_dir) as box:
+            box["state"]["machines"][name]["down"] = down
+
+    def machine_store(self, name):
+        return _read_state(self.state_dir)["machines"][name]["store"]
+
+    # -- fake child agents --
+
+    def script_agent(self, key, *, commit=True, ready=True, fail=False, conflict=False,
+                     risky=False, owns=None, message=None):
+        """Script what the child agent named `key` (the `hc run --name`) does when it is started.
+
+        - `commit`: make a commit on the task branch touching an owned path (default on).
+        - `ready`: run `herdr-task ready <ref>` after committing (default on).
+        - `fail`: the child fails (no ready; the run exits non-zero): the failed-child scenario.
+        - `conflict`: write content that conflicts with the base branch: the forced-conflict
+          scenario at merge time.
+        - `risky`: mark the child risky (a high-risk Task shows its Accept card): recorded so a
+          test can assert the agent was treated as risky.
+        - `owns`: the path(s) the commit touches (default `<key>.txt`).
+        - `message`: the commit message (default `"<key> work"`).
+        """
+        rec = {"commit": commit, "ready": ready, "fail": fail, "conflict": conflict, "risky": risky,
+               "owns": [owns] if isinstance(owns, str) else owns, "message": message}
+        with _locked(self.state_dir) as box:
+            box["state"]["agents"][key] = rec
+        return rec
+
+    def run_agent(self, key, *, worktree, branch, ref, base=None, folder=None, wait=True, env=None):
+        """Start the child agent `key` directly (what the fake `hc run` does for it), for a test
+        that drives one agent without the whole `hc run` argv. Returns the finished process when
+        `wait`, else the `Popen`."""
+        base = base or self.default_branch
+        args = [sys.executable, "-I", SELF, "agent", key, "--worktree", worktree, "--branch", branch,
+                "--ref", ref, "--base", base]
+        if folder:
+            args += ["--folder", folder]
+        runenv = env or self.env()
+        if wait:
+            return subprocess.run(args, env=runenv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  universal_newlines=True)
+        return subprocess.Popen(args, env=runenv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True)
+
+
+# ---- pull request records (shared by the harness and the fake gh) -----------------------------
+
+def _pr_url(repo, number):
+    return f"https://github.com/{repo}/pull/{number}"
+
+
+def _new_pr(state, head, base, title, body):
+    state["pr_counter"] += 1
+    n = state["pr_counter"]
+    pr = {
+        "number": n,
+        "url": _pr_url(state["repo"], n),
+        "repo": state["repo"],
+        "head": head,
+        "base": base,
+        "title": title,
+        "body": body,
+        "state": "OPEN",
+        "mergeable": "MERGEABLE",
+        "headRefOid": _sha(state["origin"], head) or "",
+        "mergeCommit": None,
+        "checks": state.get("default_check", "SUCCESS"),
+        "comments": [],
+    }
+    state["prs"].append(pr)
+    return pr
+
+
+def _pr_by_number(state, number):
+    for pr in state["prs"]:
+        if pr["number"] == int(number):
+            return pr
+    raise RuntimeError(f"no pull request #{number}")
+
+
+def _rollup(pr):
+    """The statusCheckRollup list `gh pr view --json statusCheckRollup` returns, from the pull
+    request's single check state."""
+    c = pr.get("checks") or "SUCCESS"
+    if c == "PENDING":
+        return [{"__typename": "CheckRun", "name": "check", "status": "IN_PROGRESS", "conclusion": ""}]
+    return [{"__typename": "CheckRun", "name": "check", "status": "COMPLETED", "conclusion": c}]
+
+
+def _pr_json(pr, fields):
+    """One pull request as the JSON `gh` prints for the asked `fields`."""
+    out = {}
+    for fld in fields:
+        if fld == "statusCheckRollup":
+            out[fld] = _rollup(pr)
+        elif fld == "isCrossRepository":
+            out[fld] = False
+        elif fld == "mergeCommit":
+            out[fld] = {"oid": pr["mergeCommit"]} if pr["mergeCommit"] else None
+        elif fld == "baseRefName":
+            out[fld] = pr["base"]
+        elif fld == "headRefName":
+            out[fld] = pr["head"]
+        elif fld in pr:
+            out[fld] = pr[fld]
+    return out
+
+
+# ================================================================================================
+# The fakes (run as `python3 -I flowfakes.py hc|gh|agent ...`)
+# ================================================================================================
+
+def _parse_flags(argv, with_values, bare=()):
+    """A tiny argv parser: `with_values` flags take the next token, `bare` flags are booleans.
+    Returns `(flags, positionals, after_dashdash)`."""
+    flags, pos, rest = {}, [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            rest = argv[i + 1:]
+            break
+        if a in with_values:
+            flags[a] = argv[i + 1] if i + 1 < len(argv) else None
+            i += 2
+            continue
+        if a in bare:
+            flags[a] = True
+            i += 1
+            continue
+        pos.append(a)
+        i += 1
+    return flags, pos, rest
+
+
+# ---- fake gh ----------------------------------------------------------------------------------
+
+def _fake_gh(argv):
+    state_dir = _state_dir()
+    _record(state_dir, "gh", argv, os.getcwd())
+    if not argv:
+        return 0
+    if argv[0] == "repo" and len(argv) > 1 and argv[1] == "view":
+        return _gh_repo_view(state_dir, argv[2:])
+    if argv[0] == "pr":
+        return _gh_pr(state_dir, argv[1:])
+    if argv[0] == "issue":
+        return _gh_issue(state_dir, argv[1:])
+    if argv[0] == "api":
+        print("{}")
+        return 0
+    return 0
+
+
+def _jq_field(obj, q):
+    """Enough of `-q` for the flow: a single `.field` path on a dict."""
+    q = q.strip()
+    if q.startswith("."):
+        q = q[1:]
+    if q == "":
+        return obj
+    cur = obj
+    for part in q.split("."):
+        if isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _gh_repo_view(state_dir, argv):
+    state = _read_state(state_dir)
+    flags, _, _ = _parse_flags(argv, {"--json", "-q", "--jq"})
+    data = {"nameWithOwner": state["repo"]}
+    q = flags.get("-q") or flags.get("--jq")
+    if q:
+        val = _jq_field(data, q)
+        print("" if val is None else val)
+    else:
+        print(json.dumps(data))
+    return 0
+
+
+def _gh_pr(state_dir, argv):
+    sub = argv[0] if argv else ""
+    if sub == "create":
+        return _gh_pr_create(state_dir, argv[1:])
+    if sub == "list":
+        return _gh_pr_list(state_dir, argv[1:])
+    if sub == "view":
+        return _gh_pr_view(state_dir, argv[1:])
+    if sub == "comment":
+        return _gh_pr_comment(state_dir, argv[1:])
+    if sub == "merge":
+        return _gh_pr_merge(state_dir, argv[1:])
+    return 0
+
+
+def _gh_pr_create(state_dir, argv):
+    flags, _, _ = _parse_flags(argv, {"--repo", "--head", "--base", "--title", "--body"})
+    with _locked(state_dir) as box:
+        state = box["state"]
+        head = flags.get("--head")
+        existing = next((p for p in state["prs"] if p["head"] == head and p["state"] == "OPEN"), None)
+        pr = existing or _new_pr(state, head, flags.get("--base") or state["default_branch"],
+                                 flags.get("--title") or "", flags.get("--body") or "")
+    # gh prints the URL of the created pull request; github.py reads out.split()[-1].
+    print(pr["url"])
+    return 0
+
+
+def _gh_pr_list(state_dir, argv):
+    flags, _, _ = _parse_flags(argv, {"--repo", "--head", "--state", "--json", "--limit"})
+    state = _read_state(state_dir)
+    want = (flags.get("--state") or "open").upper()
+    head = flags.get("--head")
+    fields = (flags.get("--json") or "").split(",") if flags.get("--json") else []
+    rows = []
+    for pr in state["prs"]:
+        if head is not None and pr["head"] != head:
+            continue
+        if want != "ALL" and pr["state"] != want:
+            continue
+        rows.append(_pr_json(pr, fields) if fields else {"number": pr["number"]})
+    print(json.dumps(rows))
+    return 0
+
+
+def _gh_pr_view(state_dir, argv):
+    flags, pos, _ = _parse_flags(argv, {"--repo", "--json", "-q", "--jq"})
+    number = next((p for p in pos if p.isdigit()), None)
+    state = _read_state(state_dir)
+    try:
+        pr = _pr_by_number(state, number)
+    except RuntimeError:
+        sys.stderr.write(f"no pull request found for {number}\n")
+        return 1
+    fields = (flags.get("--json") or "").split(",") if flags.get("--json") else []
+    data = _pr_json(pr, fields) if fields else pr
+    q = flags.get("-q") or flags.get("--jq")
+    if q:
+        val = _jq_field(data, q)
+        print("" if val is None else val)
+    else:
+        print(json.dumps(data))
+    return 0
+
+
+def _gh_pr_comment(state_dir, argv):
+    flags, pos, _ = _parse_flags(argv, {"--repo", "--body", "--body-file"})
+    number = next((p for p in pos if p.isdigit()), None)
+    body = flags.get("--body")
+    if body is None and flags.get("--body-file"):
+        with open(flags["--body-file"]) as f:
+            body = f.read()
+    with _locked(state_dir) as box:
+        pr = _pr_by_number(box["state"], number)
+        pr["comments"].append(body or "")
+        url = pr["url"]
+    print(url + "#comment")
+    return 0
+
+
+def _gh_pr_merge(state_dir, argv):
+    flags, pos, _ = _parse_flags(
+        argv, {"--repo"}, bare=("--squash", "--merge", "--rebase", "--delete-branch", "--auto"))
+    number = next((p for p in pos if p.isdigit()), None)
+    with _locked(state_dir) as box:
+        state = box["state"]
+        pr = _pr_by_number(state, number)
+        if pr["state"] == "MERGED":
+            print(f"Pull request #{number} already merged")
+            return 0
+        if pr.get("mergeable") == "CONFLICTING":
+            sys.stderr.write(f"Pull request #{number} is not mergeable: the merge commit cannot be cleanly created\n")
+            return 1
+        ok, merge_commit, conflicted = _squash_merge(state, pr)
+        if not ok:
+            pr["mergeable"] = "CONFLICTING"
+            sys.stderr.write("failed to merge: conflicts in " + ", ".join(conflicted) + "\n")
+            return 1
+        pr["state"] = "MERGED"
+        pr["mergeCommit"] = merge_commit
+    print(f"Merged pull request #{number} ({merge_commit[:7]})")
+    return 0
+
+
+def _squash_merge(state, pr):
+    """Squash-merge the pull request's head into its base in the bare origin, the shape of a GitHub
+    squash merge: one commit on the base, the head branch left as it was. Returns
+    `(ok, merge_commit, conflicted_files)`."""
+    work, origin = state["gh_work"], state["origin"]
+    base, head = pr["base"], pr["head"]
+    if not os.path.isdir(work):
+        _git(os.path.dirname(work), "clone", "-q", origin, work)
+    _git(work, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    _git(work, "checkout", "-q", "-B", base, f"refs/remotes/origin/{base}")
+    r = _git(work, "merge", "--squash", "--no-commit", f"refs/remotes/origin/{head}", check=False)
+    if r.returncode != 0:
+        conflicted = [ln[3:] for ln in _git(work, "status", "--porcelain").stdout.splitlines()
+                      if ln[:2] in ("UU", "AA", "DD", "DU", "UD", "AU", "UA")]
+        _git(work, "merge", "--abort", check=False)
+        _git(work, "reset", "-q", "--hard", f"refs/remotes/origin/{base}", check=False)
+        return False, None, conflicted
+    title = pr.get("title") or f"Merge #{pr['number']}"
+    _git(work, "commit", "-q", "--allow-empty", "-m", f"{title} (#{pr['number']})")
+    _git(work, "push", "-q", "origin", f"{base}:{base}")
+    return True, _git(work, "rev-parse", "HEAD").stdout.strip(), []
+
+
+def _gh_issue(state_dir, argv):
+    """Minimal issue support (herdr-task feedback uses it): record and print a plausible url."""
+    sub = argv[0] if argv else ""
+    state = _read_state(state_dir)
+    if sub == "list":
+        print("[]")
+        return 0
+    if sub in ("create", "comment"):
+        print(f"https://github.com/{state['repo']}/issues/1")
+        return 0
+    return 0
+
+
+# ---- fake hc ----------------------------------------------------------------------------------
+
+def _fake_hc(argv):
+    state_dir = _state_dir()
+    _record(state_dir, "hc", argv, os.getcwd())
+    if not argv:
+        return 0
+    cmd = argv[0]
+    if cmd == "run":
+        return _hc_run(state_dir, argv[1:])
+    if cmd == "exec":
+        return _hc_exec(state_dir, argv[1:])
+    if cmd == "file":
+        return _hc_file(state_dir, argv[1:])
+    if cmd == "machine":
+        return _hc_machine(state_dir, argv[1:])
+    if cmd in ("wait", "kill", "label", "send", "keys"):
+        return 0
+    if cmd == "read":
+        return 0
+    if cmd == "get":
+        if "--json" in argv:
+            print("null")
+        return 0
+    if cmd in ("server", "status"):
+        if "--json" in argv:
+            print(json.dumps({"name": "home"}))
+        return 0
+    return 0
+
+
+def _hc_run(state_dir, argv):
+    """Start a fake child agent in the background instead of a real worker CLI. Prints the address
+    JSON that `launch.py` reads, then detaches the agent."""
+    flags, _, after = _parse_flags(
+        argv, {"--name", "--cwd", "--label", "--parent"},
+        bare=("--bg", "--json", "--keep", "--no-parent", "--outlive-parent"))
+    name = flags.get("--name") or "agent"
+    cwd = flags.get("--cwd") or os.getcwd()
+    ref, branch, base, folder = _agent_target(after, cwd, state_dir)
+    args = [sys.executable, "-I", SELF, "agent", name, "--worktree", cwd, "--branch", branch,
+            "--ref", ref, "--base", base, "--folder", folder]
+    subprocess.Popen(args, env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    if flags.get("--json"):
+        print(json.dumps({"address": name, "name": name}))
+    return 0
+
+
+def _agent_target(after, cwd, state_dir):
+    """Work out the ref, branch, base and folder for the agent the run starts. The ref and base
+    come from the worktree's git branch; a test that needs exact values scripts them or uses
+    `run_agent` directly."""
+    branch = "HEAD"
+    r = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != "HEAD":
+        branch = r.stdout.strip()
+    base = _read_state(state_dir)["default_branch"]
+    # The ref is the last path element of the branch when it looks like task/<REF>-...; else the name.
+    ref = branch
+    parts = branch.split("/")[-1].split("-")
+    if len(parts) >= 2:
+        ref = "-".join(parts[:2])
+    return ref, branch, base, cwd
+
+
+def _hc_exec(state_dir, argv):
+    """`hc exec --on <machine> [--timeout T] -- <cmd...>`: run the command in the machine's own
+    environment (its store and home), or answer connection refused when the machine is down."""
+    flags, _, after = _parse_flags(argv, {"--on", "--timeout"}, bare=("--stdin", "--observe"))
+    machine = flags.get("--on")
+    state = _read_state(state_dir)
+    if machine and machine in state["machines"]:
+        rec = state["machines"][machine]
+        if rec.get("down"):
+            sys.stderr.write(f"hc: {machine}: connection refused\n")
+            return 1
+        env = dict(os.environ)
+        env["HERDR_TASK_STORE"] = rec["store"]
+        env["HERDR_TASK_SETTINGS"] = os.path.join(rec["home"], ".herdr", "shepherdr.json")
+        stdin = sys.stdin.read() if flags.get("--stdin") else None
+        r = subprocess.run(after, env=env, input=stdin, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return r.returncode
+    # No such machine (or none named): run the command here.
+    if after:
+        r = subprocess.run(after, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return r.returncode
+    return 0
+
+
+def _hc_file(state_dir, argv):
+    """`hc file write --on <machine> <target>`: write stdin to the target under the machine's home
+    (never an absolute real path)."""
+    if not argv or argv[0] != "write":
+        return 0
+    flags, pos, _ = _parse_flags(argv[1:], {"--on"})
+    machine = flags.get("--on")
+    target = pos[0] if pos else None
+    body = sys.stdin.read()
+    state = _read_state(state_dir)
+    if machine and machine in state["machines"] and target:
+        home = state["machines"][machine]["home"]
+        dest = target if os.path.isabs(target) else os.path.join(home, target)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w") as f:
+            f.write(body)
+    return 0
+
+
+def _hc_machine(state_dir, argv):
+    """`hc machine ls --json`: the registered machines, the shape `connected_machines` reads."""
+    state = _read_state(state_dir)
+    if argv and argv[0] == "ls":
+        if "--json" in argv:
+            machines = [{"name": n, "state": "connected"} for n in sorted(state["machines"])]
+            print(json.dumps({"machines": machines}))
+        return 0
+    return 0
+
+
+# ---- fake child agent -------------------------------------------------------------------------
+
+def _fake_agent(argv):
+    """A child worker stand-in: it commits to its task branch, pushes it and runs `herdr-task
+    ready`, as the flow's child agents do. What it does is scripted per name in the state."""
+    flags, pos, _ = _parse_flags(argv, {"--worktree", "--branch", "--ref", "--base", "--folder"})
+    key = pos[0] if pos else "agent"
+    state_dir = _state_dir()
+    _record(state_dir, "agent", argv, flags.get("--worktree") or os.getcwd())
+    state = _read_state(state_dir)
+    script = {**DEFAULT_AGENT, **(state["agents"].get(key) or {})}
+    wt = flags.get("--worktree")
+    branch = flags.get("--branch")
+    ref = flags.get("--ref") or key
+    base = flags.get("--base") or state["default_branch"]
+    folder = flags.get("--folder")
+
+    if script.get("commit") and wt:
+        _agent_commit(wt, branch, base, ref, key, script)
+    if script.get("fail"):
+        sys.stderr.write(f"{ref}: child failed\n")
+        return 1
+    if script.get("ready") and folder:
+        r = subprocess.run(["herdr-task", "ready", ref, "--folder", folder, "--json"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return r.returncode
+    return 0
+
+
+def _agent_commit(wt, branch, base, ref, key, script):
+    """Make the child's commit on its task branch and push it to the origin. A `conflict` child
+    writes to a shared path with content that will clash with the base branch at merge time."""
+    if branch and branch != "HEAD":
+        cur = _git(wt, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip()
+        if cur != branch:
+            _git(wt, "checkout", "-q", "-B", branch, check=False)
+    owns = script.get("owns") or ([f"{key}.txt"] if not script.get("conflict") else ["shared.txt"])
+    for rel in owns:
+        path = os.path.join(wt, rel)
+        os.makedirs(os.path.dirname(path) or wt, exist_ok=True)
+        with open(path, "w") as f:
+            f.write((script.get("message") or f"{key} work") + "\n" +
+                    ("conflict from " + ref + "\n" if script.get("conflict") else ""))
+        _git(wt, "add", rel)
+    _git(wt, "commit", "-q", "-m", script.get("message") or f"{ref} {key} work", check=False)
+    # Push the branch to the origin so a pull request and a squash merge can see it.
+    r = _git(wt, "remote", check=False)
+    if "origin" in r.stdout.split():
+        _git(wt, "push", "-q", "--force-with-lease", "-u", "origin", branch, check=False)
+
+
+# ---- entry point ------------------------------------------------------------------------------
+
+def _main(argv):
+    if len(argv) < 2:
+        sys.stderr.write("usage: flowfakes.py hc|gh|agent ...\n")
+        return 2
+    which, rest = argv[1], argv[2:]
+    if which == "hc":
+        return _fake_hc(rest)
+    if which == "gh":
+        return _fake_gh(rest)
+    if which == "agent":
+        return _fake_agent(rest)
+    sys.stderr.write(f"flowfakes.py: unknown fake {which}\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv))
