@@ -17,9 +17,16 @@ checkout the Feature record lives in.
 
 The after links and the Verify Task are built from the Feature's own `children` list (the records that
 were actually created), never from the plan's predicted refs, so a real run is correct even when the
-counter has moved or a child sits on another machine. A child on another machine is reached only
-through `herdr-task --on <machine>`; the tests never run a changed herdr-task on another machine (a
-repo rule), so the cross-machine refs use the Feature's folder prefix, the shape the C5 example shows.
+counter has moved or a child already sits on another machine.
+
+Placement across machines (section 6.13) is computed and shown in the plan, so `fanout --dry-run
+--machines a,b,c` previews the spread with chain affinity. A real run, though, creates children on the
+home machine only: creating a C2-complete child on another machine needs the `add` command to carry
+the child's `rows` (contract C4 has no such flag) and a lock-safe way to make cross-machine calls
+without holding the folder's store lock; both are missing, so a real `--machines` run is refused with a
+clear message rather than shipping a child that is wrong or a run that deadlocks. The Verify Task and
+the after links still treat a child on any machine correctly (so the multi-machine integration can
+record remote children later and this module links them), but this module does not itself create them.
 
 The glossary words (proposal section 2) are the ones used here: Feature, child Task, Verify Task, work
 table, row, wave, chain, work package, fan-out, placement, chain affinity, amendment. The module
@@ -30,11 +37,9 @@ wave tasks build in parallel.
 import json
 import os
 import re
-import subprocess
-import sys
 
-from .base import ENTRY, Fail, guard, now, run as run_cmd
-from .settings import machine_name, set_task, settings_for
+from .base import Fail, now, run as run_cmd
+from .settings import set_task, settings_for
 from .store import locate, open_store, Store
 from .queues import set_after
 from .output import say
@@ -126,6 +131,7 @@ def run(s, change, machines=None, amend=False, start=True):
     p = plan(s, change, machines, amend)
     if not p.get("valid"):
         raise Fail(p.get("error") or "the work table is not valid")
+    _refuse_remote_creation(p["packages"])
     feature = _feature_for(s, change)
 
     cancelled = _amend_cancel(s, feature, p["packages"]) if amend else []
@@ -136,7 +142,7 @@ def run(s, change, machines=None, amend=False, start=True):
     for entry in p["packages"]:
         if frozenset(entry["rows"]) in existing:
             continue
-        _create_child(s, feature, entry, p["packages"], start, queued_at)
+        _create_child(s, feature, entry, start, queued_at)
         existing = _children_by_rows(feature)  # so a later package sees this one as a dependency
         created += 1
         queued_at += 1
@@ -202,10 +208,8 @@ def _say_plan(args, p):
     for pkg in p["packages"]:
         where = f" on {pkg['machine']}" if pkg["machine"] else ""
         risk = f" [high: {pkg['risk_reason']}]" if pkg["risk"] == "high" else ""
-        after = f", after {', '.join(pkg['after'])}" if pkg["after"] else ""
         lines.append(f"  {pkg['package']} ({', '.join(pkg['rows'])}){where}{risk}")
-        lines.append(f"    add --branch {pkg['branch']} --base {pkg['base']} --owns {','.join(pkg['owns'])} "
-                     f"--risk {pkg['risk']} --set merge={pkg['merge']}{after}")
+        lines.append("    herdr-task add " + " ".join(_add_flags(p["feature"], pkg)))
     lines.append(f"  verify after {', '.join(p['verify_task']['after']) or '(nothing)'}")
     for w in p.get("warnings") or []:
         lines.append(f"  warning: {w}")
@@ -216,6 +220,23 @@ def _say_plan(args, p):
     for ref in p.get("cancelled") or []:
         lines.append(f"cancelled {ref} (its row was removed)")
     print("\n".join(lines))
+
+
+def _add_flags(feature_ref, pkg):
+    """The exact `add` flags a package becomes (proposal section 6.7 step 10), for the printed plan."""
+    flags = [_q(_child_title({"package": pkg["package"], "rows": pkg["rows"]})), "--worktree",
+             "--feature", feature_ref, "--role", "child",
+             "--owns", _q(",".join(pkg["owns"])), "--risk", pkg["risk"],
+             "--base", _q(pkg["base"]), "--branch", _q(pkg["branch"]),
+             "--set", f"merge={pkg['merge']}"]
+    if pkg["after"]:
+        flags += ["--after", _q(",".join(pkg["after"]))]
+    return flags
+
+
+def _q(value):
+    """Quote a flag value for the printed plan when it holds a space."""
+    return f'"{value}"' if " " in value else value
 
 
 # ---- the Feature and the work table ---------------------------------------------------------
@@ -435,15 +456,26 @@ def _child_brief(s, feature, change, pkg):
 
 # ---- creating the Tasks ---------------------------------------------------------------------
 
-def _create_child(s, feature, entry, packages, start, queued_at):
-    """Create one child Task for a work package (contract C2 fields), on this machine or, when the
-    package is placed elsewhere, on that machine with `herdr-task --on`. Records it on the Feature's
-    `children` list. The home child's after links are set later by `_link_home_children` (once every
-    package it depends on exists); a remote child is given its after at creation, because it lives in
-    the other machine's store and cannot be relinked from here."""
-    if entry["machine"]:
-        _create_remote_child(s, feature, entry, packages, start)
-        return
+def _refuse_remote_creation(packages):
+    """A real run creates children on the home machine only. Refuse, before anything is created, to
+    place children on other machines: see the module docstring (no `rows` flag on `add`, contract C4;
+    and a lock-safe cross-machine call is needed). `fanout --dry-run --machines ...` still previews the
+    placement."""
+    machines = sorted({pkg["machine"] for pkg in packages if pkg["machine"]})
+    if machines:
+        raise Fail(
+            f"fanout creates children on the home machine only; it cannot place them on "
+            f"{', '.join(machines)} yet. Creating a child on another machine needs the `add` command "
+            f"to carry its work-package rows (the contract's `add` has no --rows) and a lock-safe "
+            f"cross-machine call; both are missing. Preview the spread with `fanout --dry-run "
+            f"--machines {','.join(machines)}`, or run without --machines.")
+
+
+def _create_child(s, feature, entry, start, queued_at):
+    """Create one child Task for a work package (contract C2 fields) on this machine, and record it on
+    the Feature's `children` list. The child's after links are set later by `_link_home_children`, once
+    every package it depends on exists. A real run never reaches this with a remote placement
+    (`_refuse_remote_creation` stops that first)."""
     t = s.new(
         _child_title(entry),
         entry["brief"],
@@ -468,62 +500,6 @@ def _create_child(s, feature, entry, packages, start, queued_at):
 
 def _child_title(entry):
     return f"{entry['package']}: {', '.join(entry['rows'])}"
-
-
-def _create_remote_child(s, feature, entry, packages, start):
-    """Create a child on another machine with `herdr-task --on <machine> add` (proposal section 6.13).
-    Only the home machine runs fan-out; this is how it places a package elsewhere. The after links use
-    the Feature's folder prefix (the C5 example's shape) and name a predecessor on another machine with
-    that machine first. Not reached by the tests, which never run a changed herdr-task on another
-    machine (a repo rule)."""
-    machine = entry["machine"]
-    after = _remote_after(s, feature, entry, packages)
-    argv = ["--on", machine, "add", _child_title(entry), "--worktree", "--prompt", entry["brief"],
-            "--branch", entry["branch"], "--base", feature["branch"], "--folder", s.loc["folder"],
-            "--feature", s.ref(feature), "--role", "child", "--risk", entry["risk"],
-            "--owns", ",".join(entry["owns"]), "--set", f"merge={entry['merge']}", "--json"]
-    if after:
-        argv += ["--after", ",".join(after)]
-    created = _remote_call(machine, argv, f"create {entry['package']}")
-    rid = created["id"]
-    feature.setdefault("children", []).append(
-        {"ref": rid, "machine": machine, "package": entry["package"], "rows": list(entry["rows"]), "role": "child"})
-    if start:
-        _remote_call(machine, ["--on", machine, "start", f"{s.prefix}-{rid}", "--folder", s.loc["folder"], "--json"],
-                     f"start {entry['package']}")
-    s.dirty = True
-
-
-def _remote_call(machine, argv, what):
-    """Run `herdr-task --on <machine> ...` and return the parsed JSON object, or Fail with the error.
-    Uses the same entry the queue uses for cross-machine calls (queues.ext_state)."""
-    guard(["hc"])
-    r = subprocess.run([sys.executable, ENTRY, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       universal_newlines=True)
-    try:
-        d = json.loads(r.stdout)
-    except ValueError:
-        d = None
-    if r.returncode != 0 or not isinstance(d, dict) or d.get("error"):
-        raise Fail(f"Couldn't {what} on {machine}: "
-                   f"{(d or {}).get('error') or (r.stderr or '').strip() or 'no task returned'}")
-    return d
-
-
-def _remote_after(s, feature, entry, packages):
-    """The `--after` refs for a child created on another machine: a predecessor on the same machine is
-    a bare ref, one on the home machine or another machine is named with that machine first."""
-    home = machine_name()
-    out = []
-    for dc in _dep_children(feature, entry, packages):
-        ref = f"{s.prefix}-{dc['ref']}"
-        if dc.get("machine") == entry["machine"]:
-            out.append(ref)
-        elif dc.get("machine"):
-            out.append(f"{dc['machine']}:{ref}")
-        elif home:
-            out.append(f"{home}:{ref}")
-    return out
 
 
 # ---- after links, driven by the created children (not by predictions) ------------------------

@@ -347,6 +347,17 @@ class PlacementTest(Base):
     def test_deterministic_placement(self):
         self.assertEqual(self.plan(machines=["vm-a", "vm-b"]), self.plan(machines=["vm-a", "vm-b"]))
 
+    def test_real_run_refuses_remote_placement(self):
+        # The dry run previews the spread, but a real run creates on the home machine only: creating a
+        # child on another machine needs contract support this module does not have, so it is refused
+        # before anything is created, rather than shipping a broken or deadlocking child.
+        before = self.read()
+        with st.Store(self.loc) as s:
+            with self.assertRaises(Fail) as cm:
+                fanout.run(s, self.change, machines=["vm-a", "vm-b"])
+        self.assertIn("home machine only", str(cm.exception))
+        self.assertEqual(self.read()["tasks"], before["tasks"])  # nothing created
+
 
 # ---- local mode refuses other machines (section 6.10) ----------------------------------------
 
