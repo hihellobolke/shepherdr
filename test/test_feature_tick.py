@@ -339,6 +339,22 @@ class FixRounds(FeatureTickBase):
         self.assertEqual(f["fix_rounds"], 2)
         self.assertEqual(f["attention"], phases.ATTENTION_VERIFY_OPEN)
 
+    def test_integration_reverify_does_not_count_as_a_fix_round(self):
+        # An Integration Task's re-verify (proposal glossary: "does not count as a fix round") must not
+        # be counted, so Needs you does not fire a round early.
+        s = self.store()
+        f = self.feature(s, phase="verifying")
+        self.child(s, f, rows=("1.1",), state="done", merged=True)
+        v1 = self.verify(s, f, verify_pass=False, findings=[{"level": "major", "title": "x"}])
+        v2 = self.verify(s, f, verify_pass=False, findings=[{"level": "major", "title": "y"}])
+        v3 = self.verify(s, f, verify_pass=False, integration_reverify=True,
+                         findings=[{"level": "major", "title": "still open", "paths": [], "row": None}])
+        f["verify_task"] = v3["id"]
+        tick.one_feature(s, f, {})
+        # v1 (initial) + v2 (one fix round) + v3 (integration re-verify, not counted) -> one fix round.
+        self.assertEqual(f["fix_rounds"], 1)
+        self.assertEqual(f["attention"], "")  # within the two allowed rounds
+
     def test_fix_in_flight_holds_the_round(self):
         s = self.store()
         f = self._verifying_with_findings(s, n_verifies=3)

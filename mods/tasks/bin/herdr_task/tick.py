@@ -510,9 +510,12 @@ def one_feature(s, feature, report):
 
     # Count the fix rounds used (contract T19): every Verify Task past the first is one fix round (the
     # Assistant adds a new Verify Task per round, proposal 6.11). The person's Add a fix round sets the
-    # same count when it adds its Verify Task, so this never fights it.
+    # same count when it adds its Verify Task, so this never fights it. A Verify Task made by the
+    # integration re-verify (`_reverify`) is not a fix round (the glossary: an Integration Task "does not
+    # count as a fix round"), so it is left out of the count.
     verifies = [t for t in children if t.get("role") == "verify"
-                and t.get("state") != "cancelled" and not t.get("cancelled")]
+                and t.get("state") != "cancelled" and not t.get("cancelled")
+                and not t.get("integration_reverify")]
     rounds = max(0, len(verifies) - 1)
     if int(feature.get("fix_rounds") or 0) != rounds:
         feature["fix_rounds"] = rounds
@@ -851,6 +854,9 @@ def _reverify(s, feature, report):
                    mode="worktree", feature=feature["id"], role="verify", owns=[])
     verify["base"], verify["base_set"] = feature["branch"], True
     verify["branch"] = f"task/{s.ref(feature)}-{s.ref(verify)}-verify"
+    # This Verify Task confirms a conflict resolution, not a fix round, so it is not counted as one
+    # (the glossary: an Integration Task "does not count as a fix round").
+    verify["integration_reverify"] = True
     space = _feature_space(s, feature)
     if space:
         verify["queue"] = {"space": space}
