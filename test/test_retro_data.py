@@ -22,13 +22,21 @@ if BIN not in sys.path:
 
 class RetroBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        from unittest import mock
+        # realpath: macOS $TMPDIR (/var/folders/...) is a symlink to /private/var/...; store.locate
+        # resolves the repo folder, so the temp root is resolved too to keep slugs consistent.
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         subprocess.run(["git", "init", "-q", self.repo], check=True)
-        os.environ["HERDR_TASK_STORE"] = os.path.join(self.tmp, "store")
         from herdr_task import store, retro_data, base
         self.store, self.retro_data, self.base = store, retro_data, base
+        # store.STORE is bound from the env at import; setting HERDR_TASK_STORE here would be too
+        # late and the throwaway store would leak into the real ~/.herdr/tasks (polluting it and
+        # climbing the prefix dedup, e.g. REPO -> REPO35). Patch the module global instead.
+        p = mock.patch.object(store, "STORE", os.path.join(self.tmp, "store"))
+        p.start()
+        self.addCleanup(p.stop)
         # Mock gh only (AGENTS.md): a successful last run by default.
         self._orig_gh = retro_data.gh
         self.gh_result = (True, json.dumps([{"conclusion": "success", "url": "https://x/run/1"}]), "")
@@ -37,7 +45,6 @@ class RetroBase(unittest.TestCase):
     def tearDown(self):
         self.retro_data.gh = self._orig_gh
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("HERDR_TASK_STORE", None)
 
     def _check_script(self, name="bin/check", exit_code=0):
         p = os.path.join(self.repo, name)

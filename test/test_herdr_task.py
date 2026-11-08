@@ -62,7 +62,10 @@ class Autopilot(unittest.TestCase):
         sys.path.insert(0, BIN)
         import herdr_task.autopilot as ap
         self.ap, self.io, self.redirect = ap, io, contextlib.redirect_stdout
-        self.tmp = tempfile.mkdtemp()
+        # realpath: on macOS $TMPDIR is /var/folders/... (a symlink to /private/var/...); the code
+        # resolves folders (store.locate), so the temp root must be resolved too or the raw path and
+        # the resolved one differ by the /private prefix.
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.lists = []  # the task lists a wake looks at (waiting())
         self.folder = os.path.join(self.tmp, "tt-repo")
         os.makedirs(self.folder)
@@ -2107,7 +2110,10 @@ class AutomationFromAnotherMachine(unittest.TestCase):
         import herdr_task.home as home
         import herdr_task.autopilot as ap
         self.au, self.argparse, self.io, self.redirect = au, argparse, io, contextlib.redirect_stdout
-        self.tmp = tempfile.mkdtemp()
+        # realpath: macOS $TMPDIR (/var/folders/...) is a symlink to /private/var/...; B's real
+        # herdr-task resolves the folder (store.locate), so without this its store is keyed by the
+        # resolved slug while this test writes the raw one, and B reads an empty feed.
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         self.a_store, self.b_store = os.path.join(self.tmp, "a-tasks"), os.path.join(self.tmp, "b-tasks")
         self.a_folder, self.b_folder = os.path.join(self.tmp, "a-app"), os.path.join(self.tmp, "shepherdr")
         for f in (self.a_folder, self.b_folder):
