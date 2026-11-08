@@ -5,19 +5,22 @@ dispatches to the contract's `<module>.cmd_<name>` with a lazy import. Until the
 another task) lands, the command exits with a clear "not available yet" error. Only the CLI surface
 is exercised here; the flow modules live in other files.
 
-Two things keep this test honest across the parallel work:
+The tests never execute a command's handler:
 
+- Parsing, the flags and the exact dispatch target are checked in-process against `cli.build_parser`
+  and the `flow_target` each dispatcher carries. This runs no handler, so it is safe and stable
+  whether or not the sibling flow modules have landed, and it never reaches a machine, a skill
+  update or the store.
 - The lazy-dispatch contract itself (the "not available yet" fallback, and that a real import error
-  is not masked by it) is unit-tested against `cli.flow` directly, so it holds whether or not the
-  sibling flow modules have landed in the tree. The end-to-end "not available yet" check runs only
-  for the commands whose target module is genuinely absent in the current tree, so it does not
-  break (nor run real flow operations) once those modules land.
-
-- HOME is never changed (AGENTS.md: herdr-task must not run with a changed HOME). The commands under
-  test never reach hc or the real store: they fail on the lazy import, print `--help`, or hit an
-  argparse usage error, all before any side effect. Where a command reads the store, the test points
-  HERDR_TASK_STORE and `--folder` at throwaway directories and leaves HOME alone.
+  is not masked by it) is unit-tested against `cli.flow` directly.
+- The one end-to-end check that does run the binary exercises only the "not available yet" fallback,
+  and only for the commands whose target module is genuinely absent in the current tree (so it does
+  not run real flow operations once those modules land). It leaves HOME untouched (AGENTS.md: no
+  changed HOME) and points HERDR_TASK_STORE and --folder at throwaways; these commands fail on the
+  lazy import before any side effect, so no hc or gh is reached.
 """
+import contextlib
+import io
 import importlib
 import json
 import os
@@ -35,8 +38,14 @@ if BIN not in sys.path:
 from herdr_task import cli  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
 
-# Each flow command: the module and entry function it must dispatch to (C4/C7), and a minimal valid
-# invocation. The dispatch target is the contract's, so this table is also the list of wirings.
+PARSER = cli.build_parser()
+
+TOP_LEVEL = ["feature", "fanout", "sync-branch", "feature-status", "verify-report",
+             "retro-data", "retro", "flow"]
+FEATURE_SUBS = ["add", "show", "list", "sync", "cancel", "merge", "fix-round"]
+
+# Each flow command: the (module, function) it must dispatch to (C4/C7), and a minimal invocation
+# with no side-effect flags (no --on, no --update), used for the end-to-end fallback check.
 COMMANDS = [
     ("feature", "cmd_feature", ["feature", "add", "Login flow"]),
     ("feature", "cmd_feature", ["feature", "list"]),
@@ -55,22 +64,24 @@ COMMANDS = [
     ("flow_init", "cmd_flow_init", ["flow", "init"]),
 ]
 
-# The new command and subcommand names that must show up in the top-level help.
-TOP_LEVEL = ["feature", "fanout", "sync-branch", "feature-status", "verify-report",
-             "retro-data", "retro", "flow"]
-FEATURE_SUBS = ["add", "show", "list", "sync", "cancel", "merge", "fix-round"]
 
-# The command words (not the sample arguments) for each distinct command, for the --help checks.
-HELP_PATHS = [["feature", s] for s in FEATURE_SUBS] + [
-    ["fanout"], ["sync-branch"], ["feature-status"], ["verify-report"],
-    ["retro-data"], ["retro"], ["flow", "init"],
-]
+def parse(argv):
+    return PARSER.parse_args(argv)
+
+
+def parse_error(argv):
+    """The argparse exit code for a usage error (2), with its message swallowed."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            PARSER.parse_args(argv)
+        except SystemExit as e:
+            return e.code
+    return None
 
 
 def available(module, func):
     """Whether this flow module and its entry function have landed in the current tree. On this
-    task's branch none have, so the fallback is exercised; on an integrated tree a landed command's
-    success path is that module's own test, not this one's."""
+    task's branch none have."""
     try:
         mod = importlib.import_module(f"herdr_task.{module}")
     except ModuleNotFoundError as e:
@@ -131,42 +142,148 @@ class Dispatcher(unittest.TestCase):
         finally:
             cli.importlib.import_module = orig
 
+    def test_dispatcher_carries_its_target(self):
+        self.assertEqual(cli.flow("fanout", "cmd_fanout", "fanout").flow_target, ("fanout", "cmd_fanout"))
+
+
+class DispatchTargets(unittest.TestCase):
+    """Each command parses to the contract's (module, function) dispatch target, checked without
+    running anything."""
+
+    def test_targets(self):
+        for module, func, argv in COMMANDS:
+            with self.subTest(argv=argv):
+                args = parse(argv)
+                self.assertEqual(getattr(args.fn, "flow_target", None), (module, func))
+
+    def test_feature_subcommand_is_recorded(self):
+        for sub in FEATURE_SUBS:
+            argv = ["feature", "add", "T"] if sub == "add" else ["feature", sub] + ([] if sub == "list" else ["HAT-1"])
+            with self.subTest(sub=sub):
+                self.assertEqual(parse(argv).feature_cmd, sub)
+
+    def test_add_and_list_keep_their_classic_handlers(self):
+        self.assertIs(parse(["add", "t"]).fn, cli.cmd_add)
+        self.assertIs(parse(["list"]).fn, cli.cmd_list)
+
+
+class Flags(unittest.TestCase):
+    """Every C4 flag parses to the expected value, in-process."""
+
+    def test_feature_add_flags(self):
+        a = parse(["feature", "add", "Login", "--base", "dev", "--change", "add-login", "--mode", "local", "--no-auto-fanout"])
+        self.assertEqual((a.title, a.base, a.change, a.mode, a.auto_fanout), ("Login", "dev", "add-login", "local", False))
+
+    def test_feature_add_auto_fanout_defaults_true(self):
+        self.assertTrue(parse(["feature", "add", "Login"]).auto_fanout)
+
+    def test_feature_show_and_status_take_on(self):
+        self.assertEqual(parse(["feature", "show", "HAT-1", "--on", "vm-b"]).on, "vm-b")
+        self.assertEqual(parse(["feature-status", "HAT-1", "--on", "vm-b"]).on, "vm-b")
+
+    def test_fanout_flags(self):
+        a = parse(["fanout", "add-x", "--dry-run", "--machines", "a,b,c", "--amend", "--no-start"])
+        self.assertEqual((a.change, a.dry_run, a.machines, a.amend, a.start), ("add-x", True, "a,b,c", True, False))
+
+    def test_fanout_defaults(self):
+        a = parse(["fanout", "add-x"])
+        self.assertEqual((a.dry_run, a.machines, a.amend, a.start), (False, None, False, True))
+
+    def test_sync_branch_base(self):
+        self.assertEqual(parse(["sync-branch", "--base", "feature/HAT-12-x"]).base, "feature/HAT-12-x")
+
+    def test_verify_report_pass_and_findings(self):
+        a = parse(["verify-report", "--findings-file", "f.json", "--feature", "HAT-1"])
+        self.assertEqual((a.findings_file, a.feature, a.passed), ("f.json", "HAT-1", False))
+        self.assertTrue(parse(["verify-report", "--pass"]).passed)
+
+    def test_flow_init_update(self):
+        self.assertTrue(parse(["flow", "init", "--update"]).update)
+        self.assertFalse(parse(["flow", "init"]).update)
+
+    def test_retro_refs(self):
+        self.assertEqual(parse(["retro-data", "HAT-7"]).ref, "HAT-7")
+        self.assertEqual(parse(["retro", "HAT-7"]).ref, "HAT-7")
+
+    def test_add_flow_flags(self):
+        a = parse(["add", "t", "--feature", "HAT-1", "--role", "child", "--owns", "a,b", "--owns", "c", "--risk", "high"])
+        self.assertEqual((a.feature, a.role, a.owns, a.risk), ("HAT-1", "child", ["a,b", "c"], "high"))
+
+    def test_list_feature_filter(self):
+        self.assertEqual(parse(["list", "--feature", "HAT-9"]).feature, "HAT-9")
+
+
+class BadUsage(unittest.TestCase):
+    """Invalid input is a usage error (exit code 2), before any dispatch."""
+
+    def test_invalid_role(self):
+        self.assertEqual(parse_error(["add", "t", "--role", "nope"]), 2)
+
+    def test_invalid_risk(self):
+        self.assertEqual(parse_error(["add", "t", "--risk", "medium"]), 2)
+
+    def test_invalid_feature_mode(self):
+        self.assertEqual(parse_error(["feature", "add", "t", "--mode", "hybrid"]), 2)
+
+    def test_verify_report_requires_one_of_the_group(self):
+        self.assertEqual(parse_error(["verify-report"]), 2)
+
+    def test_verify_report_group_is_exclusive(self):
+        self.assertEqual(parse_error(["verify-report", "--pass", "--findings-file", "f.json"]), 2)
+
 
 class Help(unittest.TestCase):
+    def _help(self, words):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            try:
+                PARSER.parse_args(words + ["--help"])
+            except SystemExit as e:
+                self.assertEqual(e.code, 0)
+        return out.getvalue()
+
     def test_top_level_help_lists_the_commands(self):
+        out = self._help([])
+        for name in TOP_LEVEL:
+            self.assertIn(name, out, f"--help does not list {name}")
+
+    def test_feature_help_lists_its_subcommands(self):
+        out = self._help(["feature"])
+        for name in FEATURE_SUBS:
+            self.assertIn(name, out, f"feature --help does not list {name}")
+
+    def test_each_command_has_help(self):
+        paths = [["feature", s] for s in FEATURE_SUBS] + [
+            ["fanout"], ["sync-branch"], ["feature-status"], ["verify-report"],
+            ["retro-data"], ["retro"], ["flow", "init"], ["add"], ["list"],
+        ]
+        for words in paths:
+            with self.subTest(words=words):
+                self.assertTrue(self._help(words))
+
+    def test_add_help_lists_the_flow_flags(self):
+        out = self._help(["add"])
+        for flag in ("--feature", "--role", "--owns", "--risk"):
+            self.assertIn(flag, out, f"add --help does not list {flag}")
+
+    def test_list_help_lists_the_feature_filter(self):
+        self.assertIn("--feature", self._help(["list"]))
+
+
+class EndToEnd(unittest.TestCase):
+    """The installed entry point runs, and the lazy dispatch reports absent modules end to end."""
+
+    def test_binary_help_lists_commands(self):
         p = run("--help")
         self.assertEqual(p.returncode, 0, p.stderr)
         for name in TOP_LEVEL:
-            self.assertIn(name, p.stdout, f"--help does not list {name}")
-
-    def test_feature_help_lists_its_subcommands(self):
-        p = run("feature", "--help")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        for name in FEATURE_SUBS:
-            self.assertIn(name, p.stdout, f"feature --help does not list {name}")
-
-    def test_each_command_and_subcommand_has_help(self):
-        for path in HELP_PATHS:
-            with self.subTest(path=path):
-                p = run(*path, "--help")
-                self.assertEqual(p.returncode, 0, f"{path} --help: {p.stderr}")
-
-
-class Dispatch(unittest.TestCase):
-    def test_every_command_parses_and_reaches_dispatch(self):
-        # A parsed command never exits 2 (argparse's usage-error code); it reaches its handler.
-        work = tempfile.mkdtemp()
-        for _, _, argv in COMMANDS:
-            with self.subTest(argv=argv):
-                p = run(*argv, folder=work)
-                self.assertNotEqual(p.returncode, 2, f"{argv} failed to parse: {p.stderr}")
+            self.assertIn(name, p.stdout)
 
     def test_absent_modules_report_not_available(self):
-        # End-to-end proof of the wiring for every command whose module has not landed in this tree.
         work = tempfile.mkdtemp()
         for module, func, argv in COMMANDS:
             if available(module, func):
-                continue
+                continue  # landed in this tree; its success path is that module's own test
             with self.subTest(argv=argv):
                 p = run(*argv, folder=work)
                 self.assertEqual(p.returncode, 1, f"{argv}: rc {p.returncode}, {p.stderr}")
@@ -178,74 +295,6 @@ class Dispatch(unittest.TestCase):
         p = run("fanout", "add-login-flow", "--json")
         self.assertEqual(p.returncode, 1, p.stderr)
         self.assertIn("not available yet", json.loads(p.stdout)["error"])
-
-
-class AddFlags(unittest.TestCase):
-    """The flow flags on the existing `add` are parsed here (commands.py stores them)."""
-
-    def test_add_help_lists_the_flow_flags(self):
-        p = run("add", "--help")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        for flag in ("--feature", "--role", "--owns", "--risk"):
-            self.assertIn(flag, p.stdout, f"add --help does not list {flag}")
-
-    def test_role_choices_are_the_contract_roles(self):
-        p = run("add", "x", "--role", "nope")
-        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        for role in ("spec", "child", "verify", "fix", "integration", "retro"):
-            self.assertIn(role, p.stderr)
-
-    def test_risk_choices_are_low_and_high(self):
-        p = run("add", "x", "--risk", "medium")
-        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn("low", p.stderr)
-        self.assertIn("high", p.stderr)
-
-
-class OptionalFlagsParse(unittest.TestCase):
-    """The optional flags parse (rc != 2 is "no argparse usage error"), on this branch or a landed
-    tree alike. None of these commands use exit code 2 for their own outcomes."""
-
-    CASES = [
-        ["feature", "add", "A feature", "--base", "main", "--change", "add-x", "--mode", "local", "--no-auto-fanout"],
-        ["fanout", "add-x", "--dry-run", "--machines", "vm-a,vm-b", "--amend", "--no-start"],
-        ["feature-status", "HAT-12", "--on", "vm-b"],
-        ["feature", "show", "HAT-12", "--on", "vm-b"],
-        ["verify-report", "--findings-file", "f.json", "--feature", "HAT-12"],
-        ["flow", "init", "--update"],
-        ["sync-branch", "--base", "feature/HAT-12-x"],
-    ]
-
-    def test_optional_flags_parse(self):
-        work = tempfile.mkdtemp()
-        for argv in self.CASES:
-            with self.subTest(argv=argv):
-                p = run(*argv, folder=work)
-                self.assertNotEqual(p.returncode, 2, f"{argv} failed to parse: {p.stderr}")
-                self.assertNotIn("unrecognized arguments", p.stderr, f"{argv}: {p.stderr}")
-                self.assertNotIn("invalid choice", p.stderr, f"{argv}: {p.stderr}")
-
-
-class ListFilter(unittest.TestCase):
-    """The `list --feature` filter is parsed here (commands.py applies it)."""
-
-    def test_list_help_lists_the_feature_filter(self):
-        p = run("list", "--help")
-        self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertIn("--feature", p.stdout)
-
-    def test_list_feature_parses_in_a_throwaway_root(self):
-        work = tempfile.mkdtemp()
-        p = run("list", "--feature", "HAT-12", folder=work)
-        self.assertEqual(p.returncode, 0, p.stderr)
-
-
-class VerifyReport(unittest.TestCase):
-    def test_requires_pass_or_findings_file(self):
-        p = run("verify-report")
-        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
-        self.assertIn("--pass", p.stderr)
-        self.assertIn("--findings-file", p.stderr)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,7 @@ def flow(module, func, label):
         except AttributeError:
             raise Fail(f"{label} is not available yet")
         return fn(args)
+    run.flow_target = (module, func)  # the contract entry it dispatches to, for introspection
     return run
 
 
@@ -171,6 +172,25 @@ def main():
         print(VERSION)
         return 0
 
+    p = build_parser()
+    args = p.parse_args(argv)
+    if not getattr(args, "fn", None):
+        p.print_help()
+        return 1
+    try:
+        args.fn(args)
+    except Fail as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": str(e)}))
+        else:
+            print(f"herdr-task: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def build_parser():
+    """The full argument parser. Separated from main() so parsing can be exercised in-process
+    (tests, and any caller that wants the namespace) without running a command."""
     p = argparse.ArgumentParser(prog="herdr-task", description="Herdr's tasks: add, start and finish work for a folder.",
                                 epilog="Run on another machine's folder: herdr-task --on <machine> <command> ...")
     sub = p.add_subparsers(dest="cmd")
@@ -577,16 +597,4 @@ def main():
     c.add_argument("--json", action="store_true")
     c.set_defaults(fn=flow("flow_init", "cmd_flow_init", "flow init"))
 
-    args = p.parse_args(argv)
-    if not getattr(args, "fn", None):
-        p.print_help()
-        return 1
-    try:
-        args.fn(args)
-    except Fail as e:
-        if getattr(args, "json", False):
-            print(json.dumps({"error": str(e)}))
-        else:
-            print(f"herdr-task: {e}", file=sys.stderr)
-        return 1
-    return 0
+    return p
