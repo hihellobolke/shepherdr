@@ -640,10 +640,11 @@ On main now:
 
 Not wired yet (the scheduler tick that the contract C8 describes is a later task):
 
-- Automatic fan-out on Plan approval. For now you run `herdr-task fanout <change>` yourself.
-- Automatic phase changes past `building`, the closing steps, the failed-child retry, the written digests and the Assistant news. The closing steps have no command of their own yet, so a Feature does not reach `ready` on its own.
-- Automatic retro. For now you run `herdr-task retro <ref>` yourself.
-- Fan-out across machines. A real run creates children on the home machine only (see The commands).
+- Automatic fan-out on Plan approval; for now you run `herdr-task fanout <change>` yourself.
+- Automatic phase changes past `building`, the closing steps, the failed-child retry, the written digests and the Assistant news; with no command for the closing steps, a Feature does not reach `ready` on its own.
+- Acting on a Verify Task's result, which means turning findings into Fix Tasks and enforcing the `tasks.verify_rounds` limit; `verify-report` records the result, but nothing consumes it yet.
+- Automatic retro; for now you run `herdr-task retro <ref>` yourself.
+- Fan-out across machines; a real run creates children on the home machine only (see The commands).
 
 ## The lifecycle and its phases
 
@@ -678,9 +679,9 @@ The steps of a Feature, and how each one works on main:
    Each merges into the feature branch after its checks.
    A Risky Task waits for the person's Accept first.
 5. Verify.
-   Add a Verify Task that runs `/opsx:verify` on the feature branch, and it reports with `herdr-task verify-report`.
-   Findings become Fix Tasks.
-   The Feature allows a number of fix rounds set by `tasks.verify_rounds` (two by default).
+   Fan-out also creates a Verify Task that waits for every child.
+   Its worker runs `/opsx:verify` on the feature branch, read-only, and reports with `herdr-task verify-report`.
+   Turning findings into Fix Tasks and enforcing the fix-round limit (`tasks.verify_rounds`, two by default) belongs to the scheduler integration that is not wired yet, so `verify-report` records the result but nothing acts on it by itself now.
 6. Closing.
    The closing steps tick the rows, archive the change, merge the base in, and open the pull request (phase `ready`).
    These steps are tick-driven in the contract and are not reachable by a command yet.
@@ -720,7 +721,7 @@ With `--json` a command prints one JSON object; the shapes are in the contract (
 |---|---|
 | `fanout <change>` | Turns an approved work table into Child Tasks and starts them. `--dry-run` creates nothing and prints the plan. `--machines a,b,c` previews a spread across machines with chain affinity in `--dry-run`; a real run creates children on the home machine only (cross-machine creation is a planned follow-up, so a real `--machines` run is refused). `--amend` reads an updated table and adds only new rows (and cancels unstarted children of removed rows). `--no-start` creates the Tasks but does not start them. A second run adds only missing children, so it is safe to run again. |
 | `sync-branch` | A worker runs it in its own worktree before `ready` and when the feature branch moves. It rebases the Task branch onto the feature branch with a backup ref and `rerere`, and refuses before touching the branch if the diff goes outside the owned paths. `--base <feature-branch>` overrides the branch to rebase onto. |
-| `feature-status <ref>` | The states and digests of a Feature's children on one machine. `--on <machine>` reads another machine. The home machine calls it once per machine each tick. |
+| `feature-status <ref>` | The states and digests of a Feature's children on one machine. `--on <machine>` reads another machine. In the planned scheduler integration the home machine calls it once per machine each tick. |
 | `verify-report (--pass \| --findings-file <file>)` | A Verify Task reports its result. `--feature <ref>` names the Feature when the folder has more than one. |
 | `retro-data <ref>` | The retro JSON for a Feature: every child's digest, plus the check-script and CI state. |
 | `retro <ref>` | Starts a retro for a Feature now, with the retro agent settings. |
@@ -730,10 +731,10 @@ With `--json` a command prints one JSON object; the shapes are in the contract (
 
 `herdr-task add` gains four flags for a Child Task:
 
-- `--feature <ref>`: the Feature this Task belongs to. It sets the Task's role to `child` unless `--role` is given.
-- `--role spec|child|verify|fix|integration|retro`: the Task's flow role. It requires `--feature`.
-- `--owns <glob[,glob...]>`: the owned paths. It is repeatable and the values add up.
-- `--risk low|high`: the Task's risk (default `low`). A `high` Task gets `merge=ask`.
+- `--feature <ref>`: the Feature this Task belongs to; it sets the Task's role to `child` unless `--role` is given.
+- `--role spec|child|verify|fix|integration|retro`: the Task's flow role; it requires `--feature`.
+- `--owns <glob[,glob...]>`: the owned paths; repeatable, and the values add up.
+- `--risk low|high`: the Task's risk (default `low`); a `high` Task gets `merge=ask`.
 
 `herdr-task list --feature <ref>` shows only that Feature's Tasks, as its tree.
 
@@ -753,7 +754,8 @@ If a worker needs a file that is not theirs, they set the status line to "needs 
 
 A review round is recorded with the commit hash and the git patch-id of the whole diff against the base.
 A clean rebase keeps the diff the same, so the patch-id is unchanged and the review stays valid.
-Conflict resolution, a regenerated file or a new commit changes the patch-id, and the worker then needs a fresh review round (`ready` refuses with reason `review-stale`).
+A recorded round stays valid while its commit hash or its patch-id still matches the final commit.
+The review becomes stale, and `ready` refuses with reason `review-stale`, only when neither matches, for example after conflict resolution or a regenerated file changes the diff.
 
 ## The two modes
 
@@ -823,12 +825,14 @@ The scheduler does not yet drive the flow end to end, so the steps below run it 
    To see the plan first without creating anything, run `herdr-task fanout <change> --dry-run`.
 6. Fan out.
    Run `herdr-task fanout <change>` to create the Child Tasks and start them.
-   They work in parallel and merge into the feature branch after checks.
+   The same run also creates a Verify Task that waits for every child.
+   The children work in parallel and merge into the feature branch after checks.
    A Risky Task waits for your Accept.
    Follow the Feature with `herdr-task feature show <ref>`, or the grouped Feature row in the window and the web app.
 7. Verify.
-   Add a Verify Task for the feature branch, which runs `/opsx:verify` and reports with `herdr-task verify-report`.
-   Open findings become Fix Tasks, up to the allowed fix rounds.
+   The Verify Task created by fan-out runs once the children are in; let it run.
+   Its worker runs `/opsx:verify` and reports with `herdr-task verify-report`.
+   Acting on the findings (Fix Tasks and the fix-round limit) waits on the scheduler integration, so for now you read the report and act by hand.
 8. Close and merge.
    The closing steps and the move to `ready` are tick-driven and not reachable by a command yet, so this last stretch is not runnable end to end on main.
    When it lands, you will press Merge feature (or run `herdr-task feature merge <ref>`), and run `herdr-task retro <ref>` for the retro.
