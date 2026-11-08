@@ -85,7 +85,11 @@ identifies a child by `(machine, id)`, never by id alone. It walks both a child'
 (resolved against that child's own machine) and its cross-machine `after_ext` links between waves
 (each already machine-qualified), and it returns each blocked dependent machine-qualified too
 (`"<machine>:<ref>"` for a child off the home machine), so the caller can tell two machines' children
-with the same ref apart.
+with the same ref apart. The home machine is one identity however it is written: a record's `None` and
+the digest's `"local"` both mean home (`_norm_machine`), so a link back to home from a remote child
+matches the home child. A link that names home by its hostname is the exception a pure module cannot
+resolve (it does not know the host's name); the caller normalizes such a link to `None` or `"local"`
+before calling.
 """
 
 # The seven phases (contract C2, proposal section 2.3).
@@ -207,36 +211,49 @@ def is_blocking(task):
     return task.get("attention") in RETRYABLE and not should_retry(task)
 
 
+def _norm_machine(machine):
+    """One spelling of the home machine (contract C2, section 6.13).
+
+    A record writes the home machine as `None` (the Feature children entries) while the digest keys it
+    as `"local"`; both mean home, so they normalize to `None`. A cross-machine link that names home by
+    its hostname cannot be recognised here (a pure module does not know the host's name): the caller,
+    which knows it, normalizes such a link to `None` or `"local"` before calling (see the docstring).
+    """
+    return None if machine in (None, "local") else machine
+
+
 def _key(task):
-    """A child's machine-qualified identity `(machine, id)` (contract C2, section 6.13).
+    """A child's machine-qualified identity `(machine, id)`, home normalized (contract C2, section 6.13).
 
     A child id is unique only within its own machine's store, so two machines can both hold a child
-    `14`. The machine (None for the home machine) keeps them apart in the dependency graph.
+    `14`. The machine keeps them apart in the dependency graph; the home machine is one key either way
+    it is spelled (`_norm_machine`).
     """
-    return (task.get("machine"), task.get("id"))
+    return (_norm_machine(task.get("machine")), task.get("id"))
 
 
 def _ident(task):
-    """A child's machine-qualified name for the caller: `"<machine>:<ref>"`, or just `ref`/`id` local.
+    """A child's machine-qualified name for the caller: `"<machine>:<ref>"`, or just `ref`/`id` at home.
 
     A child off the home machine is named `"<machine>:<ref>"` (the way Shepherdr writes a cross-machine
     ref, e.g. `vm-b:HAT-15`), so two machines' children with the same ref are told apart. A home-machine
-    child (`machine` is None) is named by its `ref` when it has one, else its `id`.
+    child is named by its `ref` when it has one, else its `id`.
     """
     name = task.get("ref") if task.get("ref") is not None else task.get("id")
-    machine = task.get("machine")
+    machine = _norm_machine(task.get("machine"))
     return "%s:%s" % (machine, name) if machine else name
 
 
 def _dep_keys(task):
-    """Every child this task waits on, as `(machine, id)` keys (contract C2, section 6.13).
+    """Every child this task waits on, as home-normalized `(machine, id)` keys (contract C2, 6.13).
 
     Local links are the `after` ids, which name tasks in this child's own machine's store. Cross-machine
-    links between waves are the `after_ext` entries, each already carrying its own `machine` and `id`.
+    links between waves are the `after_ext` entries, each carrying its own `machine` and `id` (a link
+    back to the home machine normalizes to the same home key as a home child).
     """
-    machine = task.get("machine")
+    machine = _norm_machine(task.get("machine"))
     keys = [(machine, d) for d in (task.get("after") or [])]
-    keys += [(e.get("machine"), e.get("id")) for e in (task.get("after_ext") or [])]
+    keys += [(_norm_machine(e.get("machine")), e.get("id")) for e in (task.get("after_ext") or [])]
     return keys
 
 

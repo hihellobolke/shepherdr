@@ -249,6 +249,24 @@ class SkippedUnblocksDependents(unittest.TestCase):
         ]
         self.assertEqual(phases.blocked_dependents(kids), ["vm-b:WEB-15", "vm-b:WEB-16"])
 
+    def test_a_cross_machine_link_back_to_the_home_machine_matches(self):
+        # A home child (machine=None) failed; a remote child waits on it, naming home as "local".
+        # The home identity is one key either way it is written, so the remote child is blocked.
+        kids = [
+            child(14, attention="failed", retries=1, machine=None, ref="HAT-14"),
+            child(15, state="todo", machine="vm-b", ref="WEB-15",
+                  after_ext=[{"ref": "HAT-14", "machine": "local", "prefix": "HAT", "id": 14}]),
+        ]
+        self.assertEqual(phases.blocked_dependents(kids), ["vm-b:WEB-15"])
+
+    def test_a_home_child_written_local_is_named_without_a_prefix(self):
+        # A home child spelled "local" is still home: it blocks locally and is named by its bare ref.
+        kids = [
+            child(14, attention="failed", retries=1, machine="local", ref="HAT-14"),
+            child(15, state="todo", after=[14], machine="local", ref="HAT-15"),
+        ]
+        self.assertEqual(phases.blocked_dependents(kids), ["HAT-15"])
+
     def test_skip_lets_the_feature_reach_verifying(self):
         # 14 failed with no retry, 15 waits on it. Skip 14, 15 merges -> all satisfied -> verifying.
         f = feature("building")
