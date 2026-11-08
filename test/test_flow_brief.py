@@ -122,6 +122,18 @@ class FlowPart(Base):
         # No openspec/ folder and no flow: the guard must not fire for a classic task.
         self.assertIsNone(launch.flow_part(self.s, self.task(role="child"), "sp1"))
 
+    def test_missing_flow_template_stops(self):
+        # openspec/ is there, but the flow file is not: a flow Task must not launch with no role
+        # rules, so brief() stops clearly instead of silently dropping the file.
+        self.openspec()
+        self.write_settings({"everywhere": {"tasks": {"flow": "openspec"}}})
+        empty = os.path.join(self.tmp, "no-templates")
+        os.makedirs(empty)
+        with mock.patch.object(launch, "TEMPLATES", empty):
+            with self.assertRaises(Fail) as e:
+                launch.flow_part(self.s, self.task(role="spec"), "sp1")
+        self.assertIn("flow-spec.md", str(e.exception))
+
 
 class BriefInjection(Base):
     def test_classic_brief_is_byte_for_byte_unchanged(self):
@@ -132,6 +144,19 @@ class BriefInjection(Base):
             baseline = self.brief(t)
         self.assertEqual(real, baseline)
         self.assertNotIn("OpenSpec flow", real)
+
+    def test_classic_brief_equals_the_known_component_join(self):
+        """The classic brief is exactly the pre-flow join of its parts, in order, with no flow slot."""
+        from herdr_task.settings import notes, notes_part, settings_block
+        t = self.task()
+        s = self.s
+        start = notes_part("Before you start", notes(s, t, "start", "sp1"))
+        body = "Your task, " + s.ref(t) + ":\n" + ((t.get("prompt") or "").strip() or t["title"])
+        finish = notes_part("Before you say ready", notes(s, t, "finish", "sp1"))
+        expected = "\n\n".join(x for x in [
+            launch.instructions("worker"), start, body, launch.where_line(t), finish,
+            launch.closing_line(s, t, None, ["claude"]), settings_block(s, t, "sp1", ["claude"])] if x)
+        self.assertEqual(self.brief(t), expected)
 
     def test_openspec_without_a_role_is_also_unchanged(self):
         self.openspec()

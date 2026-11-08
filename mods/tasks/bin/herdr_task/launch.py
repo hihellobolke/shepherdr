@@ -438,7 +438,12 @@ def flow_part(s, task, space=None):
     if not os.path.isdir(os.path.join(s.loc["folder"], "openspec")):
         raise Fail(f"{s.ref(task)} is on the OpenSpec flow, but this repo has no openspec/ folder. "
                    f"Run `herdr-task flow init` in it first.")
-    return flow_file(name)
+    body = flow_file(name)
+    if not body:
+        # A flow Task without its role file would launch with no role rules: stop clearly instead.
+        raise Fail(f"{s.ref(task)} is on the OpenSpec flow, but its flow file {name}.md is missing from "
+                   f"{TEMPLATES} on this machine. Reinstall Shepherdr's templates here.")
+    return body
 
 
 def brief(s, task, parent=None, space=None, argv=None):
