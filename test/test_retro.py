@@ -2,12 +2,14 @@
 
 The `tasks.retro` setting decides whether a retro runs (`off`, `ask`, `automatic`); the
 `tasks.retro_save` setting decides where its report goes (`outside`, `repo`, `pr`); the
-`tasks.retro_prompt` setting decides the instructions (`built-in`, a skill name, a file path);
-and the retro agent is the `retro` role, else the Reviewer's. Nothing happens when Retro is off.
+`tasks.retro_prompt` setting decides the instructions (`built-in` role template loaded in full, a
+skill name, a file path); and the retro agent is the `retro` role, else the Reviewer's. Nothing
+happens when Retro is off.
 
 The Store and the repo are real throwaway files (AGENTS.md: throwaway roots, real throwaway git
-repos). Settings are a real throwaway shepherdr.json, patched in. Nothing shells out here: `start`
-only creates and queues the Task record; the ordinary queue starts it later.
+repos). The STORE dir, the settings file and the templates dir are all throwaway and patched in, so
+the real ~/.herdr and ~/.config are never touched and the tests do not depend on them. Nothing
+shells out here: `start` only creates and queues the Task record; the ordinary queue starts it later.
 """
 
 import io
@@ -35,30 +37,40 @@ class RetroBase(unittest.TestCase):
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         subprocess.run(["git", "init", "-q", self.repo], check=True)
-        os.environ["HERDR_TASK_STORE"] = os.path.join(self.tmp, "store")
         from herdr_task import store, retro, settings, base
         self.store, self.retro, self.settings, self.base = store, retro, settings, base
-        # A real throwaway settings file, patched in so settings_for reads it.
+        # A throwaway STORE dir, patched on the store module (STORE is import-time in base, so the
+        # env var alone would not take; this is what test_feature_store does).
+        self._saved_store = store.STORE
+        store.STORE = os.path.join(self.tmp, "store")
+        # A throwaway settings file and templates dir, so settings_for and the retro template come
+        # from here, never the real ~/.herdr or ~/.config.
         self.file = os.path.join(self.tmp, "shepherdr.json")
-        p = mock.patch.object(settings, "SETTINGS", self.file)
-        p.start()
-        self.addCleanup(p.stop)
+        self.templates = os.path.join(self.tmp, "templates")
+        os.makedirs(self.templates)
+        for target, name, value in ((settings, "SETTINGS", self.file), (settings, "TEMPLATES", self.templates)):
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
 
     def tearDown(self):
+        self.store.STORE = self._saved_store
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("HERDR_TASK_STORE", None)
 
     def write(self, d):
         with open(self.file, "w") as f:
             json.dump(d, f)
 
-    def everywhere(self, tasks=None, retro=None):
-        d = {"everywhere": {}}
-        if tasks is not None:
-            d["everywhere"]["tasks"] = tasks
-        if retro is not None:
-            d["everywhere"]["retro"] = retro
-        self.write(d)
+    def everywhere(self, tasks=None, retro=None, worker=None, reviewer=None):
+        layer = {}
+        for key, val in (("tasks", tasks), ("retro", retro), ("worker", worker), ("reviewer", reviewer)):
+            if val is not None:
+                layer[key] = val
+        self.write({"everywhere": layer})
+
+    def write_template(self, body):
+        with open(os.path.join(self.templates, "retro.md"), "w") as f:
+            f.write(body)
 
     def _store(self):
         return self.store.Store(self.store.locate(self.repo))
@@ -76,32 +88,36 @@ class RetroAgent(RetroBase):
                              {"agent": "codex", "model": "gpt-x", "effort": "high"})
 
     def test_reviewers_when_retro_is_empty(self):
-        self.write({"everywhere": {"reviewer": {"agent": "codex", "model": "gpt-x"}}})
+        self.everywhere(reviewer={"agent": "codex", "model": "gpt-x"})
         with self._store() as s:
             self.assertEqual(self.retro.retro_agent(s),
                              {"agent": "codex", "model": "gpt-x", "effort": None})
 
-    def test_none_values_when_neither_is_set(self):
-        with self._store() as s:
-            self.assertEqual(self.retro.retro_agent(s),
-                             {"agent": None, "model": None, "effort": None})
+    def test_falls_back_to_the_other_cli_when_neither_is_set(self):
+        # Neither retro nor reviewer names an agent: the Reviewer's effective default stands in, the
+        # other CLI from the worker, so the retro never silently runs as the worker's own CLI.
+        self.everywhere(worker={"agent": "claude"})
+        with mock.patch.object(self.settings, "other_cli", lambda a: "codex"):
+            with self._store() as s:
+                self.assertEqual(self.retro.retro_agent(s), {"agent": "codex", "model": None, "effort": None})
 
 
-class InstructionsLine(RetroBase):
-    def test_built_in(self):
-        line = self.retro._instructions_line("built-in")
-        self.assertIn("writing-for-agents", line)
-        self.assertIn("retro skill", line)
+class Instructions(RetroBase):
+    def test_built_in_loads_the_template_body(self):
+        self.write_template("---\nname: retro\n---\nRETRO-MARKER: do the seven categories.\n")
+        self.assertEqual(self.retro._instructions("built-in"), "RETRO-MARKER: do the seven categories.")
 
-    def test_none_is_built_in(self):
-        self.assertEqual(self.retro._instructions_line(None), self.retro._instructions_line("built-in"))
+    def test_built_in_falls_back_when_no_template_installed(self):
+        # The templates dir is empty: the stand-in runs so the retro still works.
+        self.assertEqual(self.retro._instructions("built-in"), self.retro.BUILT_IN_FALLBACK)
+        self.assertEqual(self.retro._instructions(None), self.retro.BUILT_IN_FALLBACK)
 
     def test_skill_name(self):
-        self.assertEqual(self.retro._instructions_line("my-retro"), "Follow the `my-retro` skill for the retro.")
+        self.assertEqual(self.retro._instructions("my-retro"), "Follow the `my-retro` skill for the retro.")
 
     def test_file_path(self):
         for path in ("docs/retro.md", "/abs/x.md", "~/notes.md", "./local.md"):
-            self.assertEqual(self.retro._instructions_line(path), f"Follow the retro instructions in {path}.")
+            self.assertEqual(self.retro._instructions(path), f"Follow the retro instructions in {path}.")
 
 
 class FeatureSpace(RetroBase):
@@ -153,9 +169,9 @@ class StartOff(RetroBase):
 
 
 class StartCreates(RetroBase):
-    def _start(self, tasks=None, retro=None, mode=None):
-        if tasks is not None or retro is not None:
-            self.everywhere(tasks=tasks, retro=retro)
+    def _start(self, tasks=None, retro=None, worker=None, reviewer=None, mode=None):
+        if any(v is not None for v in (tasks, retro, worker, reviewer)):
+            self.everywhere(tasks=tasks, retro=retro, worker=worker, reviewer=reviewer)
         with self._store() as s:
             feat = self._feature(s)
             t = self.retro.start(s, feat, mode=mode)
@@ -186,16 +202,40 @@ class StartCreates(RetroBase):
         self.assertIn(f"retro-data {ref}", t["prompt"])
         self.assertIn("read-only", t["prompt"])
 
+    def test_prompt_carries_the_built_in_template_in_full(self):
+        # Finding 1: the retro role template is loaded into the prompt, so the person's edits to it
+        # take effect (proposal 6.15), not a paraphrase.
+        self.write_template("---\nname: retro\n---\nDISTINCTIVE-RETRO-STEP: inspect the digests.\n")
+        _, _, t = self._start(tasks={"retro": "automatic"})
+        self.assertIn("DISTINCTIVE-RETRO-STEP: inspect the digests.", t["prompt"])
+        self.assertNotIn("name: retro", t["prompt"])  # frontmatter stripped
+
     def test_agent_from_retro_role(self):
         _, _, t = self._start(tasks={"retro": "automatic"}, retro={"agent": "codex", "effort": "high"})
         self.assertEqual(t["agent"], "codex")
         self.assertEqual(t["effort"], "high")
         self.assertNotIn("model", t)  # not set in the role, so not stamped
 
-    def test_no_agent_fields_when_none_configured(self):
-        _, _, t = self._start(tasks={"retro": "automatic"})
-        for k in ("agent", "model", "effort"):
-            self.assertNotIn(k, t)
+    def test_queue_argv_is_the_retro_agents_and_does_not_leak_worker_settings(self):
+        # Finding 2: the retro role names only the agent; the worker role names a model and effort.
+        # The queued argv must be the retro agent's own, with no worker model or effort pulled in.
+        _, _, t = self._start(tasks={"retro": "automatic"},
+                              retro={"agent": "codex"},
+                              worker={"agent": "codex", "model": "worker-only-model", "effort": "high"})
+        argv = t["queue"]["argv"]
+        self.assertEqual(argv[0], "codex")
+        self.assertNotIn("-m", argv)
+        self.assertNotIn("worker-only-model", argv)
+        self.assertNotIn("high", argv)
+
+    def test_queue_argv_uses_the_retro_models_not_the_workers(self):
+        _, _, t = self._start(tasks={"retro": "automatic"},
+                              retro={"agent": "codex", "model": "retro-model"},
+                              worker={"agent": "claude"})
+        argv = t["queue"]["argv"]
+        self.assertEqual(argv[0], "codex")
+        self.assertIn("retro-model", argv)
+        self.assertNotIn("claude", argv)
 
     def test_save_outside_is_the_default_and_uses_the_folder(self):
         _, _, t = self._start(tasks={"retro": "automatic"})
@@ -211,10 +251,6 @@ class StartCreates(RetroBase):
         _, _, t = self._start(tasks={"retro": "automatic", "retro_save": "pr"})
         self.assertIn("pull request", t["prompt"])
         self.assertEqual(t["mode"], "here")
-
-    def test_prompt_built_in_by_default(self):
-        _, _, t = self._start(tasks={"retro": "automatic"})
-        self.assertIn("writing-for-agents", t["prompt"])
 
     def test_prompt_skill_name(self):
         _, _, t = self._start(tasks={"retro": "automatic", "retro_prompt": "my-retro"})
@@ -239,7 +275,8 @@ class StartSpace(RetroBase):
             child["space"] = "sp9"
             t = self.retro.start(s, feat)
             self.assertEqual(t["space"], "sp9")
-            self.assertEqual(t["queue"], {"space": "sp9"})
+            self.assertEqual(t["queue"]["space"], "sp9")
+            self.assertIn("argv", t["queue"])
 
 
 class Command(RetroBase):
@@ -274,7 +311,6 @@ class Command(RetroBase):
         data = self._run(self._args(ref))
         self.assertEqual(data["mode"], "off")
         self.assertIsNotNone(data["task"])
-        # the Task is really in the store, queued, with role retro
         with self._store() as s:
             t = s.find(data["task"])
             self.assertEqual(t["role"], "retro")
