@@ -467,8 +467,15 @@ class RunTest(Base):
         with st.Store(self.loc) as s:
             feat = s.data["features"][0]
             gone = next(c for c in feat["children"] if c["rows"] == ["1.1"])
+            dead_ref = f"{s.prefix}-{gone['ref']}"
             s.data["tasks"] = [t for t in s.data["tasks"] if t["id"] != gone["ref"]]
             s.dirty = True
+        # the dry-run plan previews the same waits the real run makes: the dead skipped ref is in neither
+        # its dependent's after nor the Verify Task's after (plan matches run, contract C5).
+        dry = self.plan()
+        self.assertNotIn(dead_ref, dry["verify_task"]["after"])
+        wire_pkg = next(pkg for pkg in dry["packages"] if pkg["package"] == "2.1")
+        self.assertNotIn(dead_ref, wire_pkg["after"])  # 2.1 depended on 1.1; the gap drops out
         r2 = self.run_fanout()
         self.assertEqual(r2["created"]["children"], 0)
         self.assertEqual(r2["recreated"], [])

@@ -90,6 +90,11 @@ def plan(s, change, machines=None, amend=False, folder=None):
         pkg["machine"] = machine_of[pkg["id"]]
 
     refs = _predict_refs(s, feature, packages)
+    # A skipped kept gap whose Task was removed holds nothing up: the run links no one to it and the
+    # Verify Task does not wait for it (`_deps_split`, `_live_children`), so the preview leaves its dead
+    # ref out too, keeping the plan and the real run in step (contract C5).
+    dead_rows = _dead_gap_rows(s, feature)
+    dead_pkgs = {pkg["id"] for pkg in packages if frozenset(pkg["rows"]) in dead_rows}
 
     out = []
     for pkg in packages:
@@ -106,12 +111,12 @@ def plan(s, change, machines=None, amend=False, folder=None):
             "machine": machine,
             "branch": _child_branch(s, feature, refs[pkg["id"]]["ref"], pkg),
             "base": feature["branch"],
-            "after": _plan_after(pkg, packages, refs, machine),
+            "after": _plan_after(pkg, packages, refs, machine, dead_pkgs),
             "merge": "ask" if pkg["risk"] == "high" else "checks",
             "brief": _child_brief(s, feature, change, pkg),
         })
 
-    verify_after = [refs[p["id"]]["ref_q"] for p in packages]
+    verify_after = [refs[p["id"]]["ref_q"] for p in packages if p["id"] not in dead_pkgs]
     if amend:
         # A started or remote child of a removed row is kept, and the Verify Task still waits for it;
         # show that in the preview so the plan matches what Verify will wait for.
@@ -468,13 +473,16 @@ def _predict_refs(s, feature, packages):
     return refs
 
 
-def _plan_after(pkg, packages, refs, machine):
+def _plan_after(pkg, packages, refs, machine, skip=()):
     """The after refs shown in the plan: the child of each package it depends on, machine-qualified
     when it sits on another machine (proposal section 6.13). A root package comes after nothing: the
     fan-out trigger only runs once the spec Task has merged onto the feature branch (contract C8), so
-    the children branch from a feature branch that already holds the plan."""
+    the children branch from a feature branch that already holds the plan. A dependency in `skip` (a
+    skipped kept gap whose Task is gone) is left out, matching the real run which links to no one dead."""
     out = []
     for pid in _pkg_depends(pkg, packages):
+        if pid in skip:
+            continue
         dep = refs[pid]
         out.append(dep["ref_q"] if dep["machine"] != machine else dep["ref"])
     return out
@@ -917,6 +925,14 @@ def _live_children(s, feature):
     left out of the Verify Task's `after`."""
     return [c for c in feature.get("children", [])
             if c.get("machine") or s.task_by_id(c["ref"]) is not None]
+
+
+def _dead_gap_rows(s, feature):
+    """The row sets of skipped kept gaps whose Task was removed by hand: a home child recorded skipped with
+    no live Task. The run links no one to them and the Verify Task does not wait for them, so the plan
+    preview leaves their dead refs out too (plan matches run)."""
+    return {frozenset(c.get("rows") or []) for c in feature.get("children", [])
+            if not c.get("machine") and c.get("skipped") and s.task_by_id(c["ref"]) is None}
 
 
 def _stamp_skipped(s, feature):
