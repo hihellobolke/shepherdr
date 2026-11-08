@@ -353,14 +353,15 @@ class FakeHerdrTask:
     the agent ran `herdr-task ready`."""
 
     @staticmethod
-    def install(fakes):
+    def install(fakes, exit_code=0):
         log = os.path.join(fakes.state_dir, "herdr-task-calls.jsonl")
         path = os.path.join(fakes.bin_dir, "herdr-task")
         with open(path, "w") as f:
             f.write("#!/usr/bin/env python3\n"
                     "import json, sys\n"
                     f"open({log!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                    "print('{\"ok\": true}')\n")
+                    "print('{\"ok\": true}')\n"
+                    f"sys.exit({int(exit_code)})\n")
         os.chmod(path, 0o755)
         return log
 
@@ -409,6 +410,28 @@ class ChildAgent(Base):
         self.fakes.script_agent("n24", ready=False, owns="plain.txt")
         self.fakes.run_agent("n24", worktree=wt2, branch="task/HAT-24-plain", ref="HAT-24")
         self.assertFalse(self.fakes.ran("n24")["awaiting_accept"])
+
+    def test_ran_records_the_real_ready_outcome(self):
+        # ran()["ready"] is true only when ready actually ran and succeeded.
+        wt = os.path.join(self.root, "wt-nr")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-25-nr", wt, "main")
+        self.fakes.script_agent("nr25", ready=True, owns="nr.txt")  # ready=True but no folder passed
+        self.fakes.run_agent("nr25", worktree=wt, branch="task/HAT-25-nr", ref="HAT-25")  # no folder
+        ran = self.fakes.ran("nr25")
+        self.assertFalse(ran["ready"])  # ready never actually ran (no folder)
+        self.assertFalse(ran["failed"])
+
+    def test_ran_records_a_failed_ready_as_failed(self):
+        log = FakeHerdrTask.install(self.fakes, exit_code=1)
+        wt = os.path.join(self.root, "wt-rf")
+        git(self.fakes.home_repo, "worktree", "add", "-q", "-b", "task/HAT-26-rf", wt, "main")
+        self.fakes.script_agent("rf26", owns="rf.txt")
+        res = self.fakes.run_agent("rf26", worktree=wt, branch="task/HAT-26-rf", ref="HAT-26",
+                                   folder=self.fakes.home_repo)
+        self.assertEqual(res.returncode, 1)
+        ran = self.fakes.ran("rf26")
+        self.assertFalse(ran["ready"])
+        self.assertTrue(ran["failed"])
 
     def test_an_unscripted_agent_uses_the_default_behaviour(self):
         FakeHerdrTask.install(self.fakes)

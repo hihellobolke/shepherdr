@@ -873,7 +873,8 @@ def _fake_agent(argv):
         sys.stderr.write(f"{ref}: child failed\n")
         return 1
     rc = 0
-    if script.get("ready") and folder:
+    ready_ran = bool(script.get("ready") and folder)
+    if ready_ran:
         # A child reports done the same way whether or not it is risky. A Risky Task's merge waits
         # for the person because its Task carries merge=ask (set at fan-out with --risk high, in the
         # flow's own code); the agent does not gate the merge itself. The harness records that a risky
@@ -883,8 +884,10 @@ def _fake_agent(argv):
         sys.stdout.write(r.stdout)
         sys.stderr.write(r.stderr)
         rc = r.returncode
-    _mark_ran(state_dir, key, ref, risky=risky, ready=bool(script.get("ready")),
-              awaiting_accept=risky, failed=False)
+    # ran() records the real outcome: `ready` true only when it was actually run and succeeded,
+    # `failed` true when it ran and returned non-zero.
+    _mark_ran(state_dir, key, ref, risky=risky, ready=(ready_ran and rc == 0),
+              awaiting_accept=risky, failed=(ready_ran and rc != 0))
     return rc
 
 
