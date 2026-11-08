@@ -24,7 +24,9 @@ checked out anywhere, so each step works in a short-lived worktree of it (reusin
 checked out), which keeps whatever the main folder has checked out untouched.
 """
 
+import json
 import os
+import re
 import shutil
 import tempfile
 
@@ -125,8 +127,20 @@ def _live_change(folder, change):
 
 
 def _archived_change(folder, change):
-    """The change has already been archived under `openspec/changes/archive/<change>`."""
-    return os.path.isfile(os.path.join(folder, "openspec", "changes", "archive", change, "tasks.md"))
+    """The change has already been archived. OpenSpec 1.3.1 archives a change to
+    `openspec/changes/archive/<YYYY-MM-DD>-<change>/`, so match a dated directory for this change (and
+    also a plain `archive/<change>/`, in case a future CLI drops the date)."""
+    archive = os.path.join(folder, "openspec", "changes", "archive")
+    if not os.path.isdir(archive):
+        return False
+    for name in os.listdir(archive):
+        same = name == change or (_ARCHIVE_DATE_RE.match(name) and name[len("YYYY-MM-DD-"):] == change)
+        if same and os.path.isfile(os.path.join(archive, name, "tasks.md")):
+            return True
+    return False
+
+
+_ARCHIVE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-")
 
 
 def _tick(s, feature, folder):
@@ -266,6 +280,7 @@ def _open_pr(s, feature, folder):
         ok, _, err = git(folder, "push", "--force-with-lease", "-u", remote, feature["branch"])
         if not ok:
             raise Fail(f"could not push {feature['branch']}: {err}")
+        base = feature.get("base") or "main"
         existing = feature.get("pr") or {}
         if existing.get("number"):
             okv, state, _ = gh("pr", "view", str(existing["number"]), "--repo", repo,
@@ -274,7 +289,15 @@ def _open_pr(s, feature, folder):
                 _ready(feature)
                 s.dirty = True
                 return {"pr": existing.get("url")}
-        base = feature.get("base") or "main"
+        # Adopt an open pull request already on the feature branch even when it was not saved on the
+        # record (a push or `gh pr create` that landed before the store write). Without this a retry
+        # would call `gh pr create` again, hit "already exists", and never reach ready.
+        adopted = _existing_pr(repo, feature["branch"], base)
+        if adopted:
+            feature["pr"] = adopted
+            _ready(feature)
+            s.dirty = True
+            return {"pr": adopted["url"]}
         body = (feature.get("title") or "").strip() or s.ref(feature)
         ok, out, err = gh("pr", "create", "--repo", repo, "--head", feature["branch"],
                           "--base", base, "--title", f"{s.ref(feature)} {feature['title']}",
@@ -286,6 +309,21 @@ def _open_pr(s, feature, folder):
     _ready(feature)
     s.dirty = True
     return {"pr": url}
+
+
+def _existing_pr(repo, branch, base):
+    """An open pull request already on `branch` into `base`, as `{number, url, repo}`, or None."""
+    ok, out, _ = gh("pr", "list", "--repo", repo, "--head", branch, "--state", "open",
+                    "--json", "number,url,baseRefName")
+    if not ok or not out:
+        return None
+    try:
+        for pr in json.loads(out):
+            if pr.get("baseRefName") == base:
+                return {"number": pr["number"], "url": pr["url"], "repo": repo}
+    except (ValueError, TypeError, KeyError):
+        return None
+    return None
 
 
 def _ready(feature):

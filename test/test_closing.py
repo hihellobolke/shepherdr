@@ -56,11 +56,12 @@ def _script(path, body):
 
 
 FAKE_OPENSPEC = """#!/usr/bin/env python3
-import os, shutil, sys
-# argv: archive <change> -y ; cwd is the feature worktree
+import datetime, os, shutil, sys
+# argv: archive <change> -y ; cwd is the feature worktree. OpenSpec 1.3.1 archives to a dated dir:
+# openspec/changes/archive/<YYYY-MM-DD>-<change>/ (dist/core/archive.js).
 change = sys.argv[2]
 src = os.path.join("openspec", "changes", change)
-dst = os.path.join("openspec", "changes", "archive", change)
+dst = os.path.join("openspec", "changes", "archive", f"{datetime.date.today().isoformat()}-{change}")
 os.makedirs(os.path.dirname(dst), exist_ok=True)
 shutil.move(src, dst)
 """
@@ -74,6 +75,21 @@ elif a[:2] == ["pr", "create"]:
     print("https://github.com/acme/shop/pull/7")
 elif a[:2] == ["pr", "view"]:
     print("OPEN")
+else:
+    sys.exit(1)
+"""
+
+# An existing open pull request on the branch, and `pr create` fails ("already exists"): closing must
+# adopt the existing one rather than try to create a second.
+FAKE_GH_EXISTING = """#!/usr/bin/env python3
+import sys
+a = sys.argv[1:]
+if a[:2] == ["repo", "view"]:
+    print("acme/shop")
+elif a[:2] == ["pr", "list"]:
+    print('[{"number": 11, "url": "https://github.com/acme/shop/pull/11", "baseRefName": "main"}]')
+elif a[:2] == ["pr", "create"]:
+    sys.stderr.write("a pull request for branch already exists\\n"); sys.exit(1)
 else:
     sys.exit(1)
 """
@@ -127,6 +143,14 @@ class Base(unittest.TestCase):
     def log_subjects(self, branch=BRANCH):
         out = self.git("log", "--format=%s", branch)
         return out.splitlines()
+
+    def archived_rel(self, branch=BRANCH):
+        """The committed path of the archived change on `branch` (the dated dir openspec uses)."""
+        tree = self.git("ls-tree", "-r", "--name-only", branch)
+        for line in tree.splitlines():
+            if line.startswith("openspec/changes/archive/") and line.endswith(f"-{CHANGE}/tasks.md"):
+                return line
+        return None
 
     # ---- building the repo and the store -----------------------------------------------------
 
@@ -199,8 +223,11 @@ class CleanClose(Base):
             f = s.find_feature(ref)
             self.assertEqual((f["phase"], f["attention"]), ("ready", ""))
 
-        # Every box is ticked in the archived tasks.md on the feature branch.
-        ticked = self.show(f"openspec/changes/archive/{CHANGE}/tasks.md")
+        # Every box is ticked in the archived tasks.md on the feature branch (openspec archives it
+        # under a dated directory, so find it rather than assume the name).
+        archived = self.archived_rel()
+        self.assertIsNotNone(archived, "the change was not archived under a dated dir")
+        ticked = self.show(archived)
         for rid in ALL_ROWS:
             self.assertIn(f"- [x] {rid}", ticked)
         # The change folder was moved out of changes/ by the archive step.
@@ -248,6 +275,28 @@ class RemoteClose(Base):
         self.assertTrue(subprocess.run(
             ["git", "-C", bare, "rev-parse", "--verify", BRANCH],
             capture_output=True).returncode == 0)
+
+    def test_remote_mode_adopts_an_existing_pull_request(self):
+        """A pull request already open on the branch (not saved on the record) is adopted, not
+        re-created, so a retry reaches ready (reviewer major)."""
+        self.seed_main()
+        bare = os.path.join(self.tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", bare], check=True)
+        self.git("remote", "add", "origin", bare)
+        self.git("push", "-q", "origin", "main")
+        self.make_feature_branch()
+
+        fake_gh = os.path.join(self.bin, "gh")
+        _script(fake_gh, FAKE_GH_EXISTING)  # `pr create` here fails; only adoption reaches ready
+        self._set(github, "GH", fake_gh)
+
+        ref = self.build_store(ALL_ROWS, mode="remote")
+        with store.Store(self.loc) as s:
+            result = closing.close(s, s.find_feature(ref))
+        self.assertEqual(result["phase"], "ready")
+        self.assertEqual(result["pr"], "https://github.com/acme/shop/pull/11")
+        with store.Store(self.loc, write=False) as s:
+            self.assertEqual(s.find_feature(ref)["pr"]["number"], 11)
 
 
 class BaseConflict(Base):
@@ -304,10 +353,12 @@ class BaseConflict(Base):
 class Resume(Base):
     def _archive_on_branch(self):
         """Mimic a prior close that ticked and archived the change on the feature branch, before it
-        hit a base conflict that has since been resolved."""
+        hit a base conflict that has since been resolved. Uses the real dated archive layout."""
+        import datetime
         self.git("checkout", "-q", BRANCH)
         src = os.path.join(self.repo, "openspec", "changes", CHANGE)
-        dst = os.path.join(self.repo, "openspec", "changes", "archive", CHANGE)
+        dated = f"{datetime.date.today().isoformat()}-{CHANGE}"
+        dst = os.path.join(self.repo, "openspec", "changes", "archive", dated)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.move(src, dst)
         self.git("add", "-A")
@@ -458,8 +509,10 @@ class Steps(Base):
         wt = os.path.join(wt_holder, "wt")
         self.git("worktree", "add", "--quiet", wt, BRANCH)
         self.addCleanup(lambda: self.git("worktree", "remove", "--force", wt))
+        import datetime
         closing.archive_change(wt, CHANGE)
-        self.assertTrue(os.path.isdir(os.path.join(wt, "openspec", "changes", "archive", CHANGE)))
+        dated = f"{datetime.date.today().isoformat()}-{CHANGE}"
+        self.assertTrue(os.path.isdir(os.path.join(wt, "openspec", "changes", "archive", dated)))
         self.assertFalse(os.path.isdir(os.path.join(wt, "openspec", "changes", CHANGE)))
         self.assertEqual(self.git("log", "-1", "--format=%s", BRANCH), f"Archive {CHANGE}")
 
