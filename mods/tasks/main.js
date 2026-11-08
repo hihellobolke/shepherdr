@@ -380,22 +380,36 @@ export default class Tasks extends View {
       // total, open findings, the two actions), with their child Tasks nested under it. Only a folder
       // with a features list has any, so a classic space is untouched. A flow child shows here, not in
       // the status or space groups below (loose of Pinned and Needs you, as those groups already are).
-      const featLists = lists.filter((l) => this.featuresOf(l).length
-        && (!here || inSpace(here, { machine: l.machine ?? null, folder: l.folder, space: null })));
-      const multiFeat = new Set(featLists.map((l) => `${l.machine ?? ""}:${l.folder}`)).size > 1;
-      for (const l of featLists) {
+      // A Feature shows when its folder is in view and, searching, when it or one of its shown children
+      // matches. With This space on, a Feature whose folder isn't the shown one still shows when a child
+      // of it survived the space filter (a child can match by its space, not only its folder), so that
+      // child keeps its Feature heading instead of vanishing from the list.
+      const featEntries = [];
+      for (const l of lists.filter((l) => this.featuresOf(l).length)) {
+        const folderShown = !here || inSpace(here, { machine: l.machine ?? null, folder: l.folder, space: null });
         for (const feature of this.featuresOf(l)) {
           const kids = rest.filter((p) => p.list === l && p.task.feature === feature.id);
-          // Searching: a Feature shows only when it, or one of its shown children, matches.
+          if (!folderShown && !kids.length) continue;
           if (q && !kids.length && !matches(q, feature.ref, feature.title, PHASE_LABEL[feature.phase])) continue;
-          body.push(this.featureGroup(l, feature, kids, t, { open, note: multiFeat ? placeName(l) : null }));
+          featEntries.push({ list: l, feature, kids });
         }
       }
+      // The Features actually shown, so a child whose Feature is not shown falls back to a loose group
+      // (and so never vanishes).
+      const shownFeat = new Set(featEntries.map((e) => `${e.list.machine ?? ""}:${e.list.folder}:${e.feature.id}`));
+      const underFeature = (p) => p.task.feature != null && shownFeat.has(`${p.list.machine ?? ""}:${p.list.folder}:${p.task.feature}`);
+      // Name the machine and the space on a heading only as far as more than one contributes a Feature.
+      const multiFeatMachine = new Set(featEntries.map((e) => e.list.machine ?? null)).size > 1;
+      const multiFeatSpace = new Set(featEntries.map((e) => `${e.list.machine ?? ""}:${e.list.folder}`)).size > 1;
+      for (const { list: l, feature, kids } of featEntries) {
+        const note = [multiFeatMachine ? machineName(l.machine) : null, multiFeatSpace ? placeName(l) : null].filter(Boolean).join(" · ") || null;
+        body.push(this.featureGroup(l, feature, kids, t, { open, note }));
+      }
       // The status, space and machine groups below are for loose Tasks: a flow child sits under its Feature.
-      const loose = rest.filter((p) => !this.featureChild(p));
+      const loose = rest.filter((p) => !underFeature(p));
       if (by === "status") {
         for (const s of ORDER.slice(1, -1)) {
-          const ps = tasksOf[s].filter((p) => !isPin(p) && !this.featureChild(p));
+          const ps = tasksOf[s].filter((p) => !isPin(p) && !underFeature(p));
           // A group shows only when it holds something (To do too).
           if (!ps.length) continue;
           // Split by space: a light heading per space, its rows saying no more where they are.
@@ -973,14 +987,6 @@ export default class Tasks extends View {
     return (list.features ?? []).map((f) => ({ ...f, ref: refOf(list, { id: f.id }), folder: list.folder, machine: list.machine ?? null }));
   }
 
-  // A placed Task that belongs to a Feature of its own folder (a flow child): it shows under its
-  // Feature group, not in the status, space or machine groups. A classic Task, or a flow Task whose
-  // Feature is not in this folder's list, is loose.
-  featureChild(p) {
-    const fs = p.list.features;
-    return p.task.feature != null && Array.isArray(fs) && fs.some((f) => f.id === p.task.feature);
-  }
-
   // The key a Feature action's busy state lives under, so a double press waits.
   featureActionKey(list, feature, action) {
     return `${list.machine ?? ""}:${list.folder}:${feature.ref}:${action.id}`;
@@ -1021,10 +1027,11 @@ export default class Tasks extends View {
     const key = `feat:${list.machine ?? ""}:${list.folder}:${feature.id}`;
     const shut = !open && this.shut(key);
     const rows = [...children].sort((a, b) => RANK_OF[a.section] - RANK_OF[b.section] || order(a.section)(a, b));
-    // The second line, in plain words: the phase, then "<merged>/<total> merged" and the open findings.
+    // The second line, in plain words, all three of section 6.17: the phase, "<merged>/<total> merged"
+    // (shown even at 0/0, so a Feature with no children still reads), and the open verify findings.
     const bits = [row.phaseLabel,
-      row.total > 0 ? `${row.merged}/${row.total} merged` : null,
-      row.findings > 0 ? `${row.findings} finding${row.findings === 1 ? "" : "s"}` : null].filter(Boolean);
+      `${row.merged}/${row.total} merged`,
+      `${row.findings} finding${row.findings === 1 ? "" : "s"}`];
     const empty = raw.length ? "Its tasks are pinned, done or need you." : "No child tasks yet.";
     const heading = h_flex().id(`head-${key}`).h(46).px(8).gap(10).items_center().rounded(RADIUS.card)
       .when(!open, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover))
