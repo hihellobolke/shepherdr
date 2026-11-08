@@ -742,7 +742,9 @@ With `--json` a command prints one JSON object; the shapes are in the contract (
 
 When the Settings block says `Flow: openspec` and a Task has a flow role, `brief()` adds one flow file after the normal worker words.
 The spec Task gets `flow-spec`, a Child, Fix or Integration Task gets `flow-task`, and the Verify Task gets `flow-verify`.
-A classic Task, or an ordinary Task in an `openspec` space with no flow role, gets none, so its brief stays byte for byte the same as before.
+A classic Task, or an ordinary Task in an `openspec` space with no flow role, gets no flow file.
+A classic Task's brief stays byte for byte the same as before (proven by the tests).
+An ordinary Task in an `openspec` space gets no flow file either, but its Settings block still shows the `Flow: openspec` line, so its brief is not byte for byte identical to a classic one.
 A flow Task in a repo with no `openspec/` folder stops with a clear message that says to run `herdr-task flow init` first.
 
 ### Owned paths and review validity
@@ -793,8 +795,11 @@ The contract (C1) has the exact keys, values and defaults; `docs/settings.md` sa
 | May change without asking | nothing, AGENTS.md, specs and ADRs (nothing) | What a flow agent may change without the person's Accept. |
 | Retro agent | a CLI, model and effort, like a role (the Reviewer's) | The agent that runs the retro. Empty means the Reviewer's agent, model and effort. |
 
-Both user interfaces read the same `~/.herdr/shepherdr.json`.
-Risky paths and the owned-paths exempt list are per-space list editors, not per-Task `--set` values.
+Every flow setting lives in `~/.herdr/shepherdr.json` and is read by both user interfaces, but the Settings pages do not expose all of them yet.
+Flow, Verify rounds, Retro, Retro saves to and May change without asking show in both the window and the web app (May change shows once Retro is not off).
+Risky paths, Retro prompt and the Retro agent show in the window only so far, not in the web app.
+The owned-paths exempt list has no Settings row yet; set `tasks.owns_exempt` in `shepherdr.json` directly.
+Risky paths, the owned-paths exempt list and the Retro agent are per-space settings, not per-Task `--set` values.
 The `automatic` value of Retro waits on the scheduler integration that is not wired yet; for now `herdr-task retro <ref>` starts a retro by hand whatever the setting says.
 
 ## How to try the flow
