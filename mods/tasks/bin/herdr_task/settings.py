@@ -448,6 +448,15 @@ def settings_block(s, t, space=None, argv=None):
     return "\n".join([SETTINGS_HEAD, *rows])
 
 
+def reviewer_agent(s, t, space=None, argv=None):
+    """The CLI the task's reviewer runs (its Settings block Reviewer line), or None when review is
+    off: lets the brief name the reviewer's exact start command (SHMD-34)."""
+    for x in task_settings(s, t, space, argv):
+        if x["label"] == "Reviewer":
+            return (x["value"] or {}).get("agent")
+    return None
+
+
 def review_limits(s, t):
     """(review on, rounds allowed now): the Settings block's Review and Review rounds lines, with
     the rounds the assistant added (review-more)."""

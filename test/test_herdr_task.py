@@ -1577,7 +1577,7 @@ class ReviewAsAHelperAgent(unittest.TestCase):
         for words in (templates.WORKER_MD, worker):
             self.assertIn("--label herdr.role=reviewer", words)
             self.assertIn("herdr.task=$HERDR_BROWSER_TASK", words)
-            self.assertIn("codex --sandbox read-only --ask-for-approval never", words)
+            self.assertIn("codex --no-daemon -c '<the projects trust table your brief gives>' --sandbox read-only --ask-for-approval never", words)
             self.assertIn("claude --permission-mode plan", words)
             self.assertIn("hc wait <its name>", words)
             self.assertNotIn("< /dev/null", words)
@@ -1884,7 +1884,7 @@ class CleanEnv(unittest.TestCase):
         task = {"id": 6, "title": "fake", "agents": []}
         with mock.patch.object(L, "run", run), mock.patch.object(L, "folder_for", lambda s, t: "/tmp"), \
                 mock.patch.object(L, "agent_name", lambda *a: "dev-6-fake"), mock.patch.object(L, "track", lambda *a: None), \
-                mock.patch.object(L, "coordinator_tab", lambda a: None), mock.patch.object(L, "own_argv", lambda a: a), \
+                mock.patch.object(L, "coordinator_tab", lambda a: None), mock.patch.object(L, "own_argv", lambda a, c=None: a), \
                 mock.patch.object(L, "in_shell", lambda a: a), mock.patch.object(L, "low_priority", lambda a, n: a):
             L.launch(s, task, ["env"], "sp1")
         hc = ran[0]
