@@ -1,0 +1,515 @@
+"""Fan-out (proposal T05b, contract C5/C6/C7): turn an approved work table into the child Tasks of a
+Feature. The tests run against a real throwaway git repo and a throwaway STORE (tempfile); only `hc`
+and `gh` would be mocked, and the home-machine paths here need neither, so nothing is mocked. The
+repo rule holds: a test never runs a changed herdr-task on another machine, so the placement across
+machines is checked through the dry-run plan, not by creating remote children.
+
+They cover the dry run, repeat (idempotent) runs, the deterministic order, placement with chain
+affinity, the local-mode refusal of other machines, amendments, every work-table error code, risk
+(the risk column and risky paths), the generated after links and Verify Task, and the `openspec
+validate` plan guard."""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.join(ROOT, "mods", "tasks", "bin")
+if BIN not in sys.path:
+    sys.path.insert(0, BIN)
+sys.dont_write_bytecode = True
+os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-fanout-store-"))
+os.environ.setdefault("HERDR_TASK_SETTINGS", os.path.join(tempfile.mkdtemp(prefix="herdr-fanout-cfg-"), "shepherdr.json"))
+
+from herdr_task import fanout, store as st  # noqa: E402
+from herdr_task.base import Fail  # noqa: E402
+from herdr_task import settings as settings_mod  # noqa: E402
+
+
+VALID_TABLE = """# Login flow
+
+## Work table
+
+| id  | title               | owns                 | depends | risk | size |
+|-----|---------------------|----------------------|---------|------|------|
+| 0.1 | Shared parser types | src/parser/types.ts  |         | low  | S    |
+| 1.1 | Parse headers       | src/parser/header.ts | 0.1     | low  | S    |
+| 1.2 | Parse body          | src/parser/body.ts   | 0.1     | high | M    |
+| 2.1 | Wire parser         | src/parser/index.ts  | 1.1,1.2 | low  | M    |
+
+## Tasks
+
+- [ ] 0.1 Shared parser types
+- [ ] 1.1 Parse headers
+- [ ] 1.2 Parse body
+- [ ] 2.1 Wire parser
+"""
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", repo, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+
+class Base(unittest.TestCase):
+    """A fresh throwaway git repo with an OpenSpec change and a Feature in its store."""
+
+    change = "add-login-flow"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="herdr-fanout-repo-")
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        _git(self.repo, "init")
+        _git(self.repo, "commit", "--allow-empty", "-m", "init")
+        self.loc = st.locate(self.repo)
+
+    def write_table(self, text, change=None):
+        change = change or self.change
+        cdir = os.path.join(self.repo, "openspec", "changes", change)
+        os.makedirs(cdir, exist_ok=True)
+        with open(os.path.join(cdir, "tasks.md"), "w") as f:
+            f.write(text)
+
+    def make_feature(self, mode="remote", change=None, auto_fanout=True):
+        change = change or self.change
+        with st.Store(self.loc) as s:
+            f = s.new_feature("Login flow", change, "feature/tmp", mode=mode, auto_fanout=auto_fanout)
+            spec = s.new("Plan the change", "", mode="worktree", feature=f["id"], role="spec")
+            f["spec_task"] = spec["id"]
+            f["branch"] = f"feature/{s.ref(f)}-login-flow"
+            f["phase"] = "building"
+            ref = s.ref(f)
+        return ref
+
+    def plan(self, **kw):
+        with st.Store(self.loc, write=False) as s:
+            return fanout.plan(s, self.change, **kw)
+
+    def run_fanout(self, **kw):
+        with st.Store(self.loc) as s:
+            return fanout.run(s, self.change, **kw)
+
+    def read(self):
+        with st.Store(self.loc, write=False) as s:
+            return json.loads(json.dumps(s.data))
+
+
+# ---- the dry-run plan (C5) -------------------------------------------------------------------
+
+class PlanTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(VALID_TABLE)
+        self.feature_ref = self.make_feature()
+
+    def test_valid_shape(self):
+        p = self.plan()
+        self.assertTrue(p["valid"])
+        self.assertEqual(p["change"], self.change)
+        self.assertEqual(p["feature"], self.feature_ref)
+        self.assertEqual(p["waves"], [["0.1"], ["1.1", "1.2"], ["2.1"]])
+        self.assertEqual(len(p["packages"]), 4)  # one package per row (max parallelism)
+        for pkg in p["packages"]:
+            self.assertEqual(len(pkg["rows"]), 1)
+            self.assertTrue(pkg["branch"].startswith(f"task/{self.feature_ref}-"))
+            self.assertEqual(pkg["base"], f"feature/{self.feature_ref}-login-flow")
+            self.assertIsNone(pkg["machine"])
+            self.assertIn("work package", pkg["brief"])
+
+    def test_dry_run_creates_nothing(self):
+        before = self.read()
+        self.plan()
+        self.assertEqual(self.read(), before)
+
+    def test_order_wave_then_size(self):
+        # Wave first; within a wave the longer chain, then larger size, then table order. 1.1 and 1.2
+        # share a chain length, so the larger (M) 1.2 comes before the (S) 1.1.
+        p = self.plan()
+        self.assertEqual([pkg["package"] for pkg in p["packages"]], ["0.1", "1.2", "1.1", "2.1"])
+
+    def test_risk_and_merge(self):
+        p = {pkg["package"]: pkg for pkg in self.plan()["packages"]}
+        self.assertEqual(p["1.2"]["risk"], "high")
+        self.assertEqual(p["1.2"]["risk_reason"], "risk column is high")
+        self.assertEqual(p["1.2"]["merge"], "ask")
+        self.assertEqual(p["0.1"]["risk"], "low")
+        self.assertEqual(p["0.1"]["merge"], "checks")
+
+    def test_after_links_and_verify(self):
+        p = self.plan()
+        by = {pkg["package"]: pkg for pkg in p["packages"]}
+        self.assertEqual(by["0.1"]["after"], [])  # a root comes after nothing (spec is already merged)
+        self.assertEqual(by["1.1"]["depends"], ["0.1"])
+        # a non-root comes after the one child of each package it depends on
+        self.assertEqual(len(by["1.1"]["after"]), 1)
+        self.assertTrue(by["1.1"]["after"][0].startswith(self.feature_ref.split("-")[0]))
+        self.assertEqual(len(p["verify_task"]["after"]), 4)
+
+    def test_determinism(self):
+        self.assertEqual(self.plan(), self.plan())
+
+    def test_no_feature_fails(self):
+        with st.Store(self.loc, write=False) as s:
+            with self.assertRaises(Fail):
+                fanout.plan(s, "no-such-change")
+
+
+# ---- work-table error codes (C5/C6) ----------------------------------------------------------
+
+class InvalidTableTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.make_feature()
+
+    def _plan_code(self, body):
+        head = "## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+        self.write_table(head + body)
+        return self.plan()
+
+    def test_unknown_dep(self):
+        p = self._plan_code("| 0.1 | A | a.ts | 9.9 | low | S |\n")
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["code"], "unknown-dep")
+
+    def test_cycle(self):
+        p = self._plan_code("| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
+        self.assertEqual(p["code"], "cycle")
+
+    def test_empty_owns(self):
+        p = self._plan_code("| 0.1 | A |  |  | low | S |\n")
+        self.assertEqual(p["code"], "empty-owns")
+
+    def test_size_l(self):
+        p = self._plan_code("| 0.1 | A | a.ts |  | low | L |\n")
+        self.assertEqual(p["code"], "size-l")
+
+    def test_bad_risk(self):
+        p = self._plan_code("| 0.1 | A | a.ts |  | maybe | S |\n")
+        self.assertEqual(p["code"], "bad-risk")
+
+    def test_missing_tasks_md(self):
+        p = self.plan()  # no tasks.md written
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["code"], "bad-table")
+
+
+# ---- the real run ----------------------------------------------------------------------------
+
+class RunTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(VALID_TABLE)
+        self.feature_ref = self.make_feature()
+
+    def test_creates_children_and_verify(self):
+        r = self.run_fanout()
+        self.assertEqual(r["created"], {"children": 4, "verify": 1})
+        self.assertEqual(r["started"], 5)
+        data = self.read()
+        feat = data["features"][0]
+        self.assertEqual(len(feat["children"]), 4)
+        self.assertTrue(feat["verify_task"])
+        children = [t for t in data["tasks"] if t.get("role") == "child"]
+        self.assertEqual(len(children), 4)
+        for t in children:
+            self.assertEqual(t["feature"], feat["id"])
+            self.assertEqual(t["state"], "queued")
+            self.assertEqual(t["mode"], "worktree")
+            self.assertEqual(t["base"], feat["branch"])
+            self.assertTrue(t["owns"])
+            self.assertEqual(t["retries"], 0)
+            self.assertFalse(t["skipped"])
+
+    def test_merge_mode_by_risk(self):
+        self.run_fanout()
+        by_rows = {tuple(t["rows"]): t for t in self.read()["tasks"] if t.get("role") == "child"}
+        self.assertEqual(by_rows[("1.2",)]["set"]["merge"], "ask")   # high risk
+        self.assertEqual(by_rows[("0.1",)]["set"]["merge"], "checks")
+
+    def test_after_links_between_waves(self):
+        self.run_fanout()
+        tasks = {t["id"]: t for t in self.read()["tasks"]}
+        by_rows = {tuple(t["rows"]): t for t in tasks.values() if t.get("role") == "child"}
+        shared = by_rows[("0.1",)]
+        headers = by_rows[("1.1",)]
+        wire = by_rows[("2.1",)]
+        self.assertEqual(headers["after"], [shared["id"]])
+        self.assertCountEqual(wire["after"], [by_rows[("1.1",)]["id"], by_rows[("1.2",)]["id"]])
+        verify = next(t for t in tasks.values() if t.get("role") == "verify")
+        self.assertCountEqual(verify["after"], [t["id"] for t in by_rows.values()])
+        self.assertEqual(verify["owns"], [])
+
+    def test_no_start_leaves_todo(self):
+        self.run_fanout(start=False)
+        states = {t.get("role"): t["state"] for t in self.read()["tasks"] if t.get("role") in ("child", "verify")}
+        self.assertEqual(states["child"], "todo")
+        self.assertEqual(states["verify"], "todo")
+
+    def test_rerun_is_idempotent(self):
+        self.run_fanout()
+        after_first = self.read()
+        r2 = self.run_fanout()
+        self.assertEqual(r2["created"], {"children": 0, "verify": 0})
+        self.assertEqual(self.read()["tasks"], after_first["tasks"])
+        self.assertEqual(len(self.read()["features"][0]["children"]), 4)
+
+    def test_rerun_fills_a_gap(self):
+        # Create everything, then drop one child from the store as if it was never made; a rerun adds
+        # back only that one.
+        self.run_fanout()
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            gone = next(c for c in feat["children"] if c["rows"] == ["1.1"])
+            feat["children"] = [c for c in feat["children"] if c is not gone]
+            s.data["tasks"] = [t for t in s.data["tasks"] if t["id"] != gone["ref"]]
+            s.dirty = True
+        r = self.run_fanout()
+        self.assertEqual(r["created"]["children"], 1)
+        self.assertEqual(len(self.read()["features"][0]["children"]), 4)
+
+    def test_invalid_table_raises(self):
+        self.write_table("## Work table\n\nno table here\n")
+        with st.Store(self.loc) as s:
+            with self.assertRaises(Fail):
+                fanout.run(s, self.change)
+
+
+# ---- placement with chain affinity (section 6.13), via the dry run ----------------------------
+
+class PlacementTest(Base):
+    def setUp(self):
+        super().setUp()
+        # One wave-0 contract and two independent chains off it, to show the spread.
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Types | pkg/types.ts |  | low | S |\n"
+            "| 1.1 | A | a/a.ts | 0.1 | low | S |\n"
+            "| 1.2 | B | b/b.ts | 0.1 | low | M |\n"
+            "| 2.1 | Wire | w/w.ts | 1.1,1.2 | low | M |\n"
+        )
+        self.make_feature()
+
+    def test_home_only_when_no_machines(self):
+        for pkg in self.plan()["packages"]:
+            self.assertIsNone(pkg["machine"])
+
+    def test_chain_affinity(self):
+        p = self.plan(machines=["vm-a", "vm-b"])
+        where = {pkg["package"]: pkg["machine"] for pkg in p["packages"]}
+        # Each package sits on a named machine, and a dependent chain stays on one machine.
+        self.assertEqual(set(where.values()), {"vm-a", "vm-b"})
+        self.assertEqual(where["0.1"], where["2.1"])  # the long chain 0.1 -> ... -> 2.1 stays together
+        # The two wave-1 branches land on different machines (independent chains spread).
+        self.assertNotEqual(where["1.1"], where["1.2"])
+
+    def test_cross_machine_after_is_qualified(self):
+        p = self.plan(machines=["vm-a", "vm-b"])
+        by = {pkg["package"]: pkg for pkg in p["packages"]}
+        # 2.1 depends on 1.1 and 1.2 which sit on different machines: one after link is machine:ref.
+        self.assertTrue(any(":" in a for a in by["2.1"]["after"]))
+
+    def test_deterministic_placement(self):
+        self.assertEqual(self.plan(machines=["vm-a", "vm-b"]), self.plan(machines=["vm-a", "vm-b"]))
+
+
+# ---- local mode refuses other machines (section 6.10) ----------------------------------------
+
+class LocalModeTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(VALID_TABLE)
+        self.make_feature(mode="local")
+
+    def test_refuses_machines(self):
+        with st.Store(self.loc, write=False) as s:
+            with self.assertRaises(Fail) as cm:
+                fanout.plan(s, self.change, machines=["vm-a"])
+        self.assertIn("local mode", str(cm.exception))
+
+    def test_home_only_is_fine(self):
+        with st.Store(self.loc) as s:
+            r = fanout.run(s, self.change)
+        self.assertEqual(r["created"]["children"], 4)
+        for pkg in r["packages"]:
+            self.assertIsNone(pkg["machine"])
+
+
+# ---- amendments (section 6.7) ----------------------------------------------------------------
+
+class AmendTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | low | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+        )
+        self.make_feature()
+        self.run_fanout()
+
+    def _amend_table(self, rows):
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n" + rows)
+
+    def test_adds_only_new_rows(self):
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | low | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+            "| 1.3 | N | src/n.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        self.assertEqual(r["created"]["children"], 1)
+        rows = {tuple(c["rows"]) for c in self.read()["features"][0]["children"]}
+        self.assertIn(("1.3",), rows)
+
+    def test_cancels_unstarted_removed_child(self):
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        self.assertTrue(r.get("cancelled"))
+        data = self.read()
+        rows = {tuple(c["rows"]) for c in data["features"][0]["children"]}
+        self.assertNotIn(("1.2",), rows)
+        cancelled = [t for t in data["tasks"] if t.get("rows") == ["1.2"]][0]
+        self.assertEqual(cancelled["state"], "cancelled")
+
+    def test_started_removed_child_is_kept_with_warning(self):
+        # Mark 1.2's child as running, then remove its row: it stays, and a warning names it.
+        with st.Store(self.loc) as s:
+            t = next(t for t in s.data["tasks"] if t.get("rows") == ["1.2"])
+            t["state"] = "running"
+            s.dirty = True
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        self.assertTrue(any("1.2" in w for w in r["warnings"]))
+        rows = {tuple(c["rows"]) for c in self.read()["features"][0]["children"]}
+        self.assertIn(("1.2",), rows)  # kept
+
+
+# ---- risk from risky paths (section 6.6) -----------------------------------------------------
+
+class RiskyPathTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Config | config/app.json |  | low | S |\n"
+        )
+        self.make_feature()
+
+    def test_owns_matching_risky_path_is_high(self):
+        with open(settings_mod.SETTINGS, "w") as f:
+            json.dump({"everywhere": {"tasks": {"risky_paths": ["config/*.json"]}}}, f)
+        self.addCleanup(lambda: os.path.exists(settings_mod.SETTINGS) and os.remove(settings_mod.SETTINGS))
+        pkg = self.plan()["packages"][0]
+        self.assertEqual(pkg["risk"], "high")
+        self.assertIn("risky path", pkg["risk_reason"])
+        self.assertEqual(pkg["merge"], "ask")
+
+
+# ---- the openspec validate plan guard (C7/C8) ------------------------------------------------
+
+@unittest.skipUnless(shutil.which("openspec"), "openspec CLI not installed")
+class CheckPlanTest(Base):
+    def setUp(self):
+        super().setUp()
+        subprocess.run(["openspec", "init", "--tools", "none"], cwd=self.repo,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.cdir = os.path.join(self.repo, "openspec", "changes", self.change)
+        os.makedirs(os.path.join(self.cdir, "specs", "auth"), exist_ok=True)
+        with open(os.path.join(self.cdir, "proposal.md"), "w") as f:
+            f.write("## Why\nwhy\n\n## What Changes\n- a\n\n## Impact\n- auth\n")
+        self.write_table(VALID_TABLE)
+        self._spec(valid=True)
+        self.make_feature()
+
+    def _spec(self, valid):
+        body = ("## ADDED Requirements\n\n### Requirement: Login\nThe system SHALL let a user log in.\n\n"
+                "#### Scenario: Valid\n- **WHEN** valid\n- **THEN** ok\n") if valid else \
+               ("## ADDED Requirements\n\n### Requirement: Login\nNo scenario and no keyword here.\n")
+        with open(os.path.join(self.cdir, "specs", "auth", "spec.md"), "w") as f:
+            f.write(body)
+
+    def test_valid_change_passes(self):
+        self.assertEqual(fanout.check_plan(self.repo, self.change), {"ok": True, "detail": ""})
+
+    def test_invalid_openspec_change_fails(self):
+        self._spec(valid=False)
+        r = fanout.check_plan(self.repo, self.change)
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["detail"])
+
+    def test_bad_work_table_fails(self):
+        # The OpenSpec change validates, but the work table has a cycle: the plan guard still refuses.
+        self.write_table(
+            "## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
+        r = fanout.check_plan(self.repo, self.change)
+        self.assertFalse(r["ok"])
+
+
+# ---- the command entry (C4) ------------------------------------------------------------------
+
+class Args:
+    def __init__(self, **kw):
+        self.change = None
+        self.folder = None
+        self.json = False
+        self.dry_run = False
+        self.amend = False
+        self.machines = None
+        self.no_start = False
+        self.__dict__.update(kw)
+
+
+class CmdFanoutTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.write_table(VALID_TABLE)
+        self.make_feature()
+
+    def _capture(self, args):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = fanout.cmd_fanout(args)
+        return rc, buf.getvalue()
+
+    def test_dry_run_json_creates_nothing(self):
+        before = self.read()
+        rc, out = self._capture(Args(change=self.change, folder=self.repo, json=True, dry_run=True))
+        self.assertEqual(rc, 0)
+        p = json.loads(out)
+        self.assertTrue(p["valid"])
+        self.assertEqual(len(p["packages"]), 4)
+        self.assertEqual(self.read(), before)  # nothing created
+
+    def test_real_run_creates(self):
+        rc, out = self._capture(Args(change=self.change, folder=self.repo, json=True))
+        self.assertEqual(rc, 0)
+        p = json.loads(out)
+        self.assertEqual(p["created"]["children"], 4)
+        self.assertEqual(len([t for t in self.read()["tasks"] if t.get("role") == "child"]), 4)
+
+    def test_invalid_table_exit_1(self):
+        self.write_table("## Work table\n\nnothing\n")
+        rc, out = self._capture(Args(change=self.change, folder=self.repo, dry_run=True))
+        self.assertEqual(rc, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
