@@ -58,10 +58,17 @@ def _codex_log(path):
 
 class DigestBase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        os.environ["HERDR_TASK_STORE"] = os.path.join(self.tmp, "store")
+        from unittest import mock
+        # realpath: macOS $TMPDIR (/var/folders/...) is a symlink to /private/var/...; store.locate
+        # resolves the folder, so resolve the temp root too to keep slugs consistent.
+        self.tmp = os.path.realpath(tempfile.mkdtemp())
         from herdr_task import store, digest
         self.store, self.digest = store, digest
+        # store.STORE is bound from the env at import; setting HERDR_TASK_STORE here would be too late
+        # and the throwaway store would leak into the real ~/.herdr/tasks. Patch the module global.
+        p = mock.patch.object(store, "STORE", os.path.join(self.tmp, "store"))
+        p.start()
+        self.addCleanup(p.stop)
         # Never reach hc for the machine name in a test.
         self._orig_machine = digest._this_machine
         digest._this_machine = lambda: "home-mac"
@@ -69,7 +76,6 @@ class DigestBase(unittest.TestCase):
     def tearDown(self):
         self.digest._this_machine = self._orig_machine
         shutil.rmtree(self.tmp, ignore_errors=True)
-        os.environ.pop("HERDR_TASK_STORE", None)
 
     def _store(self):
         return self.store.Store(self.store.locate(self.tmp))
