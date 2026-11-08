@@ -615,39 +615,78 @@ It is a record of its own in the store of its folder, not a Task (ADR-0001).
 A Feature draws its number from the same folder counter that Tasks use, so a ref such as `HAT-12` is a Feature or a Task, never both (ADR-0002).
 Each Task that belongs to a Feature carries a `feature` field, and the CLI and both user interfaces group the Tasks under the Feature with it, for example `HAT-12 > HAT-14`.
 
-The flow keeps the person's input at two points only: the start, when the plan is written, and the end, when the Feature merges.
-In between, the Child Tasks build in parallel, each on its own branch, each reviewed by its worker's reviewer, each merging into the feature branch by itself after checks.
+The flow's aim is to keep the person's input at two points only: the start, when the plan is written, and the end, when the Feature merges.
+In between, the Child Tasks build in parallel, each on its own branch, each reviewed by its worker's reviewer, each merging into the feature branch after checks.
 The person also accepts each Risky Task and each Amendment.
 A small request stays an ordinary Task, even in a space with `flow=openspec`: the flow starts only when someone creates a Feature.
 
 Use the glossary of [the proposal](openspec-flow-proposal.md) (section 2) for every term here.
 The names, fields, JSON shapes, exit codes and module signatures are fixed in the contract above.
-This part of the file describes what the code does; the contract is the source of truth for every name.
+This part of the file describes what the code does on main; the contract is the source of truth for every name.
+
+### What is built so far
+
+The building blocks are on main and are driven by the commands below.
+The scheduler integration that drives a Feature from one phase to the next by itself is not merged yet, so today you run the steps with the commands rather than watch them happen on their own.
+
+On main now:
+
+- The Feature record, its phases and the flow Task fields in the store.
+- The `feature`, `fanout`, `sync-branch`, `feature-status`, `verify-report`, `retro-data`, `retro` and `flow init` commands, and the new `add` flags.
+- The `ready` guards (owned paths, the spec-Task plan check, and the patch-id review check) and the patch-id stored by `reviewed`.
+- The flow files added to a flow Task's brief by `brief()`.
+- The grouped Feature row in the window and the web app, with its Merge feature and Add a fix round actions.
+- Accept of a spec Task moves its Feature from `planning` to `building` by itself.
+
+Not wired yet (the scheduler tick that the contract C8 describes is a later task):
+
+- Automatic fan-out on Plan approval. For now you run `herdr-task fanout <change>` yourself.
+- Automatic phase changes past `building`, the closing steps, the failed-child retry, the written digests and the Assistant news. The closing steps have no command of their own yet, so a Feature does not reach `ready` on its own.
+- Automatic retro. For now you run `herdr-task retro <ref>` yourself.
+- Fan-out across machines. A real run creates children on the home machine only (see The commands).
 
 ## The lifecycle and its phases
 
 A Feature moves through seven phases.
 The `phase` field of the Feature record holds the current one.
+The table gives the meaning of each phase; the steps below say which moves run by themselves on main and which you run with a command.
 
-| Phase | What happens |
+| Phase | Meaning |
 |---|---|
 | `planning` | The spec Task exists and is not accepted. A worker writes one OpenSpec change with the person and adds the work table to `tasks.md`. |
-| `building` | Plan approval is done. Fan-out created the Child Tasks and they run in parallel. The Feature has no agent of its own. |
+| `building` | Plan approval is done. The Child Tasks build in parallel. The Feature has no agent of its own. |
 | `verifying` | Every child is merged or skipped. A Verify Task runs `/opsx:verify` on the feature branch, read-only. |
-| `closing` | Verify is clean. `herdr-task` ticks the rows, archives the change, merges the base in, and opens the pull request. |
+| `closing` | Verify is clean. The closing steps tick the rows, archive the change, merge the base in, and open the pull request. |
 | `ready` | The pull request is open. The person presses Merge feature. |
 | `done` | The pull request is merged. A retro runs if the setting asks for it. |
 | `cancelled` | The person cancelled the Feature. It keeps the feature branch and deletes nothing. |
 
-The stages map to the phases like this.
+The steps of a Feature, and how each one works on main:
 
-1. Start. The person asks for a Feature, or the Assistant proposes one and the person says yes. `herdr-task feature add "<title>"` creates the Feature, the feature branch and the spec Task (phase `planning`).
-2. Plan. The spec worker picks path A or path B (below) and writes the change. `ready` is refused until `openspec validate` and `fanout --dry-run` both pass. The person's Accept is Plan approval, which moves the Feature to `building`.
-3. Fan-out. Once the spec Task's merge lands on the feature branch, `tick.py` runs `fanout` by itself and starts the Child Tasks, unless `feature add --no-auto-fanout` turned that off.
-4. Build. The children work in parallel. Each merges into the feature branch after its checks. A Risky Task waits for the person's Accept first.
-5. Verify. A Verify Task runs on the feature branch. Findings become Fix Tasks. The Feature allows a number of fix rounds set by `tasks.verify_rounds` (two by default). After the last allowed round with open findings, the Feature shows Needs you.
-6. Closing. On a clean verify, `herdr-task` runs the closing steps in order and opens the pull request (phase `ready`).
-7. Retro. After the Feature is `done`, one retro runs for the whole Feature if `tasks.retro` asks for it.
+1. Start.
+   The person asks for a Feature, or the Assistant proposes one and the person says yes.
+   `herdr-task feature add "<title>"` creates the Feature, the feature branch and the spec Task (phase `planning`).
+2. Plan.
+   The spec worker picks path A or path B (see How to try the flow) and writes the change.
+   `ready` is refused until `openspec validate` and `fanout --dry-run` both pass.
+   The person's Accept is Plan approval, which moves the Feature to `building` by itself.
+3. Fan-out.
+   Run `herdr-task fanout <change>` to turn the approved work table into the Child Tasks and start them.
+   The automatic trigger on Plan approval is not wired yet, so this step is a command for now.
+4. Build.
+   The children work in parallel.
+   Each merges into the feature branch after its checks.
+   A Risky Task waits for the person's Accept first.
+5. Verify.
+   Add a Verify Task that runs `/opsx:verify` on the feature branch, and it reports with `herdr-task verify-report`.
+   Findings become Fix Tasks.
+   The Feature allows a number of fix rounds set by `tasks.verify_rounds` (two by default).
+6. Closing.
+   The closing steps tick the rows, archive the change, merge the base in, and open the pull request (phase `ready`).
+   These steps are tick-driven in the contract and are not reachable by a command yet.
+7. Merge and retro.
+   The person presses Merge feature, or runs `herdr-task feature merge <ref>`, which moves the Feature to `done`.
+   Run `herdr-task retro <ref>` for the retro; the automatic retro on `done` is not wired yet.
 
 A Feature has exactly two human actions of its own:
 
@@ -667,7 +706,7 @@ With `--json` a command prints one JSON object; the shapes are in the contract (
 
 | Subcommand | What it does |
 |---|---|
-| `feature add "<title>"` | Creates the Feature, the feature branch and the spec Task. Flags: `--base <branch>` (default: main), `--change <name>` (default: generated from the title), `--mode remote\|local` (default: detected), `--no-auto-fanout` (do not fan out by itself on Plan approval). In local mode it prints `No GitHub remote: local mode, one machine only` first. |
+| `feature add "<title>"` | Creates the Feature, the feature branch and the spec Task. Flags: `--base <branch>` (default: the branch checked out in the folder, normally main), `--change <name>` (default: generated from the title), `--mode remote\|local` (default: detected), `--no-auto-fanout` (reserved for the automatic fan-out trigger, which is not wired yet). In local mode it prints `No GitHub remote: local mode, one machine only` first. |
 | `feature show <ref>` | The full Feature state: the record, each child's state and its digest. `--on <machine>` reads a Feature on another machine. |
 | `feature list` | Every Feature in the folder. |
 | `feature sync <ref>` | Merges the base branch into the feature branch early, to keep the final merge small. |
@@ -679,13 +718,13 @@ With `--json` a command prints one JSON object; the shapes are in the contract (
 
 | Command | What it does |
 |---|---|
-| `fanout <change>` | Turns an approved work table into Child Tasks and starts them. `--dry-run` creates nothing and prints the plan. `--machines a,b,c` places packages across machines with chain affinity. `--amend` reads an updated table and adds only new rows (and cancels unstarted children of removed rows). `--no-start` creates the Tasks but does not start them. A second run adds only missing children, so it is safe to run again. |
+| `fanout <change>` | Turns an approved work table into Child Tasks and starts them. `--dry-run` creates nothing and prints the plan. `--machines a,b,c` previews a spread across machines with chain affinity in `--dry-run`; a real run creates children on the home machine only (cross-machine creation is a planned follow-up, so a real `--machines` run is refused). `--amend` reads an updated table and adds only new rows (and cancels unstarted children of removed rows). `--no-start` creates the Tasks but does not start them. A second run adds only missing children, so it is safe to run again. |
 | `sync-branch` | A worker runs it in its own worktree before `ready` and when the feature branch moves. It rebases the Task branch onto the feature branch with a backup ref and `rerere`, and refuses before touching the branch if the diff goes outside the owned paths. `--base <feature-branch>` overrides the branch to rebase onto. |
 | `feature-status <ref>` | The states and digests of a Feature's children on one machine. `--on <machine>` reads another machine. The home machine calls it once per machine each tick. |
 | `verify-report (--pass \| --findings-file <file>)` | A Verify Task reports its result. `--feature <ref>` names the Feature when the folder has more than one. |
 | `retro-data <ref>` | The retro JSON for a Feature: every child's digest, plus the check-script and CI state. |
 | `retro <ref>` | Starts a retro for a Feature now, with the retro agent settings. |
-| `flow init` | Prepares a repo: it runs `openspec init`, checks for each Matt Pocock skill at repo level (`.claude/skills`) and user level (`~/.claude/skills`), asks before it copies a missing one (pinned to a source commit, MIT notice kept), and commits the result as a pull request. `--update` moves the pinned skill copies to a newer commit. |
+| `flow init` | Prepares a repo: it runs `openspec init`, checks for each Matt Pocock skill at repo level (`.claude/skills`) and user level (`~/.claude/skills`), asks before it copies a missing one (pinned to a source commit, MIT notice kept), and commits the result on its own branch (`chore/flow-init`). It makes a local branch and commit for you to review; it does not push or open the pull request itself. `--update` moves the pinned skill copies to a newer commit on `chore/flow-init-update`. |
 
 ### New flags on `add` and `list`
 
@@ -731,7 +770,8 @@ The mode is detected when the Feature is created and fixed from then on.
 
 Local mode works on one machine only.
 It refuses to place a Child Task on another machine.
-Remote mode is required for more than one machine, because each child fetches the feature branch from GitHub.
+Remote mode is the one that allows more than one machine, because each child fetches the feature branch from GitHub.
+On main, though, a real `fanout` run creates children on the home machine only in either mode, so more than one machine is a planned follow-up, not yet live (see The commands).
 
 ## The settings
 
@@ -753,19 +793,45 @@ The contract (C1) has the exact keys, values and defaults; `docs/settings.md` sa
 
 Both user interfaces read the same `~/.herdr/shepherdr.json`.
 Risky paths and the owned-paths exempt list are per-space list editors, not per-Task `--set` values.
+The `automatic` value of Retro waits on the scheduler integration that is not wired yet; for now `herdr-task retro <ref>` starts a retro by hand whatever the setting says.
 
 ## How to try the flow
 
 Try it on a small throwaway repo first, never on a repo whose main branch you cannot afford to break.
+The scheduler does not yet drive the flow end to end, so the steps below run it with the commands.
 
-1. Prepare the repo. Run `herdr-task flow init` in it. It runs `openspec init` and checks for the Matt Pocock skills, and it asks before it copies a missing one. It commits the result as a pull request for you to review.
-2. Turn the flow on. Set `flow=openspec` for the space, in Settings (the Tasks page), or for one Feature's spec Task with `--set flow=openspec`.
-3. Create a Feature. Run `herdr-task feature add "<title>"`. It makes the Feature, the feature branch and the spec Task. In a repo with no GitHub remote it says so and uses local mode, one machine only.
-4. Write the plan. The spec worker asks you path A or path B. Path A (`/opsx:explore`, then `/opsx:propose`) suits a change whose shape is clear. Path B (`/grill-with-docs`, then `/to-spec`, then `/opsx:propose`) grounds it first. Either way the change gets a work table in `tasks.md`. The worker cannot say `ready` until `openspec validate` and `fanout --dry-run` both pass.
-5. Approve the plan. Accept the spec Task. That is Plan approval. Once the spec Task merges onto the feature branch, fan-out runs by itself and starts the Child Tasks. To see the plan first without creating anything, run `herdr-task fanout <change> --dry-run`.
-6. Watch it build. The children work in parallel and merge into the feature branch after checks. A Risky Task waits for your Accept. Follow the Feature with `herdr-task feature show <ref>`, or the grouped Feature row in the window and the web app.
-7. Verify and close. A Verify Task runs on the feature branch. Open findings become Fix Tasks, up to the allowed fix rounds. On a clean verify, the Feature closes by itself and opens the pull request (phase `ready`).
-8. Merge. Press Merge feature, or run `herdr-task feature merge <ref>`. The retro runs after the Feature is `done` if `tasks.retro` asks for it.
+1. Prepare the repo.
+   Run `herdr-task flow init` in it.
+   It runs `openspec init` and checks for the Matt Pocock skills, and it asks before it copies a missing one.
+   It leaves a local branch (`chore/flow-init`) with the change committed, for you to review and push.
+2. Turn the flow on.
+   Set `flow=openspec` for the space, in Settings (the Tasks page).
+   The space setting is what reaches the spec Task and every child; a per-Task `--set flow=openspec` on the spec Task alone does not reach the children fan-out creates.
+3. Create a Feature.
+   Run `herdr-task feature add "<title>"`.
+   It makes the Feature, the feature branch and the spec Task.
+   In a repo with no GitHub remote it says so and uses local mode, one machine only.
+4. Write the plan.
+   The spec worker asks you path A or path B.
+   Path A (`/opsx:explore`, then `/opsx:propose`) suits a change whose shape is clear.
+   Path B (`/grill-with-docs`, then `/to-spec`, then `/opsx:propose`) grounds it first.
+   Either way the change gets a work table in `tasks.md`.
+   The worker cannot say `ready` until `openspec validate` and `fanout --dry-run` both pass.
+5. Approve the plan.
+   Accept the spec Task.
+   That is Plan approval, and it moves the Feature to `building`.
+   To see the plan first without creating anything, run `herdr-task fanout <change> --dry-run`.
+6. Fan out.
+   Run `herdr-task fanout <change>` to create the Child Tasks and start them.
+   They work in parallel and merge into the feature branch after checks.
+   A Risky Task waits for your Accept.
+   Follow the Feature with `herdr-task feature show <ref>`, or the grouped Feature row in the window and the web app.
+7. Verify.
+   Add a Verify Task for the feature branch, which runs `/opsx:verify` and reports with `herdr-task verify-report`.
+   Open findings become Fix Tasks, up to the allowed fix rounds.
+8. Close and merge.
+   The closing steps and the move to `ready` are tick-driven and not reachable by a command yet, so this last stretch is not runnable end to end on main.
+   When it lands, you will press Merge feature (or run `herdr-task feature merge <ref>`), and run `herdr-task retro <ref>` for the retro.
 
 To scale up, raise Tasks at once for the space, and ramp the number of parallel agents in steps (10, 25, then 50), measuring at each step.
 See [docs/develop.md](develop.md) for how to run the checks.
