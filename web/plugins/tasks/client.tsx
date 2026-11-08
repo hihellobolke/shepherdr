@@ -9,6 +9,7 @@ import clsx from 'clsx'
 import { openAccept, useAccepting } from '@client/screens/Accept.tsx'
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent, type ReactNode } from 'react'
 import {
+  act,
   archivedIn,
   bySpace,
   definePlugin,
@@ -80,7 +81,8 @@ import {
   XIcon,
   field,
 } from '@client/ui.tsx'
-import { doneNewestFirst, machineName, type Automation, type Place, type Snapshot, type Task } from '@shared/types.ts'
+import { doneNewestFirst, machineName, type Automation, type Feature, type FeatureAction, type Place, type Snapshot, type Task } from '@shared/types.ts'
+import { featureGroups, type FeatureGroup } from '@client/groups.ts'
 import { useFlip } from '@client/motion.ts'
 import { RowMenu, useRowMenu, type RowMenuState } from '@client/rowmenu.tsx'
 import * as MN from '@core/menus.js'
@@ -456,6 +458,80 @@ function AutoRow({ a, where, from }: { a: Automation; where?: string; from?: str
   )
 }
 
+/** A Feature's action (core/features.js FEATURE_ACTIONS): Merge feature (phase ready) or Add a fix round (open findings
+ *  after the allowed rounds). It runs the matching herdr-task command through the service (service/actions.ts); a busy
+ *  guard stops a double press, and a refusal shows under the heading. Sits over the fold button, so a press never folds. */
+function FeatureActionButton({ feature, action, onError }: { feature: Feature; action: FeatureAction; onError: (msg: string | null) => void }) {
+  const [busy, setBusy] = useState(false)
+  const run = async () => {
+    setBusy(true)
+    onError(null)
+    try {
+      await act({ type: action.id === 'feature-fix-round' ? 'feature-fix-round' : 'feature-merge', feature: feature.ref, folder: feature.folder, machine: feature.machine })
+    } catch (e) {
+      onError((e as Error)?.message || `Couldn't ${action.label.toLowerCase()}.`)
+      setBusy(false)
+    }
+  }
+  return (
+    <button type="button" disabled={busy} onClick={run}
+      className="press-dim relative z-1 h-6 shrink-0 rounded-full bg-bubble px-2.5 text-[0.75rem] font-medium whitespace-nowrap text-fg enabled:hover:bg-sel disabled:opacity-60 phone:px-3 phone:text-[0.8125rem]">
+      {busy ? `${action.label}…` : action.label}
+    </button>
+  )
+}
+
+/** A Feature group (proposal section 6.17): one summary row for the Feature - its ref and title, then a quiet second
+ *  line with the phase, how many children merged of the total and the open verify findings (all three always shown,
+ *  from core/features.js, carried on the snapshot Feature), a red dot when it needs you, and its two actions at the end -
+ *  with its child Tasks nested under it. It folds like any group's heading. `note`: its machine and space, as far as
+ *  more than one shown Feature's does. `order`: the on-screen rows, for the keyboard's cursor. */
+function FeatureGroupBlock({ feature, tasks, note, order, listKey, shut, first }: {
+  feature: Feature; tasks: Task[]; note?: string; order: Task[]; listKey: string; shut: boolean; first: boolean
+}) {
+  const [error, setError] = useState<string | null>(null)
+  const key = `feat:${feature.machine ?? ''}:${feature.folder}:${feature.id}`
+  const Chevron = shut ? NextIcon : DownIcon
+  // the second line, all three of section 6.17 in plain words, shown even at zero so a Feature with no children still reads
+  const bits = `${feature.phaseLabel} · ${feature.merged}/${feature.total} merged · ${feature.findings} finding${feature.findings === 1 ? '' : 's'}`
+  return (
+    <div data-flip={key} data-heading={feature.ref} className={clsx('px-1.5 phone:px-2', first ? 'pt-1.5' : 'pt-3')}>
+      <div className="flex min-h-11 w-full items-center gap-2 rounded-row px-1 phone:px-2">
+        {/* the heading folds the Feature's tasks away; Alt/Option takes no siblings (a Feature stands on its own) */}
+        <button type="button" aria-expanded={!shut} aria-label={`${feature.ref} ${feature.title}, ${bits}${note ? `, ${note}` : ''}`}
+          onClick={() => toggleShut(listKey, key)}
+          className="press group/h flex min-h-11 min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-row px-1 text-left outline-none select-none hover:bg-hover keys:focus-visible:shadow-[inset_0_0_0_1.5px_var(--color-focus)]">
+          <Chevron aria-hidden className={clsx(ic, 'shrink-0 text-fg3 group-hover/h:text-fg')} />
+          <span className="flex min-w-0 flex-1 flex-col gap-0.5 py-1.5">
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0 font-mono text-[0.6875rem] text-fg3 phone:text-[0.75rem]">{feature.ref}</span>
+              <span className="min-w-0 truncate text-[0.875rem]/5 font-medium text-fg phone:text-base/6">{feature.title}</span>
+              {feature.attention ? <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-need" /> : null}
+            </span>
+            <span className="flex min-w-0 items-center gap-1.5 text-[0.75rem]/4 text-fg2 phone:text-[0.8125rem]/5">
+              <span className="min-w-0 truncate">{bits}</span>
+              {note ? <span className="shrink-0 text-fg3">· {note}</span> : null}
+            </span>
+          </span>
+        </button>
+        {feature.actions.length ? (
+          <span className="flex shrink-0 items-center gap-1.5">
+            {feature.actions.map((a) => <FeatureActionButton key={a.id} feature={feature} action={a} onError={setError} />)}
+          </span>
+        ) : null}
+      </div>
+      {error ? <p role="alert" className="w-0 min-w-full px-3 pt-1 pb-0.5 text-[0.75rem]/4 text-need-fg phone:px-4 phone:text-[0.8125rem]/5">{error}</p> : null}
+      {shut ? null : tasks.length ? (
+        <List>
+          {tasks.map((t) => <TaskRow key={t.id} t={t} ix={order.indexOf(t)} where={[]} />)}
+        </List>
+      ) : (
+        <p className="px-3 pb-1 pl-9 text-[0.75rem] text-fg3 phone:pl-10 phone:text-[0.8125rem]">{feature.total ? 'Its tasks are pinned, done or need you.' : 'No child tasks yet.'}</p>
+      )}
+    </div>
+  )
+}
+
 function TaskList(_: { placeId: string }) {
   const snap = useSnap()!
   const view = useStore((s) => listView(s.ui, snap))
@@ -510,23 +586,44 @@ function TaskList(_: { placeId: string }) {
       </>
     )
   }
+  // OpenSpec flow (proposal section 6.17): group each folder's Features, their child Tasks nested under one summary row.
+  // A Feature shows when it has a child in view, or (searching) when it or a child matches. Its children are then pulled
+  // out of the status, space and machine groups below (baseSnap), but a pinned or needs-you child stays cross-cutting in
+  // Pinned and Needs you, so no Task shows twice. A classic space has no Features, so feats is empty and the list is
+  // unchanged. Scoping is by folder and machine (groups.ts featureChildren), since a Feature id repeats across stores.
+  const feats = featureGroups(snap.features ?? [], live, snap.host, (f) => !!q && matches(q, f.ref, f.title, f.phaseLabel))
+  const underFeature = new Set(feats.flatMap((g) => g.tasks.map((t) => t.id)))
+  // a Feature heading names its machine and space only as far as more than one shown Feature contributes each
+  const multiFeatMachine = new Set(feats.map((g) => g.feature.machine ?? snap.host)).size > 1
+  const multiFeatSpace = new Set(feats.map((g) => `${g.feature.machine ?? ''}:${g.feature.folder}`)).size > 1
+  const featNote = (g: FeatureGroup) => {
+    const m = multiFeatMachine ? machineName(snap.machines, g.feature.machine ?? snap.host) : null
+    const sp = multiFeatSpace ? g.tasks[0]?.listName ?? g.feature.folder.split('/').filter(Boolean).pop() ?? '' : null
+    return [m, sp].filter(Boolean).join(' · ') || undefined
+  }
+  const featShut = (g: FeatureGroup) => !q && shut.includes(`${key}|feat:${g.feature.machine ?? ''}:${g.feature.folder}:${g.feature.id}`)
+  // the status/space/machine groups are built from the Tasks that are not nested under a Feature
+  const baseSnap = underFeature.size ? { ...snap, tasks: snap.tasks.filter((t) => !underFeature.has(t.id)) } : snap
   // searching, Done and archived tasks are in it too, each group whole and open, folded shut or not
   let groups = q
-    ? filteredGroups(snap, view, '', { groups: chosen }).map((g) => keepTasks(g, (t) => found(snap, t, q))).filter((g) => g.tasks.length)
+    ? filteredGroups(baseSnap, view, '', { groups: chosen }).map((g) => keepTasks(g, (t) => found(baseSnap, t, q))).filter((g) => g.tasks.length)
       .map((g) => ({ ...g, count: g.tasks.length, more: 0, less: false, shut: false }))
-    : shownGroups(snap, view, { groups: chosen, allDone, shut })
+    : shownGroups(baseSnap, view, { groups: chosen, allDone, shut })
   // Needs you holds what agents ask too: a group of its own after Pinned when no task needs you
   if (asks.length && !groups.some((g) => g.key === 'need')) {
     const at = groups[0]?.key === 'pinned' ? 1 : 0
     groups = [...groups.slice(0, at), { key: 'need', label: 'Needs you', tasks: [], names: namesFor(view.level), count: 0, more: 0, less: false, shut: !q && shut.includes(`${key}|need`) }, ...groups.slice(at)]
   }
-  // what the keyboard walks: the rows on screen
-  const order = groups.flatMap((g) => g.tasks)
-  const machines = [...new Set(groups.flatMap((g) => (g.machine ? [g.machine.id] : [])))]
-  const machineShut = (id: string) => !q && shut.includes(`${key}|m:${id}`)
-  const nothing = !groups.length && !autos.length
   // searching, the archived tasks that match come last, after the automations
   const archivedGroup = groups.find((g) => g.key === 'archived')
+  // the cross-cutting groups (Pinned, Needs you) stay at the top; the Feature rows come after them; then the rest
+  const crossGroups = groups.filter((g) => g.key === 'pinned' || g.key === 'need')
+  const restGroups = groups.filter((g) => g !== archivedGroup && g.key !== 'pinned' && g.key !== 'need')
+  // what the keyboard walks: the rows on screen, in the order they show (Pinned, Needs you, Features, then the rest)
+  const order = [...crossGroups.flatMap((g) => g.tasks), ...feats.flatMap((g) => (featShut(g) ? [] : g.tasks)), ...restGroups.flatMap((g) => g.tasks)]
+  const machines = [...new Set(groups.flatMap((g) => (g.machine ? [g.machine.id] : [])))]
+  const machineShut = (id: string) => !q && shut.includes(`${key}|m:${id}`)
+  const nothing = !groups.length && !feats.length && !autos.length
   const autoShut = !q && shut.includes(`${key}|automations`)
   const autoRow = (a: Automation, bare = false) => <AutoRow key={`${a.machine ?? ''}:${a.listName}:${a.name}`} a={a} where={bare ? undefined : autoWhere(snap, a)} from={autoFrom(snap, a)} />
   // Split by space: the automations per machine · space too, as a status's tasks
@@ -553,6 +650,71 @@ function TaskList(_: { placeId: string }) {
       )}
     </div>
   ) : null
+  // a run of groups (the cross-cutting ones, then the rest after the Feature rows): each with its Machine › Space
+  // heading, its fold and its rows, as before. `gs` is the run it belongs to, so a machine heading counts within it.
+  const renderGroups = (gs: typeof groups) => gs.flatMap((g, i) => {
+    // Machine › Space: a machine's name over its groups, once, with how many tasks they hold
+    const m = g.machine
+    const head =
+      m && m.id !== gs[i - 1]?.machine?.id ? (
+        <MachineHeading
+          key={`machine:${m.id}`}
+          name={m.name}
+          first={!i}
+          count={gs.filter((x) => x.machine?.id === m.id).reduce((n, x) => n + x.count, 0)}
+          fold={q ? undefined : { shut: machineShut(m.id), toggle: (all) => toggleShut(key, `m:${m.id}`, all ? machines.filter((x) => x !== m.id).map((x) => `m:${x}`) : []) }}
+        />
+      ) : null
+    if (m && machineShut(m.id)) return [head]
+    const siblings = () => gs.filter((x) => x !== g && x.machine?.id === m?.id).map((x) => x.key)
+    const fold: Fold | undefined = q ? undefined : { shut: g.shut, toggle: (all) => toggleShut(key, g.key, all ? siblings() : []) }
+    const extra = g.key === 'need' ? asks : []
+    return [
+      head,
+      <div key={g.key}>
+        {g.kind === 'machine' ? (
+          <MachineHeading name={g.label} first={!i} count={g.count} fold={fold} />
+        ) : (
+          <GroupHeading label={g.label} note={g.note} count={g.count + extra.length} flip={`group:${g.key}`} fold={fold} />
+        )}
+        {g.shut ? null : g.subs ? (
+          // Split by space: a light heading per machine · space, its rows saying no more where they are
+          g.subs.map((s, j) => {
+            const k = `${g.key}/${s.key}`
+            const others = () => g.subs!.filter((x) => x !== s).map((x) => `${g.key}/${x.key}`)
+            return (
+              <div key={k}>
+                <SubHeading sub={s} count={s.count ?? s.tasks.length} first={!j} flip={`sub:${k}`}
+                  fold={q ? undefined : { shut: !!s.shut, toggle: (all) => toggleShut(key, k, all ? others() : []) }} />
+                {s.shut ? null : (
+                  <List>
+                    {s.tasks.map((t) => <TaskRow key={t.id} t={t} ix={order.indexOf(t)} where={[]} />)}
+                  </List>
+                )}
+                {s.more || s.less ? (
+                  <div data-flip={`more:${k}`}>
+                    <DoneToggle more={s.more ?? 0} onClick={() => toggleAllDone(key, k)} />
+                  </div>
+                ) : null}
+              </div>
+            )
+          })
+        ) : (
+          <List>
+            {g.tasks.map((t) => (
+              <TaskRow key={t.id} t={t} ix={order.indexOf(t)} where={whereOf(snap, t, g.names)} />
+            ))}
+            {extra.map((n) => <AgentNeedRow key={n.id} n={n} listKey={key} />)}
+          </List>
+        )}
+        {g.more || g.less ? (
+          <div data-flip={`more:${g.key}`}>
+            <DoneToggle more={g.more} onClick={() => toggleAllDone(key, g.key)} />
+          </div>
+        ) : null}
+      </div>,
+    ]
+  })
   return (
     <>
       <TaskFilter listKey={view.search} order={order} />
@@ -560,69 +722,13 @@ function TaskList(_: { placeId: string }) {
       <StatusFilters counts={counts} filter="all" />
       <div ref={list} className="relative">
         {!loaded ? <Empty className="pt-3 text-fg3">Reading tasks…</Empty> : null}
-        {groups.filter((g) => g !== archivedGroup).flatMap((g, i) => {
-          // Machine › Space: a machine's name over its groups, once, with how many tasks they hold
-          const m = g.machine
-          const head =
-            m && m.id !== groups[i - 1]?.machine?.id ? (
-              <MachineHeading
-                key={`machine:${m.id}`}
-                name={m.name}
-                first={!i}
-                count={groups.filter((x) => x.machine?.id === m.id).reduce((n, x) => n + x.count, 0)}
-                fold={q ? undefined : { shut: machineShut(m.id), toggle: (all) => toggleShut(key, `m:${m.id}`, all ? machines.filter((x) => x !== m.id).map((x) => `m:${x}`) : []) }}
-              />
-            ) : null
-          if (m && machineShut(m.id)) return [head]
-          const siblings = () => groups.filter((x) => x !== g && x.machine?.id === m?.id).map((x) => x.key)
-          const fold: Fold | undefined = q ? undefined : { shut: g.shut, toggle: (all) => toggleShut(key, g.key, all ? siblings() : []) }
-          const extra = g.key === 'need' ? asks : []
-          return [
-            head,
-            <div key={g.key}>
-              {g.kind === 'machine' ? (
-                <MachineHeading name={g.label} first={!i} count={g.count} fold={fold} />
-              ) : (
-                <GroupHeading label={g.label} note={g.note} count={g.count + extra.length} flip={`group:${g.key}`} fold={fold} />
-              )}
-              {g.shut ? null : g.subs ? (
-                // Split by space: a light heading per machine · space, its rows saying no more where they are
-                g.subs.map((s, j) => {
-                  const k = `${g.key}/${s.key}`
-                  const others = () => g.subs!.filter((x) => x !== s).map((x) => `${g.key}/${x.key}`)
-                  return (
-                    <div key={k}>
-                      <SubHeading sub={s} count={s.count ?? s.tasks.length} first={!j} flip={`sub:${k}`}
-                        fold={q ? undefined : { shut: !!s.shut, toggle: (all) => toggleShut(key, k, all ? others() : []) }} />
-                      {s.shut ? null : (
-                        <List>
-                          {s.tasks.map((t) => <TaskRow key={t.id} t={t} ix={order.indexOf(t)} where={[]} />)}
-                        </List>
-                      )}
-                      {s.more || s.less ? (
-                        <div data-flip={`more:${k}`}>
-                          <DoneToggle more={s.more ?? 0} onClick={() => toggleAllDone(key, k)} />
-                        </div>
-                      ) : null}
-                    </div>
-                  )
-                })
-              ) : (
-                <List>
-                  {g.tasks.map((t) => (
-                    <TaskRow key={t.id} t={t} ix={order.indexOf(t)} where={whereOf(snap, t, g.names)} />
-                  ))}
-                  {extra.map((n) => <AgentNeedRow key={n.id} n={n} listKey={key} />)}
-                </List>
-              )}
-              {g.more || g.less ? (
-                <div data-flip={`more:${g.key}`}>
-                  <DoneToggle more={g.more} onClick={() => toggleAllDone(key, g.key)} />
-                </div>
-              ) : null}
-            </div>,
-          ]
-        })}
+        {/* Pinned and Needs you first, then each Feature as one grouped row (proposal 6.17), then the rest */}
+        {renderGroups(crossGroups)}
+        {feats.map((g, i) => (
+          <FeatureGroupBlock key={`feat:${g.feature.machine ?? ''}:${g.feature.folder}:${g.feature.id}`}
+            feature={g.feature} tasks={g.tasks} note={featNote(g)} order={order} listKey={key} shut={featShut(g)} first={!crossGroups.length && !i} />
+        ))}
+        {renderGroups(restGroups)}
         {/* Automations: their own group, last */}
         {autoGroup}
         {/* nothing at all: said once, never "yet" (3.0's) */}
@@ -635,7 +741,7 @@ function TaskList(_: { placeId: string }) {
             </List>
           </div>
         ) : null}
-        {q && !groups.length && !autos.length ? <Empty className="pt-3 text-fg3">No tasks match “{q}”.</Empty> : null}
+        {q && !groups.length && !feats.length && !autos.length ? <Empty className="pt-3 text-fg3">No tasks match “{q}”.</Empty> : null}
         {footer}
       </div>
     </>
