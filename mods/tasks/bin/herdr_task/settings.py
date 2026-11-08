@@ -21,9 +21,14 @@ SETTINGS = os.environ.get("HERDR_TASK_SETTINGS") or os.path.join(HOME, ".herdr",
 TEMPLATES = os.environ.get("HERDR_TASK_TEMPLATES") or os.path.join(HOME, ".config", "herdr-core", "templates")
 OLD_INSTRUCTIONS = os.path.join(HOME, ".herdr", "instructions")
 ASSISTANT_TEMPLATES = ("assistant", "coordinator")  # "coordinator": Assistants started before the rename
+# The OpenSpec flow settings (docs/openspec-flow.md contract C1) live under "tasks" too, except the
+# retro agent, which is a role section of its own ("retro"), next to worker and reviewer. Each
+# defaults to off or to the safe value, so a space with flow "classic" behaves exactly as before.
 DEFAULTS = {"tasks": {"merge": "ask", "review_rounds": 0, "must_fix": "major", "max_running": MAX_RUNNING, "worktrees": True,
-                      "start_notes": "", "finish_notes": "", "archive_after": 7, "proof": True, "base": "", "branch": ""},
-            "automations": {"enabled": True}, "worker": {}, "reviewer": {}, "coordinator": {}, "backup": {},
+                      "start_notes": "", "finish_notes": "", "archive_after": 7, "proof": True, "base": "", "branch": "",
+                      "flow": "classic", "verify_rounds": 2, "risky_paths": [], "owns_exempt": [], "retro": "off",
+                      "retro_prompt": "built-in", "retro_save": "outside", "may_change": []},
+            "automations": {"enabled": True}, "worker": {}, "reviewer": {}, "retro": {}, "coordinator": {}, "backup": {},
             "agents": {"reactions": True, "feedback": True, "feedback_repo": "eliasstravik/shepherdr"}}
 LEVELS = ["blocker", "major", "minor"]
 
@@ -249,13 +254,20 @@ MERGE_WORDS = {"ask": "ask the person first: they accept it in the Tasks panel, 
                "checks": "after checks: once you say ready, Herdr merges it when its checks pass",
                "auto": "on its own: once you say ready, Herdr merges it"}
 MUST_WORDS = {"blocker": "blocker", "major": "major and up (blocker, major)", "minor": "everything (blocker, major, minor)"}
+# The OpenSpec flow words for the Settings block (contract C1): the Flow line (shown only when the
+# flow is openspec) and the Retro line (shown only when the retro is not off).
+FLOW_WORDS = {"classic": "classic", "openspec": "openspec"}
+RETRO_WORDS = {"off": "off", "ask": "ask me", "automatic": "automatic"}
 # --set's keys (Shepherdr's spellings too) and the task fields they set.
 SET_KEYS = {"review": "review", "brief.review": "review", "merge": "merge", "brief.merge": "merge",
             "rounds": "review_rounds", "review.rounds": "review_rounds", "review-rounds": "review_rounds", "review_rounds": "review_rounds",
             "mustfix": "must_fix", "must-fix": "must_fix", "must_fix": "must_fix", "review.mustfix": "must_fix",
             "agent": "agent", "task.agent": "agent", "model": "model", "task.model": "model", "effort": "effort", "task.effort": "effort",
             "reviewer": "reviewer", "reviewer.agent": "reviewer", "reviewer.model": "reviewer_model", "reviewer.effort": "reviewer_effort",
-            "proof": "proof", "brief.proof": "proof"}
+            "proof": "proof", "brief.proof": "proof",
+            "flow": "flow", "brief.flow": "flow",
+            "verify.rounds": "verify_rounds", "verify-rounds": "verify_rounds", "verify_rounds": "verify_rounds",
+            "retro": "retro"}
 # The Proof line (as Shepherdr's skill asks of its task agents), on and off.
 PROOF_WORDS = {"on": "show verifiable proof in one recipe artifact: each proof with a one-line caption, real and from this work now, "
                      "plus a \"Not proven\" list; then say ready with --proof <its id>",
@@ -273,7 +285,8 @@ def set_task(t, key, value):
     """One --set key=value (or flag) on task t; an empty value or "default" goes back to Settings'."""
     field = SET_KEYS.get(key.strip().lower())
     if not field:
-        raise Fail(f"--set takes review, review.rounds, review.mustFix, merge, proof, agent, model, effort or reviewer settings, not {key!r}.")
+        raise Fail(f"--set takes review, review.rounds, review.mustFix, merge, proof, flow, verify.rounds, retro, "
+                   f"agent, model, effort or reviewer settings, not {key!r}.")
     v = value.strip().strip("\"'").strip()
     sets = t.setdefault("set", {})
     if not v or v.lower() == "default":
@@ -300,6 +313,19 @@ def set_task(t, key, value):
         if low not in MERGE_VALUES:
             raise Fail('merge is "on its own", "after checks" or "ask me first".')
         sets[field] = MERGE_VALUES[low]
+    elif field == "flow":
+        if low not in FLOW_WORDS:
+            raise Fail("flow is classic or openspec.")
+        sets[field] = low
+    elif field == "verify_rounds":
+        m = re.fullmatch(r"(\d+)\s*(rounds?)?", low)
+        if not m or not 1 <= int(m.group(1)) <= 5:
+            raise Fail("verify.rounds is 1 to 5.")
+        sets[field] = int(m.group(1))
+    elif field == "retro":
+        if low not in RETRO_WORDS:
+            raise Fail("retro is off, ask or automatic.")
+        sets[field] = low
     else:
         # Agents, models and efforts are the task's own fields (worker_pick reads them).
         if field in ("effort", "reviewer_effort") and low not in EFFORTS:
@@ -351,6 +377,12 @@ def task_settings(s, t, space=None, argv=None):
     def add(label, text, value, by):
         lines.append({"label": label, "text": text, "value": value, "by": by})
 
+    # The Flow line (contract C1): only when the flow is openspec. A classic brief adds nothing, so
+    # it stays byte for byte the same as before.
+    flow = sets.get("flow") or (k.get("flow") if k.get("flow") in FLOW_WORDS else "classic")
+    if flow != "classic":
+        add("Flow", FLOW_WORDS[flow], flow,
+            "task" if "flow" in sets else by_layer(s, space, "tasks", "flow", flow, "classic"))
     rounds_cfg = int(k.get("review_rounds") or 0)
     if "review" in sets:
         on, rev_by = sets["review"] == "on", "task"
@@ -395,6 +427,11 @@ def task_settings(s, t, space=None, argv=None):
     proof = sets["proof"] == "on" if "proof" in sets else k.get("proof") is not False
     add("Proof", PROOF_WORDS["on" if proof else "off"], proof,
         "task" if "proof" in sets else by_layer(s, space, "tasks", "proof", proof, True))
+    # The Retro line (contract C1): only when the retro is not off. Off adds nothing.
+    retro = sets.get("retro") or (k.get("retro") if k.get("retro") in RETRO_WORDS else "off")
+    if retro != "off":
+        add("Retro", RETRO_WORDS[retro], retro,
+            "task" if "retro" in sets else by_layer(s, space, "tasks", "retro", retro, "off"))
     model, effort = argv_model(argv)
     text = agent + (f", model {model}" if model else "") + (f", effort {effort}" if effort else "")
     a_by = "task" if any(t.get(f) for f in ("agent", "model", "effort")) else \

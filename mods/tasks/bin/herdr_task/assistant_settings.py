@@ -13,7 +13,7 @@ import os
 import sys
 
 from .base import addon_off, hc_json, MAX_RUNNING, now, run, STORE
-from .settings import DEFAULTS, LOCAL_MACHINE, MUST_WORDS, SETTINGS, agent_key, bare, read_settings
+from .settings import DEFAULTS, FLOW_WORDS, LOCAL_MACHINE, MUST_WORDS, RETRO_WORDS, SETTINGS, agent_key, bare, read_settings
 from .launch import coordinators, is_coordinator
 from . import reactions
 
@@ -29,6 +29,12 @@ MERGE_SHORT = {"ask": "ask the person first (they accept it in the Tasks panel, 
                "auto": "on its own (Herdr merges a ready task)"}
 BY = {"space": "set for this space", "machine": "this machine's setting", "everywhere": "your setting everywhere"}
 NOTICE_END = "Nothing to answer: reply only <hc no-reply/>."
+# The OpenSpec flow facts, in the Assistant's own descriptive style (the same facts as the Settings
+# block's Flow and Retro lines). Both rows show only when the setting is not its default, so a space
+# that stays on the classic flow with retro off keeps the block byte for byte as before.
+FLOW_WORDS_ASSIST = {"classic": "classic", "openspec": "openspec (Features: a spec worker, fan-out to children, verify, then close)"}
+RETRO_WORDS_ASSIST = {"off": "off", "ask": "ask me (I ask before a retro runs after a Feature is done)",
+                      "automatic": "automatic (a retro runs by itself after a Feature is done)"}
 
 
 def space_of(k):
@@ -104,7 +110,7 @@ def rows(space, d=None, auto=None):
         offering = (cfg.get("agents") or {}).get("feedback") is not False
         from .feedback import feedback_repo
         repo = feedback_repo(d)
-        return [
+        out = [
             ("review", "Review", review, "on" if rounds > 0 else "off",
              [("tasks", "review_rounds"), ("tasks", "must_fix"), ("reviewer", None)]),
             ("merge", "Merge", MERGE_SHORT[merge], merge, [("tasks", "merge")]),
@@ -129,6 +135,14 @@ def rows(space, d=None, auto=None):
              if offering else "off (never offer feedback for Shepherdr; file nothing)", "on" if offering else "off",
              [("agents", "feedback"), ("agents", "feedback_repo")]),
         ]
+        # The Flow and Retro facts, each shown only when it is not its default (contract C1).
+        flow = t.get("flow") if t.get("flow") in FLOW_WORDS else "classic"
+        if flow != "classic":
+            out.append(("flow", "Flow", FLOW_WORDS_ASSIST[flow], flow, [("tasks", "flow")]))
+        retro = t.get("retro") if t.get("retro") in RETRO_WORDS else "off"
+        if retro != "off":
+            out.append(("retro", "Retro", RETRO_WORDS_ASSIST[retro], retro, [("tasks", "retro")]))
+        return out
     have = lines(resolve(ls), (on, every, direction))
     default = {x[0]: x[2] for x in lines(resolve([]), (False, every, ""))}
     out = []
@@ -140,7 +154,7 @@ def rows(space, d=None, auto=None):
                        for sec, f in parts)
         setters = [name for name, layer in ls if sets(layer)]
         scope = setters[-1] if setters else "everywhere"
-        by = setters[-1] if setters and text != default[key] else None
+        by = setters[-1] if setters and text != default.get(key) else None
         out.append({"key": key, "label": label, "text": text, "value": value, "by": by, "scope": scope})
     return out
 
