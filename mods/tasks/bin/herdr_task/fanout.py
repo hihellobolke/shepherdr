@@ -140,23 +140,26 @@ def run(s, change, machines=None, amend=False, start=True):
     feature = _feature_for(s, change)
 
     cancelled = _amend_cancel(s, feature, p["packages"]) if amend else []
+    if amend:
+        _amend_reconcile_risk(s, feature, p["packages"])
 
     existing = _children_by_rows(feature)
     # Only a package that still has to be created can be refused for its placement; a child already on
     # another machine (its machine preserved in the plan) is left alone, not re-refused.
     _refuse_remote_creation([pkg for pkg in p["packages"] if frozenset(pkg["rows"]) not in existing])
+    space = _spec_space(s, feature)
     created = 0
     queued_at = now()
     for entry in p["packages"]:
         if frozenset(entry["rows"]) in existing:
             continue
-        _create_child(s, feature, entry, start, queued_at)
+        _create_child(s, feature, entry, space, start, queued_at)
         existing = _children_by_rows(feature)  # so a later package sees this one as a dependency
         created += 1
         queued_at += 1
 
     _link_home_children(s, feature, p["packages"])
-    verify_made = _ensure_verify(s, feature, change, start, queued_at)
+    verify_made = _ensure_verify(s, feature, change, space, start, queued_at)
     s.dirty = True
 
     p["created"] = {"children": created, "verify": 1 if verify_made else 0}
@@ -497,7 +500,14 @@ def _refuse_remote_creation(packages):
             f"--machines {','.join(machines)}`, or run without --machines.")
 
 
-def _create_child(s, feature, entry, start, queued_at):
+def _spec_space(s, feature):
+    """The space the Feature's children run in: the spec Task's space (set when it ran). A child with no
+    space makes the queue fall back to the default space, which can be the wrong one, so carry it."""
+    spec = s.task_by_id(feature.get("spec_task")) if feature.get("spec_task") else None
+    return spec.get("space") if spec else None
+
+
+def _create_child(s, feature, entry, space, start, queued_at):
     """Create one child Task for a work package (contract C2 fields) on this machine, and record it on
     the Feature's `children` list. The child's after links are set later by `_link_home_children`, once
     every package it depends on exists. A real run never reaches this with a remote placement
@@ -517,6 +527,8 @@ def _create_child(s, feature, entry, start, queued_at):
     t["branch"] = entry["branch"]
     t["base"], t["base_set"] = feature["branch"], True
     set_task(t, "merge", entry["merge"])
+    if space:
+        t["queue"] = {"space": space}  # the space the queue starts it in (the spec Task's)
     if start:
         t["state"], t["queued_at"] = "queued", queued_at
     feature.setdefault("children", []).append(
@@ -596,7 +608,7 @@ def _link_home_children(s, feature, packages):
             set_after(s, t, hid, ext)
 
 
-def _ensure_verify(s, feature, change, start, queued_at):
+def _ensure_verify(s, feature, change, space, start, queued_at):
     """Create the first Verify Task (role verify) that waits for every child, or reconcile the existing
     one's after with the current children (new ones added, cancelled ones dropped). Returns True when a
     Verify Task was created. The Verify Task waits for children on every machine, not only the home
@@ -618,6 +630,8 @@ def _ensure_verify(s, feature, change, start, queued_at):
     )
     t["branch"] = f"task/{s.ref(feature)}-{s.ref(t)}-verify"
     t["base"], t["base_set"] = feature["branch"], True
+    if space:
+        t["queue"] = {"space": space}
     if home_ids or ext:
         set_after(s, t, home_ids, ext)
     if start:
@@ -652,6 +666,9 @@ def _amend_warnings(s, feature, packages):
         if pkg and t and sorted(t.get("owns") or []) != sorted(pkg["owns"]):
             warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed owns to "
                             f"{', '.join(pkg['owns'])}, but child {_ref_of(s, c)} keeps {', '.join(t.get('owns') or [])}")
+        if pkg and t and _started(t) and pkg["risk"] != t.get("risk"):
+            warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed risk to {pkg['risk']}, "
+                            f"but child {_ref_of(s, c)} has started; its merge policy is unchanged")
     return warnings
 
 
@@ -678,9 +695,32 @@ def _amend_cancel(s, feature, packages):
 
 
 def _started(task):
-    """True once a Task has left the queue: it is running, ready, done or past that (not still todo,
-    queued, scheduled or already cancelled)."""
+    """True once a Task has ever begun, so fan-out must not cancel or rewrite it. A Task that ran keeps
+    its `started` time and its worktree even after it is re-queued (resume, cmd_start), so the current
+    state alone is not enough: a re-queued child is state `queued` yet has started. Check the start
+    history, then the state, so a never-started child (todo/queued/scheduled) is the only cancellable
+    one."""
+    if task.get("started") or task.get("worktree"):
+        return True
     return task.get("state") not in ("todo", "queued", "scheduled", "cancelled")
+
+
+def _amend_reconcile_risk(s, feature, packages):
+    """On an amendment, bring an unstarted existing child's risk and merge policy in line with its row
+    (section 6.6, contract C2: a high-risk Task uses merge=ask). A started child is not changed under
+    the person; its change is surfaced as a warning in the plan instead."""
+    pkg_by_rows = {frozenset(pkg["rows"]): pkg for pkg in packages}
+    for c in feature.get("children", []):
+        if c.get("machine"):
+            continue
+        pkg = pkg_by_rows.get(frozenset(c.get("rows") or []))
+        t = s.task_by_id(c["ref"])
+        if not pkg or not t or _started(t):
+            continue
+        if pkg["risk"] != t.get("risk"):
+            t["risk"] = pkg["risk"]
+            set_task(t, "merge", pkg["merge"])
+            s.dirty = True
 
 
 # ---- small helpers --------------------------------------------------------------------------

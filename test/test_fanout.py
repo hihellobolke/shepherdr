@@ -279,6 +279,18 @@ class RunTest(Base):
         self.assertCountEqual(verify["after"], [t["id"] for t in by_rows.values()])
         self.assertEqual(verify["owns"], [])
 
+    def test_children_inherit_the_spec_task_space(self):
+        # Give the spec Task a space; the children and the Verify Task must queue in that space, not the
+        # default one.
+        with st.Store(self.loc) as s:
+            spec = s.task_by_id(s.data["features"][0]["spec_task"])
+            spec["space"] = "vm-demo/sp1"
+            s.dirty = True
+        self.run_fanout()
+        for t in self.read()["tasks"]:
+            if t.get("role") in ("child", "verify"):
+                self.assertEqual((t.get("queue") or {}).get("space"), "vm-demo/sp1")
+
     def test_no_start_leaves_todo(self):
         self.run_fanout(start=False)
         states = {t.get("role"): t["state"] for t in self.read()["tasks"] if t.get("role") in ("child", "verify")}
@@ -340,7 +352,7 @@ class RunTest(Base):
         with st.Store(self.loc) as s:
             feat = s.data["features"][0]
             before = json.loads(json.dumps(s.task_by_id(feat["verify_task"])))
-            made = fanout._ensure_verify(s, feat, self.change, True, 0)  # must not reach vm-b or rewrite
+            made = fanout._ensure_verify(s, feat, self.change, None, True, 0)  # must not reach vm-b or rewrite
         self.assertFalse(made)
         with st.Store(self.loc, write=False) as s:
             self.assertEqual(s.task_by_id(s.data["features"][0]["verify_task"]), before)
@@ -427,6 +439,32 @@ class PlacementTest(Base):
                 fanout.run(s, self.change, machines=["vm-a", "vm-b"])
         self.assertIn("home machine only", str(cm.exception))
         self.assertEqual(self.read()["tasks"], before["tasks"])  # nothing created
+
+
+# ---- inferred dependency from overlapping owns (section 6.7 step 3) ---------------------------
+
+class OverlapTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.make_feature()
+        # 1.1 and 0.1 touch the same place (0.1 owns a file under src/api, 1.1 a glob over it) with no
+        # declared dependency, so fan-out must add one: the later row waits for the earlier.
+        self.write_table(
+            "## Work table\n\n"
+            "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | Base | src/api/base.ts |  | low | S |\n"
+            "| 1.1 | All | src/api/*.ts |  | low | S |\n"
+        )
+
+    def test_overlap_adds_a_dependency_in_the_plan(self):
+        by = {pkg["package"]: pkg for pkg in self.plan()["packages"]}
+        self.assertIn("0.1", by["1.1"]["depends"])  # inferred, though the table declared none
+        self.assertEqual(by["0.1"]["depends"], [])
+
+    def test_overlap_dependency_becomes_an_after_link(self):
+        self.run_fanout()
+        tasks = {tuple(t["rows"]): t for t in self.read()["tasks"] if t.get("role") == "child"}
+        self.assertEqual(tasks[("1.1",)]["after"], [tasks[("0.1",)]["id"]])
 
 
 # ---- local mode refuses other machines (section 6.10) ----------------------------------------
@@ -541,6 +579,36 @@ class AmendTest(Base):
         h_child = next(t for t in tasks if t.get("rows") == ["1.1"])
         self.assertEqual(after[("0.1",)], [h_child["id"]])  # 0.1 now waits for 1.1
         self.assertEqual(after[("1.1",)], [])               # 1.1 waits for nothing
+
+    def test_risk_escalation_reaches_an_unstarted_child(self):
+        # An amendment that raises a row to high risk must make its unstarted child merge=ask (C2).
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | high | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+        )
+        self.run_fanout(amend=True)
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertEqual(child["risk"], "high")
+        self.assertEqual(child["set"]["merge"], "ask")
+
+    def test_started_child_is_not_cancelled_even_if_requeued(self):
+        # A child that ran and was re-queued (state queued, but with a start history) must not be
+        # cancelled by an amendment that drops its row; it is kept with a warning.
+        with st.Store(self.loc) as s:
+            t = next(t for t in s.data["tasks"] if t.get("rows") == ["1.1"])
+            t["state"], t["started"], t["worktree"] = "queued", 1700000000000, "/tmp/wt"
+            s.dirty = True
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        rows = {tuple(c["rows"]) for c in self.read()["features"][0]["children"]}
+        self.assertIn(("1.1",), rows)  # kept, not cancelled
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertNotEqual(child["state"], "cancelled")
+        self.assertTrue(any("1.1" in w for w in r["warnings"]))
 
     def test_changed_owns_of_existing_child_warns(self):
         # Keep row 1.1 but change its owned paths. The running child keeps its owns; a warning names it.
