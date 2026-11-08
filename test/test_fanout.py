@@ -644,6 +644,21 @@ class RiskyPathTest(Base):
         self.assertIn("risky path", pkg["risk_reason"])
         self.assertEqual(pkg["merge"], "ask")
 
+    def test_risky_paths_are_read_for_the_feature_space(self):
+        # The risky path is set in the space the children run in (the spec Task's). Risk classification
+        # must read that space's setting, not another space's.
+        with st.Store(self.loc) as s:
+            s.task_by_id(s.data["features"][0]["spec_task"])["space"] = "sp1"
+            s.dirty = True
+        folder = self.loc["folder"]
+        with open(settings_mod.SETTINGS, "w") as f:
+            json.dump({"spaces": {"sp1": {"folder": folder, "tasks": {"risky_paths": ["config/*.json"]}},
+                                  "other": {"folder": "/some/other/folder", "tasks": {"risky_paths": ["nowhere/*"]}}}}, f)
+        self.addCleanup(lambda: os.path.exists(settings_mod.SETTINGS) and os.remove(settings_mod.SETTINGS))
+        pkg = self.plan()["packages"][0]
+        self.assertEqual(pkg["risk"], "high")  # the feature-space risky path applied
+        self.assertEqual(pkg["merge"], "ask")
+
 
 # ---- the openspec validate plan guard (C7/C8) ------------------------------------------------
 

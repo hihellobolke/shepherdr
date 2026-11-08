@@ -37,6 +37,7 @@ wave tasks build in parallel.
 import json
 import os
 import re
+import shlex
 
 from .base import Fail, git, now, run as run_cmd
 from .settings import set_task, settings_for
@@ -76,7 +77,7 @@ def plan(s, change, machines=None, amend=False, folder=None):
     worktable.add_overlap_links(rows)
     waves = worktable.waves(rows)
     row_order = worktable.order(rows)
-    packages = _packages(rows, waves, row_order, s)
+    packages = _packages(rows, waves, row_order, s, _spec_space(s, feature))
 
     machine_of = _place(packages, machines)
     for pkg in packages:
@@ -242,20 +243,16 @@ def _say_plan(args, p):
 
 
 def _add_flags(feature_ref, pkg):
-    """The exact `add` flags a package becomes (proposal section 6.7 step 10), for the printed plan."""
-    flags = [_q(_child_title({"package": pkg["package"], "rows": pkg["rows"]})), "--worktree",
+    """The exact `add` flags a package becomes (proposal section 6.7 step 10), for the printed plan.
+    Values are shell-quoted so a glob such as `src/*.ts` is safe to paste."""
+    flags = [shlex.quote(_child_title({"package": pkg["package"], "rows": pkg["rows"]})), "--worktree",
              "--feature", feature_ref, "--role", "child",
-             "--owns", _q(",".join(pkg["owns"])), "--risk", pkg["risk"],
-             "--base", _q(pkg["base"]), "--branch", _q(pkg["branch"]),
+             "--owns", shlex.quote(",".join(pkg["owns"])), "--risk", pkg["risk"],
+             "--base", shlex.quote(pkg["base"]), "--branch", shlex.quote(pkg["branch"]),
              "--set", f"merge={pkg['merge']}"]
     if pkg["after"]:
-        flags += ["--after", _q(",".join(pkg["after"]))]
+        flags += ["--after", shlex.quote(",".join(pkg["after"]))]
     return flags
-
-
-def _q(value):
-    """Quote a flag value for the printed plan when it holds a space."""
-    return f'"{value}"' if " " in value else value
 
 
 # ---- the Feature and the work table ---------------------------------------------------------
@@ -293,15 +290,18 @@ def _read_rows(folder, change, branch=None):
 
 # ---- work packages (section 6.7 step 5) -----------------------------------------------------
 
-def _packages(rows, waves, row_order, s):
+def _packages(rows, waves, row_order, s, space):
     """Group the rows into work packages (section 6.7 step 5). A package holds rows of one wave and one
     directory; one row is one package by default (the shape the contract fixtures and the C5 example
     show, and the one that gives the most parallel children, which is the point of the flow). Returns
     the packages in run order (`row_order`), each with its id (the row id), its rows, wave, owns,
-    external row dependencies, risk, risk reason and size."""
+    external row dependencies, risk, risk reason and size.
+
+    `space` is the Feature's space (the children's), so the risky-path setting is read for that space,
+    not the first one that shares the folder; a risky path set in the real space is not missed."""
     wave_of = {rid: depth for depth, ids in enumerate(waves) for rid in ids}
     order_pos = {rid: i for i, rid in enumerate(row_order)}
-    risky = settings_for(s)["tasks"].get("risky_paths") or []
+    risky = settings_for(s, space)["tasks"].get("risky_paths") or []
 
     packages = []
     for r in sorted(rows, key=lambda r: order_pos[r["id"]]):
