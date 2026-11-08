@@ -12,7 +12,7 @@ import * as HC from "../core/host.js";
 import * as APc from "../core/autopilot.js";
 import type { SettingRow, SettingSection } from "../web/shared/types.ts";
 
-const { TASK_ROWS, DEFAULTS, wordFor, valueFor, ROLES: CORE_ROLES, NOTES: CORE_NOTES, ABOUT, BACKUP, REACTIONS, STAR, starState, FEEDBACK, feedbackRepo, upgradeReactions, BASE, BRANCH, branchPattern, MACHINES, OLD_NAMES, SECTIONS,
+const { TASK_ROWS, MAY_CHANGE, DEFAULTS, wordFor, valueFor, ROLES: CORE_ROLES, NOTES: CORE_NOTES, ABOUT, BACKUP, REACTIONS, STAR, starState, FEEDBACK, feedbackRepo, upgradeReactions, BASE, BRANCH, branchPattern, MACHINES, OLD_NAMES, SECTIONS,
   WEB, modelLabel, roleSel, otherCli, otherCliWords, backupProblem, homeAbout, webState, fromWord, LOADING_AGENTS, RESET, machineLabel } = C as any;
 const AP = APc as any;
 /** Autopilot as Everywhere has it now (herdr-task's view: what Settings keeps, else what it kept before, else the
@@ -228,17 +228,27 @@ export class Settings {
 
   private tasks(s: Scope | null): SettingSection {
     const scope = s?.id ?? null;
-    // Must fix shows only while there is a review
+    // Must fix shows only while there is a review; May change without asking only when Retro is not off
     const rounds = Number(this.pick(scope, "tasks", "review_rounds").value) || 0;
-    const rows: SettingRow[] = TASK_ROWS.filter(([, field]: any) => field !== "must_fix" || rounds > 0).map(([section, field, label, choices]: any) => {
-      const p = this.pick(scope, section, field);
-      const words = (v: any) => wordFor(choices, v);
-      const key = `${section}.${field}`;
-      return Array.isArray(choices)
-        ? { label, key, value: words(p.value), options: choices.map(([, w]: any) => w), hint: ABOUT[key], ...this.follows(s, p, words, section, field) }
-        // a count: the window's − and + (Tasks at once)
-        : { label, key, value: String(p.value), steps: range(choices.min, choices.max, 1, String), hint: ABOUT[key], ...this.follows(s, p, String, section, field) };
-    });
+    const retro = String(this.pick(scope, "tasks", "retro").value ?? "off");
+    const rows: SettingRow[] = TASK_ROWS
+      .filter(([, field]: any) => (field !== "must_fix" || rounds > 0) && (field !== "may_change" || retro !== "off"))
+      .map(([section, field, label, choices]: any) => {
+        const p = this.pick(scope, section, field);
+        const key = `${section}.${field}`;
+        // May change without asking: several of its choices at once (the brief's may_change list), as Autopilot's events
+        if (field === "may_change") {
+          const list = (v: any) => (Array.isArray(v) ? v.join(",") : "");
+          const on = Array.isArray(p.value) ? p.value : [];
+          return { label, key, value: on.join(","), multi: choices.map(([value, w]: any) => ({ value, label: w })), hint: ABOUT[key],
+            ...this.follows(s, p, list, section, field) } as SettingRow;
+        }
+        const words = (v: any) => wordFor(choices, v);
+        return Array.isArray(choices)
+          ? { label, key, value: words(p.value), options: choices.map(([, w]: any) => w), hint: ABOUT[key], ...this.follows(s, p, words, section, field) }
+          // a count: the window's − and + (Tasks at once)
+          : { label, key, value: String(p.value), steps: range(choices.min, choices.max, 1, String), hint: ABOUT[key], ...this.follows(s, p, String, section, field) };
+      });
     // Base branch, a space's only (as the window's): its box, empty for the branch the folder has checked out
     if (s) {
       const p = this.pick(scope, "tasks", "base");
@@ -414,6 +424,17 @@ export class Settings {
         if (Object.keys(m).length) layer.machine = m; else delete layer.machine;
       }
       if (machine && !Object.keys(layer).length) delete next.machines[machine];
+    } else if (key === "tasks.may_change") {
+      // several of its choices at once (agents_md, specs), comma-joined; kept in the contract's order. An empty pick is
+      // stored as [] (nothing may change, C1), not deleted: a space can say "nothing" even when Everywhere allows some.
+      // Reset (word null, or setting it back to what it would inherit) deletes the override, as the window's Reset does.
+      if (word === null) put("tasks", "may_change", null);
+      else {
+        const on = word.split(",").map((x) => x.trim()).filter(Boolean);
+        const allowed = new Set(MAY_CHANGE.map(([v]: any) => v));
+        if (on.some((x) => !allowed.has(x))) throw new Error("Not one of its choices.");
+        put("tasks", "may_change", MAY_CHANGE.map(([x]: any) => x).filter((x: any) => on.includes(x)));
+      }
     } else if (task) {
       const [, , , choices] = task;
       let value = word === null ? null : valueFor(choices, word);
