@@ -56,13 +56,26 @@ The current Verify Task is the child whose `id` is the Feature's `verify_task`. 
 false and stores the `findings`. The rule in `verifying`:
 
 - Verify passed -> the Feature moves to `closing`.
-- Verify reported a `blocker` finding -> attention `blocker-finding`; the loop stops at once.
-- Verify reported only non-blocker findings and no Fix Task is still in flight -> attention
-  `verify-open`. This is the resting state between rounds. Each tick, when the Feature is here,
-  `tick.py` asks `fix_round_allowed`: within the setting it opens the next fix round (new Fix Tasks
-  and a new Verify Task), which clears the attention; over the setting the `verify-open` attention
-  stays and the person sees Needs you with the Add a fix round action. So "after the allowed fix
-  rounds" is the pairing of this attention with `fix_round_allowed`.
+- A Fix Task of the current round is still in flight -> attention stays `""`: the round is being
+  worked, whatever the findings say.
+- Verify reported a `blocker` finding and no Fix Task is in flight -> attention `blocker-finding`:
+  the Assistant could not turn the blocker into a fix, so the loop stops at once (section 6.11).
+- Verify reported only non-blocker findings and no Fix Task is in flight -> this is the resting
+  state between rounds. `verify-open` means open findings *after the allowed fix rounds* (contract
+  C2), so deciding it needs the `verify_rounds` setting, which only `fix_round_allowed` carries.
+  `phase_of` takes `verify_rounds` as an optional argument for exactly this: with it, `phase_of`
+  returns `verify-open` only once `fix_round_allowed` is false (the rounds are used up), and `""`
+  while a round is still allowed (so `tick.py` opens the next one). Called with the bare contract
+  signature (`verify_rounds` left out), `phase_of` returns `""` and leaves the `verify-open`
+  decision to the caller; it never raises `verify-open` early. When it holds, the person sees Needs
+  you with the Add a fix round action (contract C9 keys that action on `verify-open`).
+
+### Several machines (proposal section 6.13)
+
+A child id is unique only within its own machine's store (contract C2), so `blocked_dependents`
+identifies a child by `(machine, id)`, never by id alone, and resolves a child's local `after` ids
+against that same machine. Chain affinity keeps a chain on one machine, so the dependency links that
+matter for blocking are local; cross-machine links between waves (`after_ext`) are not walked here.
 """
 
 # The seven phases (contract C2, proposal section 2.3).
@@ -163,20 +176,25 @@ def should_retry(task):
     """True when a failed or stalled Task may take its one restart (contract C7, section 6.12).
 
     A failed or stalled child restarts once from its own branch; `retries` counts the restarts used,
-    so a child with a `failed` or `stalled` reason and `retries` below 1 may retry. Any other Task
-    (a different reason, none, or one that has already used its retry) may not.
+    so a child with a `failed` or `stalled` reason and `retries` below 1 may retry. A child that has
+    been resolved (merged or skipped) or cancelled never retries: a retry must not undo a skip or a
+    cancellation. Any other Task (a different reason, none, or one that has used its retry) may not.
     """
+    if is_satisfied(task) or _is_cancelled(task):
+        return False
     return task.get("attention") in RETRYABLE and int(task.get("retries") or 0) < 1
 
 
 def is_blocking(task):
     """True when a child holds up the children that depend on it.
 
-    A child blocks when it failed or stalled, has no retry left (so `tick.py` will not restart it),
-    and has not been skipped. Skipping it clears the block: a skipped child is satisfied, so its
-    dependents may run (section 6.12).
+    A child blocks when it failed or stalled and has no retry left (so `tick.py` will not restart
+    it). A resolved child (merged or skipped) or a cancelled one never blocks: skipping the failed
+    child is exactly how the person unblocks its dependents (section 6.12).
     """
-    return task.get("attention") in RETRYABLE and not should_retry(task) and not _is_skipped(task)
+    if is_satisfied(task) or _is_cancelled(task):
+        return False
+    return task.get("attention") in RETRYABLE and not should_retry(task)
 
 
 def _ident(task):
@@ -184,32 +202,46 @@ def _ident(task):
     return task.get("ref") if task.get("ref") is not None else task.get("id")
 
 
-def blocked_dependents(children):
-    """The children a failure blocks, by dependency (`after`), newest block propagated to its chain.
+def _key(task):
+    """A child's machine-qualified identity `(machine, id)` (contract C2, section 6.13).
 
-    A child is blocked when one of the children it waits on (`after`) is blocking (`is_blocking`) or
-    is itself blocked: a failure with no retry left stops its whole chain of dependents, while the
-    other chains keep running (proposal section 6.12). Only dependents are returned, never the failed
-    child itself. Skipping the failed child clears its block (`is_blocking` turns false), so a later
-    call returns the shorter list: that is how a skip unblocks a chain.
+    A child id is unique only within its own machine's store, so two machines can both hold a child
+    `14`. The machine (None for the home machine) keeps them apart in the dependency graph.
+    """
+    return (task.get("machine"), task.get("id"))
+
+
+def blocked_dependents(children):
+    """The children a failure blocks, by dependency (`after`), the block propagated down the chain.
+
+    A child is blocked when one of the children it waits on (its local `after` ids, on its own
+    machine) is blocking (`is_blocking`) or is itself blocked: a failure with no retry left stops its
+    whole chain of dependents, while the other chains keep running (proposal section 6.12). A resolved
+    child (merged or skipped) or a cancelled one is never blocked and never passes a block on, so
+    skipping a failed row unblocks everything below it: a later call returns the shorter list. Only
+    dependents are returned, never the failed child itself.
 
     Returns the dependents' refs (or ids) in sorted order.
     """
-    by_id = {c.get("id"): c for c in children if c.get("id") is not None}
-    blockers = {c.get("id") for c in children if is_blocking(c)}
+    by_key = {_key(c): c for c in children if c.get("id") is not None}
+    blockers = {_key(c) for c in children if c.get("id") is not None and is_blocking(c)}
     blocked = set()
     changed = True
     while changed:
         changed = False
         for c in children:
-            cid = c.get("id")
-            if cid in blocked or cid in blockers:
+            if c.get("id") is None:
                 continue
-            deps = c.get("after") or []
+            key = _key(c)
+            if key in blocked or key in blockers:
+                continue
+            if is_satisfied(c) or _is_cancelled(c):
+                continue  # a resolved or cancelled child breaks the chain: nothing below it is blocked by this
+            deps = [(c.get("machine"), d) for d in (c.get("after") or [])]
             if any(d in blockers or d in blocked for d in deps):
-                blocked.add(cid)
+                blocked.add(key)
                 changed = True
-    return sorted(_ident(by_id[i]) for i in blocked if i in by_id)
+    return sorted((_ident(by_key[k]) for k in blocked), key=str)
 
 
 def fix_round_allowed(feature, verify_rounds):
@@ -256,13 +288,20 @@ def _child_attention(children):
 
 
 def _current_verify(feature, children):
-    """The Feature's current Verify Task: the child whose id is `verify_task`, else the newest one."""
+    """The Feature's current Verify Task: the child whose id is the record's `verify_task`, or None.
+
+    Only the named task counts. An older Verify Task that already reported is not read as the current
+    result: when `verify_task` names a task that is not present yet (a fresh round whose Verify Task
+    has not arrived), the result is None and the Feature keeps waiting rather than acting on a stale
+    pass or stale findings.
+    """
     vid = feature.get("verify_task")
-    verifies = [c for c in children if c.get("role") == "verify"]
-    for c in verifies:
-        if c.get("id") == vid:
+    if vid is None:
+        return None
+    for c in children:
+        if c.get("role") == "verify" and c.get("id") == vid:
             return c
-    return max(verifies, key=lambda c: c.get("id") or 0) if verifies else None
+    return None
 
 
 def _verify_reported(verify_task):
@@ -278,12 +317,17 @@ def _fix_in_flight(children):
     )
 
 
-def phase_of(feature, children):
+def phase_of(feature, children, verify_rounds=None):
     """The `(phase, attention)` a Feature should have, given its children's states (contract C7).
 
     Pure: no IO. `feature` is the Feature record (contract C2) and `children` is the list of its
     flow Task records. The returned phase is never past what the children's states allow; the
     transitions this module does not own are preserved from the record (see the module docstring).
+
+    `verify_rounds` is the optional setting (contract C7 `fix_round_allowed`). It is only read in the
+    `verifying` phase, to decide `verify-open` (open findings after the allowed fix rounds). Left out,
+    the bare contract call never raises `verify-open`; given, `phase_of` raises it once the rounds are
+    used up (see the module docstring).
     """
     phase = feature.get("phase") or PLANNING
 
@@ -312,11 +356,14 @@ def phase_of(feature, children):
             return (VERIFYING, "")
         if verify_task.get("verify_pass"):
             return (CLOSING, "")
+        if _fix_in_flight(children):
+            return (VERIFYING, "")  # a fix round is running: wait, whatever the findings say
         findings = verify_task.get("findings") or []
         if any((f or {}).get("level") == "blocker" for f in findings):
+            # A blocker with no fix in flight: the Assistant could not turn it into a fix, so stop.
             return (VERIFYING, ATTENTION_BLOCKER_FINDING)
-        if findings and not _fix_in_flight(children):
-            return (VERIFYING, ATTENTION_VERIFY_OPEN)
+        if findings and verify_rounds is not None and not fix_round_allowed(feature, verify_rounds):
+            return (VERIFYING, ATTENTION_VERIFY_OPEN)  # open findings after the allowed fix rounds
         return (VERIFYING, "")
 
     return (phase, "")
