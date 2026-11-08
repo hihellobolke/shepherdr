@@ -15,18 +15,51 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 sys.dont_write_bytecode = True
-os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-fanout-store-"))
-os.environ.setdefault("HERDR_TASK_SETTINGS", os.path.join(tempfile.mkdtemp(prefix="herdr-fanout-cfg-"), "shepherdr.json"))
 
 from herdr_task import fanout, store as st  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
 from herdr_task import settings as settings_mod  # noqa: E402
+
+
+# The store root (store.STORE) and the settings path (settings.SETTINGS) are read from the
+# environment when herdr_task is first imported, which in a full `python3 -m unittest discover -s
+# test` run is whichever test file imports it first, not this one. Setting HERDR_TASK_STORE at
+# import time here would be too late then, and these tests would write to the person's real
+# ~/.herdr/tasks (SHMD-38). Point both at throwaway dirs for the whole module instead, patching the
+# already-bound module globals so the override holds whatever the import order, and set the env too
+# so any child process inherits the throwaway roots. The repo hygiene rule (test_repo.TestHygiene)
+# bans the old import-time os.environ mutation; this does it in setUpModule, undone in tearDownModule.
+_patches = []
+_tmp_dirs = []
+
+
+def setUpModule():
+    store_dir = tempfile.mkdtemp(prefix="herdr-fanout-store-")
+    cfg_dir = tempfile.mkdtemp(prefix="herdr-fanout-cfg-")
+    _tmp_dirs.extend([store_dir, cfg_dir])
+    settings_file = os.path.join(cfg_dir, "shepherdr.json")
+    _patches.extend([
+        mock.patch.object(st, "STORE", store_dir),
+        mock.patch.object(settings_mod, "SETTINGS", settings_file),
+        mock.patch.dict(os.environ, {"HERDR_TASK_STORE": store_dir, "HERDR_TASK_SETTINGS": settings_file}),
+    ])
+    for p in _patches:
+        p.start()
+
+
+def tearDownModule():
+    while _patches:
+        _patches.pop().stop()
+    for d in _tmp_dirs:
+        shutil.rmtree(d, ignore_errors=True)
+    _tmp_dirs.clear()
 
 
 VALID_TABLE = """# Login flow
