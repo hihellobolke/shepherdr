@@ -30,7 +30,9 @@ import { taskMenu } from "./core/menus.js";
 import { RANK, STATUS, RANK_OF, ORDER, GROUP_BY, groupBy, machineOf, machineName, refOf, taskKey, autoPrefix, place,
   queueReason, reportOf as report, secondLine, leftOf, order, matches, day, ago, capital, short, autoWhere, fromLine, inSpace } from "./core/tasks.js";
 import { READ_LISTS, taskLists } from "./core/tasklists.js";
-import { TEXT, H, RADIUS, red, amber } from "./ui.js";
+// The one summary row a Feature group shows, and its phase words (shared core: core/features.js).
+import { featureRow, PHASE_LABEL } from "./core/features.js";
+import { TEXT, H, RADIUS, red, amber, button, toast, plainError } from "./ui.js";
 
 const CLI = () => `${appHome()}/mods/tasks/bin/herdr-task`;
 const DONE_SHOWN = 5; // Done rows a group shows before "Show N more"
@@ -105,6 +107,7 @@ export default class Tasks extends View {
     this.searchAt = shared("tasks.searchreq")?.at ?? 0;
     if (shared("tasks.menuopen")) setShared("tasks.menuopen", null); // left over if the app quit with More open
     this.allDone = saved("alldone");
+    this.featureBusy = new Set(); // Feature actions running now ("<machine>:<folder>:<ref>:<action>"): their button waits.
     this.asks = new Map(); // an ask's id -> its words (asks.js), read from the hook's request
     this.reading = new Set();
     this.prefixes = new Map(); // another folder's list (not loaded here): "<machine> <slug>" -> its prefix (null: none found)
@@ -373,9 +376,26 @@ export default class Tasks extends View {
       const ownNeeds = needList.filter((n) => !n.pin).map((n) => n.row);
       if (ownNeeds.length) body.push(this.group("needs", STATUS.needs, ownNeeds, t, { open }));
       const rest = placed.filter((p) => !isPin(p));
+      // Feature groups (proposal 6.17): each folder's Features, one summary row each (phase, merged of
+      // total, open findings, the two actions), with their child Tasks nested under it. Only a folder
+      // with a features list has any, so a classic space is untouched. A flow child shows here, not in
+      // the status or space groups below (loose of Pinned and Needs you, as those groups already are).
+      const featLists = lists.filter((l) => this.featuresOf(l).length
+        && (!here || inSpace(here, { machine: l.machine ?? null, folder: l.folder, space: null })));
+      const multiFeat = new Set(featLists.map((l) => `${l.machine ?? ""}:${l.folder}`)).size > 1;
+      for (const l of featLists) {
+        for (const feature of this.featuresOf(l)) {
+          const kids = rest.filter((p) => p.list === l && p.task.feature === feature.id);
+          // Searching: a Feature shows only when it, or one of its shown children, matches.
+          if (q && !kids.length && !matches(q, feature.ref, feature.title, PHASE_LABEL[feature.phase])) continue;
+          body.push(this.featureGroup(l, feature, kids, t, { open, note: multiFeat ? placeName(l) : null }));
+        }
+      }
+      // The status, space and machine groups below are for loose Tasks: a flow child sits under its Feature.
+      const loose = rest.filter((p) => !this.featureChild(p));
       if (by === "status") {
         for (const s of ORDER.slice(1, -1)) {
-          const ps = tasksOf[s].filter((p) => !isPin(p));
+          const ps = tasksOf[s].filter((p) => !isPin(p) && !this.featureChild(p));
           // A group shows only when it holds something (To do too).
           if (!ps.length) continue;
           // Split by space: a light heading per space, its rows saying no more where they are.
@@ -389,13 +409,13 @@ export default class Tasks extends View {
         // A space's group: its tasks in status order. By space across machines, the machine
         // quiet after its name (Shepherdr's note).
         const spaceGroup = (l, note) => {
-          const ps = sorted(rest.filter((p) => p.list === l));
+          const ps = sorted(loose.filter((p) => p.list === l));
           return ps.length ? this.group(`folder:${l.machine ?? ""}:${l.folder}`, placeName(l), ps.map((p) => this.row(p, t)), t, { open, note, done: ps.filter((p) => p.section === "done").length }) : null;
         };
         const machinesOf = [...new Set(this.lists.map((l) => l.machine ?? null))];
         if (by === "space") body.push(...lists.map((l) => spaceGroup(l, multi ? machineName(l.machine) : null)).filter(Boolean));
         else for (const [i, mc] of machinesOf.entries()) {
-          const ps = sorted(rest.filter((p) => (p.list.machine ?? null) === mc));
+          const ps = sorted(loose.filter((p) => (p.list.machine ?? null) === mc));
           if (!ps.length) continue;
           const key = `machine:${mc ?? ""}`;
           if (by === "machine") body.push(this.group(key, machineName(mc), ps.map((p) => this.row(p, t)), t, { open,
@@ -943,6 +963,92 @@ export default class Tasks extends View {
   accept(p, _cx) {
     openOverlay({ mod: "accept-card", kind: "dialog", modal: true, width: 640, height: 640,
       props: { ref: refOf(p.list, p.task), folder: p.list.folder, machine: p.list.machine ?? null, title: p.task.title } });
+  }
+
+  // A folder's Features, enriched with their ref (the folder prefix and the Feature id, as a Task's
+  // ref is built), folder and machine, the way core/features.js expects them. The window reads the raw
+  // store list, so it enriches here, where the service enriches its published ones. A classic space
+  // has no features list, so this is empty and its rows are untouched (proposal section 7).
+  featuresOf(list) {
+    return (list.features ?? []).map((f) => ({ ...f, ref: refOf(list, { id: f.id }), folder: list.folder, machine: list.machine ?? null }));
+  }
+
+  // A placed Task that belongs to a Feature of its own folder (a flow child): it shows under its
+  // Feature group, not in the status, space or machine groups. A classic Task, or a flow Task whose
+  // Feature is not in this folder's list, is loose.
+  featureChild(p) {
+    const fs = p.list.features;
+    return p.task.feature != null && Array.isArray(fs) && fs.some((f) => f.id === p.task.feature);
+  }
+
+  // The key a Feature action's busy state lives under, so a double press waits.
+  featureActionKey(list, feature, action) {
+    return `${list.machine ?? ""}:${list.folder}:${feature.ref}:${action.id}`;
+  }
+
+  // A Feature action (core/features.js FEATURE_ACTIONS): Merge feature (phase ready) or Add a fix
+  // round (open findings after the allowed rounds). It runs the matching herdr-task command on the
+  // folder's machine; a busy guard stops a double press, and an error comes back as a toast.
+  featureAction(list, feature, action, cx) {
+    const key = this.featureActionKey(list, feature, action);
+    if (this.featureBusy.has(key)) return;
+    const sub = action.id === "feature-fix-round" ? "fix-round" : "merge";
+    this.featureBusy.add(key);
+    cx.spawn(async (cx) => {
+      try {
+        const r = await exec(CLI(), [...(list.machine ? ["--on", list.machine] : []), "feature", sub, feature.ref, "--folder", list.folder, "--json"]);
+        let out = null;
+        try { out = JSON.parse(r.stdout || "null"); } catch {}
+        if (r.code !== 0 || out?.error) throw new Error(out?.error || r.stderr?.trim() || `herdr-task feature ${sub} failed`);
+      } catch (e) {
+        toast({ title: `${feature.ref} · ${action.label}`, body: plainError(e), level: "error" });
+      } finally {
+        this.featureBusy.delete(key);
+        cx.notify();
+      }
+    });
+  }
+
+  // A Feature group (proposal section 6.17): the one summary row core/features.js builds - the phase,
+  // how many children merged of the total, and the open verify findings - with its two actions, and
+  // the Feature's child Tasks nested under it. The summary is record-driven (so remote children on
+  // other machines count too); the nested rows are this folder's own placed child rows, in status
+  // order. children: the folder's placed child rows of this Feature (loose of Pinned and Needs you,
+  // as the status groups are); open (searching): the group shows whole.
+  featureGroup(list, feature, children, t, { open = false, note = null } = {}) {
+    const raw = (list.tasks ?? []).filter((x) => x.feature === feature.id);
+    const row = featureRow(feature, raw);
+    const key = `feat:${list.machine ?? ""}:${list.folder}:${feature.id}`;
+    const shut = !open && this.shut(key);
+    const rows = [...children].sort((a, b) => RANK_OF[a.section] - RANK_OF[b.section] || order(a.section)(a, b));
+    // The second line, in plain words: the phase, then "<merged>/<total> merged" and the open findings.
+    const bits = [row.phaseLabel,
+      row.total > 0 ? `${row.merged}/${row.total} merged` : null,
+      row.findings > 0 ? `${row.findings} finding${row.findings === 1 ? "" : "s"}` : null].filter(Boolean);
+    const empty = raw.length ? "Its tasks are pinned, done or need you." : "No child tasks yet.";
+    const heading = h_flex().id(`head-${key}`).h(46).px(8).gap(10).items_center().rounded(RADIUS.card)
+      .when(!open, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover))
+        .on_hover((on, cx) => { this.hoverHead = on ? key : this.hoverHead === key ? null : this.hoverHead; cx.notify(); })
+        .on_click((_e, cx) => { this.fold(key, !shut); cx.notify(); }))
+      .child(h_flex().w(14).h(14).flex_none().items_center().justify_center()
+        .child(svg(`mods/workspace-chrome/chevron-${shut ? "right" : "down"}.svg`).size(12).flex_none()
+          .text_color(this.hoverHead === key ? t.foreground : t.dim)))
+      .child(v_flex().flex_1().min_w(0).gap(2)
+        .child(h_flex().h(18).min_w(0).gap(6).items_center()
+          .child(div().flex_none().font_family(ID_FONT).text_size(ID_SIZE).text_color(t.dim).child(row.ref))
+          .child(div().min_w(0).truncate().font_medium().text_color(t.foreground).child(row.title))
+          .when(Boolean(row.attention), (el) => el.child(div().size(6).flex_none().rounded(3).bg(red()))))
+        .child(h_flex().h(16).min_w(0).gap(6).items_center().text_size(TEXT.label).text_color(t.muted)
+          .child(div().min_w(0).truncate().child(bits.join(" · ")))
+          .when(Boolean(note), (el) => el.child(div().flex_none().text_color(t.dim).child(`· ${note}`)))))
+      .when(row.actions.length > 0, (el) => el.child(h_flex().flex_none().gap(6).items_center()
+        .children(row.actions.map((a) => button(`${key}-${a.id}`, a.label,
+          { kind: "secondary", size: "sm", disabled: this.featureBusy.has(this.featureActionKey(list, feature, a)),
+            onClick: (_e, cx) => this.featureAction(list, feature, a, cx) })))));
+    return v_flex().flex_none().gap(1).pt(6)
+      .child(heading)
+      .when(!shut, (el) => el.children(rows.map((p) => this.row(p, t, true)))
+        .when(!rows.length, (el) => el.child(div().pl(32).pr(8).pb(4).text_size(TEXT.label).text_color(t.dim).child(empty))));
   }
 
   // One row (as Shepherdr's web Tasks list), three parts with one job each:
