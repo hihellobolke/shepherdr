@@ -431,6 +431,12 @@ class BranchRef(unittest.TestCase):
         self.assertEqual(flowfakes.ref_from_branch("feature/HAT-12-login-flow"), "HAT-12")
         self.assertEqual(flowfakes.ref_from_branch("no-ref-here"), "no-ref-here")
 
+    def test_a_lowercase_title_slug_with_ref_like_text_is_not_mistaken_for_a_ref(self):
+        # The title slug is lower-cased, so "http-500" in the title is not a ref token.
+        self.assertEqual(flowfakes.ref_from_branch("task/HAT-12-HAT-14-handle-http-500"), "HAT-14")
+        self.assertEqual(flowfakes.ref_from_branch("task/HAT-14-fix-http-500"), "HAT-14")
+        self.assertEqual(flowfakes.ref_from_branch("task/SHMD-2-retry-s3-500-later"), "SHMD-2")
+
 
 class HcRun(Base):
     def wait_for(self, predicate, timeout=10):

@@ -730,14 +730,19 @@ def _hc_run(state_dir, argv):
     return 0
 
 
-REF_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
+# A ref is an upper-case prefix and a number (HAT-14, SHMD-2). The branch's title slug is lower-cased
+# (feature.slug_title), so matching upper-case only never mistakes a title word like "http-500" for a
+# ref.
+REF_TOKEN = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]*-\d+(?![A-Za-z0-9])")
 
 
 def ref_from_branch(branch):
     """The child ref encoded in a branch name. A child branch carries the feature ref and then the
-    child ref (`task/HAT-12-HAT-14-parser`, C5), so the child is the last ref-like token, not the
-    first; a classic branch (`task/HAT-14-title`) and a feature branch (`feature/HAT-12-login`)
-    have one, so the last is also the right one. Returns the branch unchanged when it holds none."""
+    child ref (`task/HAT-12-HAT-14-parser`, C5), so the child is the last ref token, not the first; a
+    classic branch (`task/HAT-14-title`) and a feature branch (`feature/HAT-12-login-flow`) have one,
+    so the last is also the right one. Only upper-case ref tokens count, so a lower-cased title slug
+    with ref-like text (`task/HAT-12-HAT-14-handle-http-500`) still resolves to the child ref
+    (`HAT-14`). Returns the branch unchanged when it holds no ref token."""
     tokens = REF_TOKEN.findall(branch)
     return tokens[-1] if tokens else branch
 
