@@ -4,6 +4,10 @@ import ast
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -439,6 +443,62 @@ class TestHygiene(unittest.TestCase):
         )
         for src in allowed:
             self.assertEqual(self._leaks(src), [], f"guard flagged allowed code:\n{src}")
+
+
+class TestStoreIsolation(unittest.TestCase):
+    """A full `python3 -m unittest discover -s test` must never write to the person's real ~/.herdr
+    (the tasks store, settings or worktrees); AGENTS.md says tests use throwaway roots only.
+
+    The leak that bit this repo (SHMD-38): herdr_task reads the store root from the environment once,
+    when it is first imported (store.STORE, settings.SETTINGS). A test file that set its throwaway
+    HERDR_TASK_STORE at import time was too late whenever an earlier test file had already imported
+    herdr_task and frozen the path to the real ~/.herdr/tasks, so every store write in that file
+    landed in the real home and the suite grew it on each run.
+
+    This guard reproduces that exact import order against the store-writing test (test_fanout) in a
+    child process under a throwaway HOME, with the store env vars unset so the default store resolves
+    under that throwaway HOME, and fails if the probe wrote anything there. The throwaway HOME means
+    the real ~/.herdr is never at risk, even when the guard catches a regression."""
+
+    ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    TESTDIR = os.path.dirname(os.path.abspath(__file__))
+    BIN = os.path.join(ROOT, "mods", "tasks", "bin")
+    # A store-writing test: its setUp builds a Feature in the store, so running it writes a task list.
+    PROBE = "test_fanout.RunTest.test_creates_children_and_verify"
+
+    def test_a_store_write_stays_off_the_real_home(self):
+        home = tempfile.mkdtemp(prefix="herdr-isolation-home-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        # Import herdr_task.store (which freezes the store root from the env) BEFORE the probe test's
+        # module loads, exactly as an earlier test file does in a full suite run. Then run the probe
+        # and report whether it passed and what landed in the real ~/.herdr (tasks, settings,
+        # worktrees), all of which resolve under the throwaway HOME here.
+        code = (
+            "import sys, os, json, unittest\n"
+            "sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2])\n"
+            "import herdr_task.store as st\n"
+            "res = unittest.TextTestRunner(verbosity=0).run("
+            "unittest.TestLoader().loadTestsFromName(sys.argv[3]))\n"
+            "herdr = os.path.join(st.HOME, '.herdr')\n"
+            "listing = lambda p: sorted(os.listdir(p)) if os.path.isdir(p) else []\n"
+            "leaked = {'tasks': listing(os.path.join(herdr, 'tasks')),\n"
+            "          'worktrees': listing(os.path.join(herdr, 'worktrees')),\n"
+            "          'settings': ['shepherdr.json'] if os.path.exists(os.path.join(herdr, 'shepherdr.json')) else []}\n"
+            "print('RESULT:' + json.dumps({'ok': res.wasSuccessful(), 'leaked': leaked}))\n"
+        )
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HERDR_TASK_STORE", "HERDR_TASK_SETTINGS", "HERDR_TASK_WORKTREES")}
+        env["HOME"] = home
+        r = subprocess.run([sys.executable, "-c", code, self.BIN, self.TESTDIR, self.PROBE],
+                           env=env, capture_output=True, text=True, timeout=120)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("RESULT:")), None)
+        self.assertIsNotNone(line, f"the isolation probe did not run (is {self.PROBE} still there?):\n"
+                             f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}")
+        out = json.loads(line[len("RESULT:"):])
+        self.assertTrue(out["ok"], f"the isolation probe {self.PROBE} did not pass:\n{r.stdout}\n{r.stderr}")
+        hits = [f"{where} ({', '.join(names)})" for where, names in sorted(out["leaked"].items()) if names]
+        self.assertEqual(hits, [], "a test wrote to the default roots instead of its throwaway ones; "
+                         "a full suite run would leak into the real ~/.herdr like this: " + "; ".join(hits))
 
 
 if __name__ == "__main__":
