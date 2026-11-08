@@ -12,19 +12,39 @@ import tempfile
 import types
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
 sys.path.insert(0, BIN)
 sys.dont_write_bytecode = True
 
+from herdr_task import branchsync  # noqa: E402
+
 # Isolate every git call (this test's and branchsync's own) from the user's global and system
 # config, so hooks, signing or an fsmonitor there never slow the rebases or hold the temp dirs open.
-_EMPTY_GITCONFIG = tempfile.NamedTemporaryFile(prefix="herdr-gitconfig-", delete=False).name
-os.environ["GIT_CONFIG_GLOBAL"] = _EMPTY_GITCONFIG
-os.environ["GIT_CONFIG_SYSTEM"] = os.devnull
+# Kept for the lifetime of this module's tests and restored after, so nothing leaks into later test
+# files in a full `unittest discover` run.
+_ENV_PATCH = None
+_GITCONFIG = None
 
-from herdr_task import branchsync  # noqa: E402
+
+def setUpModule():
+    global _ENV_PATCH, _GITCONFIG
+    _fd, _GITCONFIG = tempfile.mkstemp(prefix="herdr-gitconfig-")
+    os.close(_fd)
+    _ENV_PATCH = mock.patch.dict(os.environ, {
+        "GIT_CONFIG_GLOBAL": _GITCONFIG,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    })
+    _ENV_PATCH.start()
+
+
+def tearDownModule():
+    if _ENV_PATCH is not None:
+        _ENV_PATCH.stop()
+    if _GITCONFIG and os.path.exists(_GITCONFIG):
+        os.unlink(_GITCONFIG)
 
 
 def git(repo, *args, check=True):

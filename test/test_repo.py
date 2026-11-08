@@ -292,6 +292,47 @@ class Repo(unittest.TestCase):
         self.assertIn(v, open(J("README.md")).read())
 
 
+class TestHygiene(unittest.TestCase):
+    """A full `python3 -m unittest discover -s test` imports every test file into one process, so a
+    test file that mutates global state at import time (where no setUp/tearDown can undo it) leaks
+    that state into every later file and makes the suite order-dependent. Two leaks have bitten this
+    repo, so a test file must not, at module level (column 0, outside setUpModule): inject a fake
+    `herdr_task.*` into sys.modules (the real module then never loads for later files), or mutate
+    os.environ (the changed env then follows every later file, including subprocesses)."""
+
+    TESTDIR = os.path.dirname(os.path.abspath(__file__))
+    # Column-0 lines only: setUp/tearDown/setUpModule bodies and functions are indented, so an
+    # os.environ patch moved into setUpModule (restored in tearDownModule) is allowed.
+    ENV_WRITE = re.compile(
+        r"^os\.environ\s*\[.*\]\s*=(?!=)"           # os.environ["X"] = ...
+        r"|^os\.environ\.(setdefault|update|pop|clear|__setitem__)\("
+        r"|^os\.putenv\("
+        r"|^del\s+os\.environ\[")
+    SYS_MODULES = re.compile(
+        r"""^sys\.modules\s*\[\s*["']herdr_task"""   # sys.modules["herdr_task..."] = ...
+        r"""|^sys\.modules\.setdefault\(\s*["']herdr_task""")
+
+    def _test_files(self):
+        for name in sorted(os.listdir(self.TESTDIR)):
+            if name.startswith("test_") and name.endswith(".py"):
+                yield name
+
+    def test_no_module_level_state_leaks(self):
+        bad = []
+        for name in self._test_files():
+            with open(os.path.join(self.TESTDIR, name), encoding="utf-8") as fh:
+                for n, line in enumerate(fh, 1):
+                    if not line.strip() or line[:1] in (" ", "\t", "#"):
+                        continue  # indented (inside a function) or blank/comment: not module level
+                    if self.ENV_WRITE.match(line):
+                        bad.append(f"{name}:{n}: module-level os.environ mutation "
+                                   f"(move it into setUpModule/tearDownModule with restore)")
+                    if self.SYS_MODULES.match(line):
+                        bad.append(f"{name}:{n}: module-level sys.modules['herdr_task...'] injection "
+                                   f"(use the real module, or inject and remove it inside a test)")
+        self.assertEqual(bad, [], "test files leak global state at import time:\n" + "\n".join(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
 

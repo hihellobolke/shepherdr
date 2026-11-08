@@ -14,16 +14,32 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
 sys.dont_write_bytecode = True
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
-# STORE is read at import time; the per-test dir replaces it below.
-os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-fs-import-"))
 
 from herdr_task import feature_status, digest, store  # noqa: E402
+
+# A throwaway STORE off the real ~/.herdr, kept for this module's tests and restored after so it
+# never leaks into later test files. Each test also patches store.STORE to its own tmp dir in setUp.
+_ENV_PATCH = None
+
+
+def setUpModule():
+    global _ENV_PATCH
+    _ENV_PATCH = mock.patch.dict(os.environ, {
+        "HERDR_TASK_STORE": tempfile.mkdtemp(prefix="herdr-fs-import-"),
+    })
+    _ENV_PATCH.start()
+
+
+def tearDownModule():
+    if _ENV_PATCH is not None:
+        _ENV_PATCH.stop()
 
 
 class Args:

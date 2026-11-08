@@ -11,9 +11,6 @@ A classic Task and a classic space never reach this module; the `feature` comman
 accepted; it moves the Feature to `building`. It does not fan out: the fan-out trigger lives in
 `tick.py` and waits for the spec merge to land on the feature branch (`spec_merged`), because Accept
 can return while the spec Task's merge is still pending or only requested.
-
-`phases.py` is built by a parallel task (T11a). It is imported lazily (`_phases`), so this module
-loads and its non-phase commands work even before `phases.py` lands; the tests mock it.
 """
 
 import os
@@ -31,6 +28,7 @@ from .launch import base_ref, caller_space, current_base, git_quick
 from .agents import live_agents
 from .scheduler import ensure_scheduler
 from . import digest
+from . import phases
 
 
 # A change name that already begins with one of these verbs is kept; otherwise `add-` is prefixed,
@@ -46,22 +44,12 @@ VERIFY_OPEN = "verify-open"
 _GITHUB_HOST = re.compile(r"(?:^|@|//)github\.com(?:[:/]|$)", re.I)
 
 
-# ---- phases (built in parallel by T11a; imported lazily) -------------------------------------
-
-def _phases():
-    from . import phases
-    return phases
-
+# ---- phases ---------------------------------------------------------------------------------
 
 def _set_phase(feature, phase):
     """Move a Feature to a phase, through `phases.py` (its `PHASES` are the one list of phase
-    names). An unknown phase is a programming error and is refused. When `phases.py` has not landed
-    yet the write still happens, so this module never blocks on a parallel task."""
-    try:
-        valid = _phases().PHASES
-    except Exception:
-        valid = None
-    if valid is not None and phase not in valid:
+    names). An unknown phase is a programming error and is refused."""
+    if phase not in phases.PHASES:
         raise Fail(f"Unknown phase {phase!r}.")
     feature["phase"] = phase
 
