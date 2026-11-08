@@ -147,6 +147,23 @@ class Mode(Base):
         git(self.repo, "remote", "add", "origin", "https://gitlab.com/acme/shop.git")
         self.assertEqual(feature.detect_mode(self.repo), "local")
 
+    def test_local_when_url_merely_contains_github(self):
+        # A GitLab repo named github-mirror is not GitHub: the host must be github.com.
+        git(self.repo, "remote", "add", "origin", "https://gitlab.com/acme/github-mirror.git")
+        self._patch(feature, "gh", lambda *a, **k: (True, "", ""))
+        self.assertEqual(feature.detect_mode(self.repo), "local")
+
+    def test_remote_from_an_ssh_url(self):
+        git(self.repo, "remote", "add", "origin", "git@github.com:acme/shop.git")
+        self._patch(feature, "gh", lambda *a, **k: (True, "", ""))
+        self.assertEqual(feature.detect_mode(self.repo), "remote")
+
+    def test_remote_when_github_is_a_second_remote(self):
+        git(self.repo, "remote", "add", "origin", "https://gitlab.com/acme/shop.git")
+        git(self.repo, "remote", "add", "upstream", "https://github.com/acme/shop.git")
+        self._patch(feature, "gh", lambda *a, **k: (True, "", ""))
+        self.assertEqual(feature.detect_mode(self.repo), "remote")
+
 
 # ---- create ---------------------------------------------------------------------------------
 
@@ -338,15 +355,17 @@ class Cancel(Base):
             running["state"] = "running"
             running["branch"] = "task/child-running"
             running["worktree"] = os.path.join(self.tmp, "child-wt")
-            os.makedirs(running["worktree"], exist_ok=True)
-            with open(os.path.join(running["worktree"], "work.txt"), "w") as fh:
-                fh.write("work\n")
             queued = s.new("Queued child", "", "worktree", feature=f["id"], role="child")
             queued["state"] = "queued"
             queued["queued_at"] = 1
             running_key = s.key(running)
             fb = f["branch"]
             run_ref, spec_ref, queued_ref = s.ref(running), s.ref(spec), s.ref(queued)
+        # A real child branch and a real git worktree, to prove cancel keeps both (deletes nothing).
+        git(self.repo, "branch", "task/child-running", "main")
+        git(self.repo, "worktree", "add", "-q", os.path.join(self.tmp, "child-wt"), "task/child-running")
+        with open(os.path.join(self.tmp, "child-wt", "work.txt"), "w") as fh:
+            fh.write("work\n")
         # Only the running child has a live agent; killing it goes through feature.run (hc kill).
         self._patch(feature, "live_agents", lambda key: [{"address": "hc://a1"}] if key == running_key else [])
         self._patch(feature, "run", lambda args: killed.append(args))
@@ -361,9 +380,11 @@ class Cancel(Base):
             self.assertEqual(s.feature_by_id(f["id"])["phase"], "cancelled")
             for ref in (run_ref, spec_ref, queued_ref):
                 self.assertEqual(s.find(ref)["state"], "cancelled")
-        # Deletes nothing: the feature branch, the child branch and its worktree are all still there.
+        # Deletes nothing: the feature branch, the real child branch and its real worktree all stay.
         self.assertTrue(branch_exists(self.repo, fb))
+        self.assertTrue(branch_exists(self.repo, "task/child-running"))
         self.assertTrue(os.path.isfile(os.path.join(self.tmp, "child-wt", "work.txt")))
+        self.assertIn(os.path.join(self.tmp, "child-wt"), git(self.repo, "worktree", "list"))
 
 
 # ---- merge ----------------------------------------------------------------------------------
@@ -397,6 +418,33 @@ class Merge(Base):
         # The feature's file is now on main as one squash commit (main was checked out).
         self.assertTrue(os.path.isfile(os.path.join(self.repo, "feat.txt")))
         self.assertEqual(git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+
+    def test_local_merge_refuses_a_dirty_checkout(self):
+        """The base is the folder's own checkout: merge refuses when it has uncommitted work and
+        never touches it (the person's edits are safe)."""
+        fid, fb = self._ready_feature("local")
+        with open(os.path.join(self.repo, "README.md"), "a") as fh:
+            fh.write("uncommitted edit\n")
+        with self.store() as s:
+            with self.assertRaises(Fail):
+                feature.merge(s, s.feature_by_id(fid))
+            self.assertEqual(s.feature_by_id(fid)["phase"], "ready")  # not moved to done
+        with open(os.path.join(self.repo, "README.md")) as fh:
+            self.assertIn("uncommitted edit", fh.read())  # the person's edit is untouched
+
+    def test_remote_refuses_without_a_pull_request(self):
+        """A remote Feature with no pull request must not fall back to a local merge and report done."""
+        called = []
+        with self.store() as s:
+            f = feature.create(s, "Login flow", mode="remote")
+            f["phase"] = "ready"  # no pr recorded
+            fid = f["id"]
+        self._patch(feature, "gh", lambda *a, **k: (called.append(a), (True, "", ""))[1])
+        with self.store() as s:
+            with self.assertRaises(Fail):
+                feature.merge(s, s.feature_by_id(fid))
+            self.assertEqual(s.feature_by_id(fid)["phase"], "ready")
+        self.assertEqual(called, [])  # never shelled a local merge or a gh call
 
     def test_remote_merges_the_pull_request(self):
         calls = []

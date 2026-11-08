@@ -26,7 +26,7 @@ from .base import Fail, git, now, run
 from .store import open_store
 from .output import say
 from .github import gh, github, remote_of
-from .settings import worker_argv
+from .settings import machine_name, worker_argv
 from .launch import base_ref, caller_space, current_base, git_quick
 from .agents import live_agents
 from .scheduler import ensure_scheduler
@@ -40,6 +40,10 @@ CHANGE_VERBS = ("add", "update", "remove", "delete", "fix", "refactor", "change"
 
 # The Needs-you reason code (C2) that offers the person the Add a fix round action.
 VERIFY_OPEN = "verify-open"
+
+# A git remote whose host is github.com (https, ssh or scp-like), not just any URL that contains the
+# word "github" (so a GitLab repo named github-mirror is not mistaken for GitHub).
+_GITHUB_HOST = re.compile(r"(?:^|@|//)github\.com(?:[:/]|$)", re.I)
 
 
 # ---- phases (built in parallel by T11a; imported lazily) -------------------------------------
@@ -81,13 +85,22 @@ def change_name(title):
 
 # ---- mode (remote or local) -----------------------------------------------------------------
 
+def _has_github_remote(folder):
+    """True when any of the folder's remotes points at github.com."""
+    for name in git(folder, "remote")[1].split():
+        if _GITHUB_HOST.search(git(folder, "remote", "get-url", name)[1]):
+            return True
+    return False
+
+
 def detect_mode(folder):
     """`"remote"` when the folder is a git repo with a GitHub remote and `gh` access, else
-    `"local"` (C7). Local mode works on one machine only (proposal 6.10)."""
+    `"local"` (C7). Local mode works on one machine only (proposal 6.10). Every remote is checked
+    for a github.com host (not a substring), so a repo with a GitHub remote beside another is still
+    remote, and a non-GitHub URL that merely contains "github" is not."""
     if not os.path.isdir(folder) or not git(folder, "rev-parse", "--git-dir")[0]:
         return "local"
-    url = git(folder, "remote", "get-url", remote_of(folder))[1]
-    if "github.com" not in url and "github" not in url:
+    if not _has_github_remote(folder):
         return "local"
     return "remote" if gh("auth", "status")[0] else "local"
 
@@ -208,12 +221,17 @@ def show(s, feature):
 
 def _base_point(s, feature):
     """What `sync` merges into the feature branch: in remote mode the remote's base (fetched), so
-    the feature branch catches up with work merged on GitHub; else the local base branch."""
+    the feature branch catches up with work merged on GitHub; else the local base branch. A fetch
+    that fails in remote mode is raised, not swallowed: merging a stale remote-tracking branch would
+    report a clean sync that never saw the current base."""
     main, base = s.loc["folder"], feature.get("base") or "main"
     if feature.get("mode") == "remote":
         remote = remote_of(main)
         if remote in git(main, "remote")[1].split():
-            git_quick(main, "fetch", "--quiet", "--no-tags", remote, base)
+            ok, _, err = git_quick(main, "fetch", "--quiet", "--no-tags", remote, base)
+            if not ok:
+                raise Fail(f"Couldn't fetch {base} from {remote}: {err or 'the remote is unreachable'}. "
+                           f"Sync again when it is reachable.")
             tracked = f"{remote}/{base}"
             if git(main, "show-ref", "--verify", "--quiet", f"refs/remotes/{tracked}")[0]:
                 return tracked
@@ -257,7 +275,12 @@ def cancel(s, feature):
     """Stop the Feature's running Tasks and remove its queued ones; keep the feature branch and
     delete nothing (C7, proposal 6.12). A running Task's agents are killed and it is marked
     cancelled; a queued, scheduled or not-started Task is taken out of the queue and marked
-    cancelled. No branch, worktree or file is removed."""
+    cancelled. No branch, worktree or file is removed.
+
+    This stops the Tasks in this (home) machine's store and sets the Feature to `cancelled`. A child
+    that runs on another machine is not in this store; `tick.py` (T19), which already polls each
+    machine each tick, stops it when it sees the cancelled phase. feature.py may change only its own
+    file and must not run herdr-task on other machines, so cross-machine stops are not done here."""
     stopped, removed = [], []
     for t in _feature_tasks(s, feature):
         if t.get("state") in ("done", "cancelled"):
@@ -283,10 +306,17 @@ def cancel(s, feature):
 
 def _squash_merge_local(main, fb, base, message):
     """Squash-merge the feature branch into the base branch locally (local mode, proposal 6.10),
-    as the classic local merge does. Returns an error string, or None on success. Works in the
-    folder when the base is checked out there, else in a throwaway worktree on the base."""
+    as the classic local merge does. Returns an error string, or None on success.
+
+    The person's work is never touched or lost: when the base is the folder's own checkout the merge
+    runs there only if that checkout is clean (else it refuses and the person keeps their edits), so
+    the `reset --hard` that undoes a conflicted squash can only restore the base tip, not discard
+    uncommitted work. Otherwise the merge runs in a throwaway worktree on the base."""
     own_tmp = None
     if current_base(main) == base:
+        if git(main, "status", "--porcelain")[1].strip():
+            return (f"The folder has uncommitted changes on {base}; commit or set them aside, then "
+                    f"merge again. Nothing was changed.")
         wt = main
     else:
         own_tmp = tempfile.mkdtemp(prefix="herdr-feature-merge-")
@@ -298,11 +328,12 @@ def _squash_merge_local(main, fb, base, message):
     try:
         ok, _, err = git(wt, "merge", "--squash", fb)
         if not ok:
-            git(wt, "merge", "--abort")
-            git(wt, "reset", "--hard")
-            return err or f"Couldn't squash-merge {fb} into {base}."
+            # The worktree was clean before, so this restores it to the base tip and loses nothing.
+            git(wt, "reset", "--hard", "HEAD")
+            return err or f"Couldn't squash-merge {fb} into {base} (conflicts)."
         ok, out, err = git(wt, "commit", "-m", message)
         if not ok and "nothing to commit" not in (out + err):
+            git(wt, "reset", "--hard", "HEAD")
             return err or f"Couldn't commit the merge of {fb}."
         return None
     finally:
@@ -320,7 +351,12 @@ def merge(s, feature):
                    f"Merge feature works only in phase ready.")
     pr = feature.get("pr") or {}
     url = pr.get("url")
-    if feature.get("mode") == "remote" and pr.get("number"):
+    if feature.get("mode") == "remote":
+        # Remote mode merges the pull request, never a silent local squash: that would report the
+        # Feature done without landing anything on GitHub.
+        if not pr.get("number"):
+            raise Fail(f"{s.ref(feature)} has no open pull request to merge; closing opens it. "
+                       f"Try Merge feature again once the pull request is open.")
         repo = pr.get("repo") or github(s)
         if not repo:
             raise Fail("No GitHub repo for this Feature's pull request.")
@@ -416,6 +452,13 @@ def _cmd_list(args):
 
 
 def _cmd_show(args):
+    # `feature show <ref> --on <machine>` reads a Feature whose home is another machine (C4). The
+    # Feature record lives on its home machine, so the show is forwarded there, the same way the
+    # top-level `herdr-task --on <machine> ...` forwards; `--on` for this machine reads locally.
+    on = getattr(args, "on", None)
+    if on and on != machine_name():
+        from . import cli
+        return cli.remote(on, ["feature", "show", args.ref] + (["--json"] if getattr(args, "json", False) else []))
     with open_store(args, write=False) as s:
         feature = get(s, args.ref)
         data = show(s, feature)
