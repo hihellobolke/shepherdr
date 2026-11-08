@@ -11,12 +11,20 @@ free up. It is idempotent: a second run adds only the missing children (property
 `--amend` reads an updated table, adds the new rows and cancels an unstarted child of a removed row.
 
 `check_plan` is the plan guard that `ready` runs on a spec Task (contract C8): `openspec validate`
-plus a dry run must both pass before the plan can be approved.
+plus a dry run must both pass before the plan can be approved. The spec worker runs `ready` in its own
+worktree, so `check_plan` reads the work table and validates from that worktree, not from the main
+checkout the Feature record lives in.
 
-The glossary words (proposal section 2) are the ones used here: Feature, child Task, Verify Task,
-work table, row, wave, chain, work package, fan-out, placement, chain affinity, amendment. The module
+The after links and the Verify Task are built from the Feature's own `children` list (the records that
+were actually created), never from the plan's predicted refs, so a real run is correct even when the
+counter has moved or a child sits on another machine. A child on another machine is reached only
+through `herdr-task --on <machine>`; the tests never run a changed herdr-task on another machine (a
+repo rule), so the cross-machine refs use the Feature's folder prefix, the shape the C5 example shows.
+
+The glossary words (proposal section 2) are the ones used here: Feature, child Task, Verify Task, work
+table, row, wave, chain, work package, fan-out, placement, chain affinity, amendment. The module
 depends only on `worktable` and `store` (contract C11); it never imports the modules that other T05-
-wave tasks build in parallel, and it reaches another machine only through `herdr-task --on <machine>`.
+wave tasks build in parallel.
 """
 
 import json
@@ -26,7 +34,7 @@ import subprocess
 import sys
 
 from .base import ENTRY, Fail, guard, now, run as run_cmd
-from .settings import set_task, settings_for
+from .settings import machine_name, set_task, settings_for
 from .store import locate, open_store, Store
 from .queues import set_after
 from .output import say
@@ -35,19 +43,21 @@ from . import worktable
 
 # ---- the dry-run plan (contract C5) ---------------------------------------------------------
 
-def plan(s, change, machines=None, amend=False):
+def plan(s, change, machines=None, amend=False, folder=None):
     """The dry-run plan for `change` (contract C5): the waves, the work packages with their owns,
     dependencies, risk, machine, branch, base, after links, merge mode and generated brief, and the
     Verify Task's after list. Creates nothing.
 
-    Raises Fail when the folder has no Feature for the change. Returns the invalid shape
+    `folder` overrides where `tasks.md` is read from (the spec worktree for the `ready` plan guard);
+    it defaults to the Feature's folder. Raises Fail when the folder has no Feature for the change, or
+    when `machines` names other machines for a local-mode Feature. Returns the invalid shape
     {"change", "valid": False, "code", "error"} when the work table is bad (the codes of C5/C6)."""
     feature = _feature_for(s, change)
     if machines and feature.get("mode") == "local":
         raise Fail(f"{s.ref(feature)} is in local mode (no GitHub remote): it runs on one machine "
                    f"only, so fan-out cannot place children on {', '.join(machines)}.")
     try:
-        rows = _read_rows(s.loc["folder"], change)
+        rows = _read_rows(folder or s.loc["folder"], change)
         worktable.check_table(rows)
     except worktable.WorkTableError as e:
         return {"change": change, "valid": False, "code": e.code, "error": e.message}
@@ -78,7 +88,7 @@ def plan(s, change, machines=None, amend=False):
             "machine": machine,
             "branch": _child_branch(s, feature, refs[pkg["id"]]["ref"], pkg),
             "base": feature["branch"],
-            "after": _after_refs(pkg, packages, refs, machine),
+            "after": _plan_after(pkg, packages, refs, machine),
             "merge": "ask" if pkg["risk"] == "high" else "checks",
             "brief": _child_brief(s, feature, change, pkg),
         })
@@ -105,12 +115,14 @@ def dry_run_json(plan_dict):
 
 def run(s, change, machines=None, amend=False, start=True):
     """Create the missing child Tasks of `change` in plan order, add (or extend) the Verify Task that
-    waits for them, and queue them when `start` (the queue then starts them as slots free up). Returns
-    the plan (contract C5) with `"created": {"children": n, "verify": 0|1}` and `"started": n`.
+    waits for them all, and queue them when `start` (the queue then starts them as slots free up).
+    Returns the plan (contract C5) with `"created": {"children": n, "verify": 0|1}` and `"started": n`,
+    and `"cancelled"` when an amendment cancelled children.
 
     Idempotent: a child already recorded on the Feature (matched by its work-package rows) is left as
-    it is, so a second run only fills the gaps. With `amend`, an unstarted child of a row that the
-    table no longer has is cancelled, and a started one is kept with a warning (section 6.7)."""
+    it is, so a second run only fills the gaps. With `amend`, an unstarted child of a row the table no
+    longer has is cancelled, a started one is kept with a warning, and a running child's owns are never
+    changed (section 6.7)."""
     p = plan(s, change, machines, amend)
     if not p.get("valid"):
         raise Fail(p.get("error") or "the work table is not valid")
@@ -124,11 +136,12 @@ def run(s, change, machines=None, amend=False, start=True):
     for entry in p["packages"]:
         if frozenset(entry["rows"]) in existing:
             continue
-        _create_child(s, feature, entry, start, queued_at)
+        _create_child(s, feature, entry, p["packages"], start, queued_at)
+        existing = _children_by_rows(feature)  # so a later package sees this one as a dependency
         created += 1
         queued_at += 1
 
-    _link_children(s, feature, p["packages"])
+    _link_home_children(s, feature, p["packages"])
     verify_made = _ensure_verify(s, feature, change, start, queued_at)
     s.dirty = True
 
@@ -140,14 +153,16 @@ def run(s, change, machines=None, amend=False, start=True):
 
 
 def check_plan(folder, change):
-    """The `ready` plan guard for a spec Task (contract C7/C8): `openspec validate <change>` and a
-    dry run must both pass. Returns {"ok": bool, "detail": str}; `detail` names the first failure."""
+    """The `ready` plan guard for a spec Task (contract C7/C8): `openspec validate <change>` and a dry
+    run must both pass. The spec worker runs in its own worktree, so both read from `folder` (the
+    worktree), while the Feature record is read from the folder's store (the main checkout). Returns
+    {"ok": bool, "detail": str}; `detail` names the first failure."""
     ok, detail = _openspec_valid(folder, change)
     if not ok:
         return {"ok": False, "detail": detail}
     try:
         with Store(locate(folder), write=False) as s:
-            p = plan(s, change)
+            p = plan(s, change, folder=folder)
     except Fail as e:
         return {"ok": False, "detail": str(e)}
     if not p.get("valid"):
@@ -158,18 +173,20 @@ def check_plan(folder, change):
 # ---- the command entry ----------------------------------------------------------------------
 
 def cmd_fanout(args):
-    """The `fanout` command (contract C4/C5). `--dry-run` prints the plan and creates nothing; a real
-    run creates and (unless `--no-start`) queues the children."""
+    """The `fanout` command (contract C4/C5/C6). `--dry-run` prints the plan and creates nothing; a
+    real run creates and (unless `--no-start`) queues the children. An invalid work table prints the
+    C5 invalid shape and exits 1, for a real run as well as a dry run."""
     change = args.change
     machines = [m.strip() for m in (getattr(args, "machines", None) or "").split(",") if m.strip()] or None
     amend = bool(getattr(args, "amend", False))
     dry = bool(getattr(args, "dry_run", False))
     with open_store(args, write=not dry) as s:
-        if dry:
-            p = plan(s, change, machines, amend)
+        p = plan(s, change, machines, amend)
+        if not p.get("valid"):
             _say_plan(args, p)
-            return 0 if p.get("valid") else 1
-        p = run(s, change, machines, amend, start=not getattr(args, "no_start", False))
+            return 1
+        if not dry:
+            p = run(s, change, machines, amend, start=not getattr(args, "no_start", False))
     _say_plan(args, p)
     return 0
 
@@ -185,8 +202,10 @@ def _say_plan(args, p):
     for pkg in p["packages"]:
         where = f" on {pkg['machine']}" if pkg["machine"] else ""
         risk = f" [high: {pkg['risk_reason']}]" if pkg["risk"] == "high" else ""
-        after = f" after {', '.join(pkg['after'])}" if pkg["after"] else ""
-        lines.append(f"  {pkg['package']} ({', '.join(pkg['rows'])}) {pkg['branch']}{where}{risk}{after}")
+        after = f", after {', '.join(pkg['after'])}" if pkg["after"] else ""
+        lines.append(f"  {pkg['package']} ({', '.join(pkg['rows'])}){where}{risk}")
+        lines.append(f"    add --branch {pkg['branch']} --base {pkg['base']} --owns {','.join(pkg['owns'])} "
+                     f"--risk {pkg['risk']} --set merge={pkg['merge']}{after}")
     lines.append(f"  verify after {', '.join(p['verify_task']['after']) or '(nothing)'}")
     for w in p.get("warnings") or []:
         lines.append(f"  warning: {w}")
@@ -194,6 +213,8 @@ def _say_plan(args, p):
         lines.append(f"created {p['created']['children']} child Tasks"
                      + (" and 1 Verify Task" if p["created"]["verify"] else "")
                      + (f", queued {p['started']}" if p["started"] else ""))
+    for ref in p.get("cancelled") or []:
+        lines.append(f"cancelled {ref} (its row was removed)")
     print("\n".join(lines))
 
 
@@ -224,10 +245,10 @@ def _read_rows(folder, change):
 
 def _packages(rows, waves, row_order, s):
     """Group the rows into work packages (section 6.7 step 5). A package holds rows of one wave and one
-    directory; one row is one package by default (the shape the contract fixtures and C5 example show,
-    and the one that gives the most parallel children, which is the point of the flow). Returns the
-    packages in run order (`row_order`), each with its id (the row id), its rows, wave, owns, external
-    row dependencies, risk, risk reason and size."""
+    directory; one row is one package by default (the shape the contract fixtures and the C5 example
+    show, and the one that gives the most parallel children, which is the point of the flow). Returns
+    the packages in run order (`row_order`), each with its id (the row id), its rows, wave, owns,
+    external row dependencies, risk, risk reason and size."""
     wave_of = {rid: depth for depth, ids in enumerate(waves) for rid in ids}
     order_pos = {rid: i for i, rid in enumerate(row_order)}
     risky = settings_for(s)["tasks"].get("risky_paths") or []
@@ -341,13 +362,13 @@ def _pkg_chain_len(ids, successors):
     return chain
 
 
-# ---- refs, branches and after links ---------------------------------------------------------
+# ---- refs and branches (plan display only) --------------------------------------------------
 
 def _predict_refs(s, feature, packages):
-    """A map from package id to {ref, ref_q, machine} for the plan. An existing child keeps its real
-    ref and machine; a missing one is predicted from the folder counter in package order, with this
-    folder's prefix (the prediction a real run realises for home children). `ref_q` is the ref a task
-    on another machine is named by (machine:ref), the plain ref on the home machine."""
+    """For the plan display, a map from package id to {ref, ref_q, machine}. An existing child keeps
+    its real ref and machine; a missing one is predicted from the folder counter in package order,
+    with this folder's prefix. These predictions are for the dry-run preview only; a real run links by
+    the children it actually creates (`_link_home_children`, `_ensure_verify`)."""
     existing = _children_by_rows(feature)
     nxt = s.data.get("next", 1)
     refs = {}
@@ -362,12 +383,11 @@ def _predict_refs(s, feature, packages):
     return refs
 
 
-def _after_refs(pkg, packages, refs, machine):
-    """The refs this package comes after: the child of each package it depends on. A dependency on
-    another machine is named machine:ref (proposal section 6.13, the cross-wave links). A root package
-    (no package dependency) comes after nothing: the fan-out trigger only runs once the spec Task has
-    merged onto the feature branch (contract C8), so the children branch from a feature branch that
-    already holds the plan."""
+def _plan_after(pkg, packages, refs, machine):
+    """The after refs shown in the plan: the child of each package it depends on, machine-qualified
+    when it sits on another machine (proposal section 6.13). A root package comes after nothing: the
+    fan-out trigger only runs once the spec Task has merged onto the feature branch (contract C8), so
+    the children branch from a feature branch that already holds the plan."""
     out = []
     for pid in _pkg_depends(pkg, packages):
         dep = refs[pid]
@@ -415,12 +435,14 @@ def _child_brief(s, feature, change, pkg):
 
 # ---- creating the Tasks ---------------------------------------------------------------------
 
-def _create_child(s, feature, entry, start, queued_at):
+def _create_child(s, feature, entry, packages, start, queued_at):
     """Create one child Task for a work package (contract C2 fields), on this machine or, when the
     package is placed elsewhere, on that machine with `herdr-task --on`. Records it on the Feature's
-    `children` list."""
+    `children` list. The home child's after links are set later by `_link_home_children` (once every
+    package it depends on exists); a remote child is given its after at creation, because it lives in
+    the other machine's store and cannot be relinked from here."""
     if entry["machine"]:
-        _create_remote_child(s, feature, entry, start)
+        _create_remote_child(s, feature, entry, packages, start)
         return
     t = s.new(
         _child_title(entry),
@@ -448,17 +470,33 @@ def _child_title(entry):
     return f"{entry['package']}: {', '.join(entry['rows'])}"
 
 
-def _create_remote_child(s, feature, entry, start):
+def _create_remote_child(s, feature, entry, packages, start):
     """Create a child on another machine with `herdr-task --on <machine> add` (proposal section 6.13).
-    Only the home machine runs fan-out; this is how it places a package elsewhere. Not reached by the
-    tests, which never run a changed herdr-task on other machines (a repo rule)."""
+    Only the home machine runs fan-out; this is how it places a package elsewhere. The after links use
+    the Feature's folder prefix (the C5 example's shape) and name a predecessor on another machine with
+    that machine first. Not reached by the tests, which never run a changed herdr-task on another
+    machine (a repo rule)."""
     machine = entry["machine"]
+    after = _remote_after(s, feature, entry, packages)
     argv = ["--on", machine, "add", _child_title(entry), "--worktree", "--prompt", entry["brief"],
             "--branch", entry["branch"], "--base", feature["branch"], "--folder", s.loc["folder"],
             "--feature", s.ref(feature), "--role", "child", "--risk", entry["risk"],
             "--owns", ",".join(entry["owns"]), "--set", f"merge={entry['merge']}", "--json"]
-    if entry["after"]:
-        argv += ["--after", ",".join(entry["after"])]
+    if after:
+        argv += ["--after", ",".join(after)]
+    created = _remote_call(machine, argv, f"create {entry['package']}")
+    rid = created["id"]
+    feature.setdefault("children", []).append(
+        {"ref": rid, "machine": machine, "package": entry["package"], "rows": list(entry["rows"]), "role": "child"})
+    if start:
+        _remote_call(machine, ["--on", machine, "start", f"{s.prefix}-{rid}", "--folder", s.loc["folder"], "--json"],
+                     f"start {entry['package']}")
+    s.dirty = True
+
+
+def _remote_call(machine, argv, what):
+    """Run `herdr-task --on <machine> ...` and return the parsed JSON object, or Fail with the error.
+    Uses the same entry the queue uses for cross-machine calls (queues.ext_state)."""
     guard(["hc"])
     r = subprocess.run([sys.executable, ENTRY, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                        universal_newlines=True)
@@ -466,48 +504,85 @@ def _create_remote_child(s, feature, entry, start):
         d = json.loads(r.stdout)
     except ValueError:
         d = None
-    if r.returncode != 0 or not isinstance(d, dict) or "id" not in d:
-        raise Fail(f"Couldn't create {entry['package']} on {machine}: "
-                   f"{(r.stderr or '').strip() or 'no task returned'}")
-    feature.setdefault("children", []).append(
-        {"ref": d["id"], "machine": machine, "package": entry["package"], "rows": list(entry["rows"]), "role": "child"})
-    s.dirty = True
+    if r.returncode != 0 or not isinstance(d, dict) or d.get("error"):
+        raise Fail(f"Couldn't {what} on {machine}: "
+                   f"{(d or {}).get('error') or (r.stderr or '').strip() or 'no task returned'}")
+    return d
 
 
-def _link_children(s, feature, packages_plan):
-    """Set each home child's `after` to the children of the packages it depends on (contract: the
-    queue then starts a child only once its dependencies are done). A dependency on another machine is
-    added as an external `--after` (proposal section 6.13, the cross-wave links)."""
+def _remote_after(s, feature, entry, packages):
+    """The `--after` refs for a child created on another machine: a predecessor on the same machine is
+    a bare ref, one on the home machine or another machine is named with that machine first."""
+    home = machine_name()
+    out = []
+    for dc in _dep_children(feature, entry, packages):
+        ref = f"{s.prefix}-{dc['ref']}"
+        if dc.get("machine") == entry["machine"]:
+            out.append(ref)
+        elif dc.get("machine"):
+            out.append(f"{dc['machine']}:{ref}")
+        elif home:
+            out.append(f"{home}:{ref}")
+    return out
+
+
+# ---- after links, driven by the created children (not by predictions) ------------------------
+
+def _dep_children(feature, entry, packages):
+    """The Feature `children` entries of the packages a package depends on (its predecessors), in
+    order. Recovers the package-level links from the plan's row dependencies."""
     by_pkg = {c["package"]: c for c in feature.get("children", [])}
-    holder = {rid: entry["package"] for entry in packages_plan for rid in entry["rows"]}
-    for entry in packages_plan:
-        c = by_pkg.get(entry["package"])
-        if not c or c.get("machine"):
-            continue
+    holder = {rid: pkg["package"] for pkg in packages for rid in pkg["rows"]}
+    out = []
+    for dep_pkg in _dedup(holder[d] for d in entry["depends"] if holder.get(d) and holder[d] != entry["package"]):
+        c = by_pkg.get(dep_pkg)
+        if c:
+            out.append(c)
+    return out
+
+
+def _local_and_ext(s, children):
+    """Split a list of child entries into (home task ids, external after records). A child on another
+    machine becomes an `after_ext` record (queues.set_after), named with its machine first and the
+    Feature's folder prefix (the C5 example's shape)."""
+    home_ids, ext = [], []
+    for c in children:
+        if c.get("machine"):
+            ext.append({"ref": f"{c['machine']}:{s.prefix}-{c['ref']}", "machine": c["machine"],
+                        "prefix": s.prefix, "id": c["ref"]})
+        else:
+            home_ids.append(c["ref"])
+    return home_ids, ext
+
+
+def _link_home_children(s, feature, packages):
+    """Set each home child's `after` to the children of the packages it depends on, always reconciling
+    (so a dependency that an amendment removed is cleared, not left pointing at a cancelled Task). A
+    dependency on another machine becomes an external after record."""
+    by_pkg = {c["package"]: c for c in feature.get("children", [])}
+    entry_by_pkg = {e["package"]: e for e in packages}
+    for c in feature.get("children", []):
+        if c.get("machine"):
+            continue  # a remote child's after was set on its own machine at creation
         t = s.task_by_id(c["ref"])
-        if not t:
+        entry = entry_by_pkg.get(c["package"])
+        if not t or not entry:
             continue
-        home_ids, ext = [], []
-        for dep_pkg in _dedup(holder[d] for d in entry["depends"] if holder.get(d) and holder[d] != entry["package"]):
-            dc = by_pkg.get(dep_pkg)
-            if not dc:
-                continue
-            if dc.get("machine"):
-                ext.append({"ref": _ref_of(s, dc), "machine": dc["machine"], "prefix": s.prefix, "id": dc["ref"]})
-            else:
-                home_ids.append(dc["ref"])
-        if (home_ids or ext) and ((t.get("after") or []) != home_ids or ext):
+        home_ids, ext = _local_and_ext(s, _dep_children(feature, entry, packages))
+        if (t.get("after") or []) != home_ids or (t.get("after_ext") or []) != ext:
             set_after(s, t, home_ids, ext)
 
 
 def _ensure_verify(s, feature, change, start, queued_at):
-    """Create the first Verify Task (role verify) that waits for every child, or extend the existing
-    one's `after` with any newly added children. Returns True when a Verify Task was created."""
-    home_ids = [c["ref"] for c in feature.get("children", []) if not c.get("machine")]
+    """Create the first Verify Task (role verify) that waits for every child, or reconcile the existing
+    one's after with the current children (new ones added, cancelled ones dropped). Returns True when a
+    Verify Task was created. The Verify Task waits for children on every machine, not only the home
+    ones (proposal section 6.11)."""
+    home_ids, ext = _local_and_ext(s, feature.get("children", []))
     if feature.get("verify_task"):
         t = s.task_by_id(feature["verify_task"])
-        if t and home_ids and (t.get("after") or []) != home_ids:
-            set_after(s, t, home_ids)
+        if t and ((t.get("after") or []) != home_ids or (t.get("after_ext") or []) != ext):
+            set_after(s, t, home_ids, ext)
         return False
     t = s.new(
         f"Verify {s.ref(feature)}: {feature['title']}",
@@ -520,8 +595,8 @@ def _ensure_verify(s, feature, change, start, queued_at):
     )
     t["branch"] = f"task/{s.ref(feature)}-{s.ref(t)}-verify"
     t["base"], t["base_set"] = feature["branch"], True
-    if home_ids:
-        set_after(s, t, home_ids)
+    if home_ids or ext:
+        set_after(s, t, home_ids, ext)
     if start:
         t["state"], t["queued_at"] = "queued", queued_at
     feature["verify_task"] = t["id"]
@@ -532,24 +607,36 @@ def _ensure_verify(s, feature, change, start, queued_at):
 # ---- amendment (section 6.7) ----------------------------------------------------------------
 
 def _amend_warnings(s, feature, packages):
-    """The warnings an amendment prints (section 6.7): a started child of a removed row. The running
-    child's owns are never changed under it, so the plan keeps its old package; a changed owns shows
-    here too when the row stays but its paths move."""
+    """The warnings an amendment prints (section 6.7): a started child of a removed row, and a running
+    child whose owned paths the new table changed (the running child keeps its owns; the Assistant
+    decides). A removed child on another machine is named so the Assistant can act on it there."""
     warnings = []
+    pkg_by_rows = {frozenset(pkg["rows"]): pkg for pkg in packages}
     all_rows = {r for pkg in packages for r in pkg["rows"]}
     for c in feature.get("children", []):
         rows = set(c.get("rows") or [])
         if rows and not (rows & all_rows):
             t = _child_record(s, c)
-            if t and _started(t):
-                warnings.append(
-                    f"row(s) {', '.join(sorted(rows))} removed, but child {_ref_of(s, c)} has started; it stays")
+            if c.get("machine"):
+                warnings.append(f"row(s) {', '.join(sorted(rows))} removed, but child {_ref_of(s, c)} is on "
+                                f"{c['machine']}; cancel it there if it has not started")
+            elif t and _started(t):
+                warnings.append(f"row(s) {', '.join(sorted(rows))} removed, but child {_ref_of(s, c)} has "
+                                f"started; it stays")
+            continue
+        pkg = pkg_by_rows.get(frozenset(c.get("rows") or []))
+        t = _child_record(s, c)
+        if pkg and t and sorted(t.get("owns") or []) != sorted(pkg["owns"]):
+            warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed owns to "
+                            f"{', '.join(pkg['owns'])}, but child {_ref_of(s, c)} keeps {', '.join(t.get('owns') or [])}")
     return warnings
 
 
 def _amend_cancel(s, feature, packages):
-    """Cancel an unstarted child of a row the table no longer has (section 6.7). A started child is
-    kept (its warning comes from the plan). Returns the refs of the cancelled children."""
+    """Cancel an unstarted home child of a row the table no longer has (section 6.7). A started child
+    is kept (its warning comes from the plan). A removed child on another machine is left for the
+    Assistant to cancel there (its warning names it); this machine never cancels another machine's
+    Task on its own. Returns the refs of the cancelled children."""
     all_rows = {r for pkg in packages for r in pkg["rows"]}
     cancelled = []
     for c in list(feature.get("children", [])):

@@ -155,6 +155,23 @@ class PlanTest(Base):
             with self.assertRaises(Fail):
                 fanout.plan(s, "no-such-change")
 
+    def test_folder_override_reads_that_tree(self):
+        # The spec worker runs `ready` in its own worktree, so the plan guard must read the table from
+        # the given folder, not from the Feature's checkout. Put a broken table in the main checkout
+        # and a good one in a separate tree; `folder=` picks the tree to read.
+        broken = ("## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+                  "| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
+        self.write_table(broken)  # main checkout now has a cyclic table
+        other = tempfile.mkdtemp(prefix="herdr-fanout-wt-")
+        self.addCleanup(shutil.rmtree, other, ignore_errors=True)
+        cdir = os.path.join(other, "openspec", "changes", self.change)
+        os.makedirs(cdir)
+        with open(os.path.join(cdir, "tasks.md"), "w") as f:
+            f.write(VALID_TABLE)
+        with st.Store(self.loc, write=False) as s:
+            self.assertFalse(fanout.plan(s, self.change)["valid"])  # reads the broken main table
+            self.assertTrue(fanout.plan(s, self.change, folder=other)["valid"])  # reads the good tree
+
 
 # ---- work-table error codes (C5/C6) ----------------------------------------------------------
 
@@ -274,6 +291,22 @@ class RunTest(Base):
         with st.Store(self.loc) as s:
             with self.assertRaises(Fail):
                 fanout.run(s, self.change)
+
+    def test_verify_waits_for_children_on_every_machine(self):
+        # A Verify Task must wait for children on other machines too, not only the home ones. Seed a
+        # remote child entry and check the split the Verify Task's after is built from.
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            feat["children"] = [
+                {"ref": 50, "machine": None, "package": "0.1", "rows": ["0.1"], "role": "child"},
+                {"ref": 51, "machine": "vm-b", "package": "1.1", "rows": ["1.1"], "role": "child"},
+            ]
+            home_ids, ext = fanout._local_and_ext(s, feat["children"])
+            self.assertEqual(home_ids, [50])
+            self.assertEqual(len(ext), 1)
+            self.assertEqual(ext[0]["machine"], "vm-b")
+            self.assertTrue(ext[0]["ref"].startswith("vm-b:"))
+            self.assertEqual(ext[0]["id"], 51)
 
 
 # ---- placement with chain affinity (section 6.13), via the dry run ----------------------------
@@ -397,6 +430,33 @@ class AmendTest(Base):
         rows = {tuple(c["rows"]) for c in self.read()["features"][0]["children"]}
         self.assertIn(("1.2",), rows)  # kept
 
+    def test_removed_dependency_clears_after(self):
+        # 1.1 depended on 0.1. An amendment drops 0.1 (unstarted) and drops 1.1's dependency on it.
+        # 0.1's child is cancelled, and 1.1's after must no longer point at the cancelled Task.
+        before = {tuple(t["rows"]): t["after"] for t in self.read()["tasks"]
+                  if t.get("rows") == ["1.1"]}
+        self.assertTrue(before[("1.1",)])  # it had an after link
+        self._amend_table(
+            "| 1.1 | H | src/h.ts |  | low | S |\n"
+            "| 1.2 | B | src/b.ts |  | low | S |\n"
+        )
+        self.run_fanout(amend=True)
+        after = {tuple(t["rows"]): t.get("after") or [] for t in self.read()["tasks"]
+                 if t.get("role") == "child"}
+        self.assertEqual(after[("1.1",)], [])  # the removed dependency was reconciled away
+
+    def test_changed_owns_of_existing_child_warns(self):
+        # Keep row 1.1 but change its owned paths. The running child keeps its owns; a warning names it.
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/moved.ts | 0.1 | low | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        self.assertTrue(any("owns" in w and "1.1" in w for w in r["warnings"]))
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertEqual(child["owns"], ["src/h.ts"])  # unchanged under the running child
+
 
 # ---- risk from risky paths (section 6.6) -----------------------------------------------------
 
@@ -509,6 +569,19 @@ class CmdFanoutTest(Base):
         self.write_table("## Work table\n\nnothing\n")
         rc, out = self._capture(Args(change=self.change, folder=self.repo, dry_run=True))
         self.assertEqual(rc, 1)
+
+    def test_real_run_invalid_prints_c5_shape(self):
+        # A real run (not dry) with a bad table still prints the C5 invalid shape and exits 1, rather
+        # than losing it to a plain {"error": ...}; nothing is created.
+        self.write_table(
+            "## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
+            "| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
+        rc, out = self._capture(Args(change=self.change, folder=self.repo, json=True))
+        self.assertEqual(rc, 1)
+        p = json.loads(out)
+        self.assertFalse(p["valid"])
+        self.assertEqual(p["code"], "cycle")
+        self.assertEqual(len([t for t in self.read()["tasks"] if t.get("role") == "child"]), 0)
 
 
 if __name__ == "__main__":
