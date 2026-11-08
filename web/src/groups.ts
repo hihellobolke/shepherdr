@@ -6,7 +6,7 @@
 // remembered on this device; by status until chosen. By status on more spaces, each status's tasks (but Pinned's and
 // Needs you's) go under a light heading per machine · space when they are in more than one (Split by space, on until
 // switched off).
-import { doneNewestFirst, type Machine, type Place, type Task } from '@shared/types.ts'
+import { doneNewestFirst, type Feature, type Machine, type Place, type Task } from '@shared/types.ts'
 
 export type GroupBy = 'status' | 'machine' | 'project' | 'machine-project'
 export type Groups = { all: GroupBy; machine: GroupBy; split: boolean }
@@ -234,6 +234,48 @@ function projectGroups(places: Place[], machines: Machine[], ts: Task[], level: 
     const p = places.find((x) => `${x.machine}|${x.name}` === k)
     const machine = level === 0 ? machines.find((m) => m.machine === on)?.name : undefined
     out.push({ key: p?.id ?? `list:${k}`, label: name, note: machine, tasks, names: { machine: false, project: false } })
+  }
+  return out
+}
+
+/* ---------- OpenSpec flow: a folder's Features, their Tasks nested (proposal section 6.17) ---------- */
+
+/** A Feature group a task list shows (proposal section 6.17, docs/openspec-flow.md C9): one summary row for the
+ *  Feature (its phase, how many children merged of the total, the open verify findings and the two actions - all
+ *  already computed by the shared core core/features.js featureRow and carried on the snapshot Feature), with its
+ *  child Tasks nested under it. */
+export interface FeatureGroup {
+  feature: Feature
+  /** its child Tasks to nest under it, in the list's status order; empty when all its children are pinned or need you
+   *  (those stay cross-cutting in Pinned and Needs you) */
+  tasks: Task[]
+}
+
+/** The child Tasks of a Feature among a list of Tasks, scoped by folder and machine. A Feature id is drawn from the
+ *  same per-folder counter as a Task's (docs/openspec-flow.md C2, ADR-0002), so it is unique only within its own
+ *  machine's store: a Task is this Feature's child only when it shares the Feature's folder and machine. `host` is this
+ *  machine's key, because a home Feature's `machine` is null while its Tasks carry the host as their `on`. */
+export function featureChildren(feature: Feature, tasks: Task[], host: string): Task[] {
+  const machine = feature.machine ?? host
+  return tasks.filter((t) => t.feature === feature.id && t.taskFolder === feature.folder && t.on === machine)
+}
+
+/**
+ * Group a task list's Features, each with its child Tasks nested under it (proposal section 6.17). A Feature shows when
+ * it has a child in the list, or `keep` says so (a search that matches the Feature itself, so its heading stays even
+ * when no child matches). Its nested children are its own Tasks that are neither pinned nor needing you: those stay
+ * cross-cutting in the Pinned and Needs you groups, as the window does, so no Task shows twice. `host` is this
+ * machine's key (see featureChildren). The order follows the Features as given (the service publishes them in the
+ * folder's order); a classic space has no Features, so this is empty and the list is untouched.
+ */
+export function featureGroups(features: Feature[], tasks: Task[], host: string, keep: (feature: Feature) => boolean = () => false): FeatureGroup[] {
+  const order = (ts: Task[]) => doneNewestFirst(GROUPS.flatMap(([s]) => ts.filter((t) => t.status === s)))
+  const out: FeatureGroup[] = []
+  for (const feature of features) {
+    const all = featureChildren(feature, tasks, host)
+    if (!all.length && !keep(feature)) continue
+    const nested = all.filter((t) => !t.pinned && t.status !== 'need')
+    out.push({ feature, tasks: order(nested) })
   }
   return out
 }
