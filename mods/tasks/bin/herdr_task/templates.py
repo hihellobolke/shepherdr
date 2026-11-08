@@ -85,7 +85,12 @@ SUBAGENTS_RULE = ("read-only, as your own helper agent that people can watch and
 WORKER_MD_BEFORE_FEEDBACK = WORKER_MD_BEFORE_SUBAGENTS.replace(SUBAGENTS_OLD, SUBAGENTS_RULE)
 # Since agents offer feedback for Shepherdr itself through their Assistant (SHEP-78).
 FEEDBACK_RULE = ("- Shepherdr itself misbehaving, not your task's own code (a Shepherdr, herdr-task, web app or window feature that doesn't work as meant, a Herdr command failing like a bug, the person frustrated with Shepherdr, or a \"Shepherdr feedback:\" line in your reviewer's findings): run the `herdr-task feedback` command given at the end of your brief, once per problem, then carry on. It returns at once and your Assistant asks the person whether to file it; never file an issue yourself, and put no secrets, private paths or whole logs in it.\n")
-WORKER_MD = WORKER_MD_BEFORE_FEEDBACK + FEEDBACK_RULE
+WORKER_MD_BEFORE_FLOW = WORKER_MD_BEFORE_FEEDBACK + FEEDBACK_RULE
+# Since the OpenSpec flow adds a flow file to a worker's brief (SHMD-13): the pointer is inert on a classic task.
+FLOW_POINTER_WORKER = ("- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries "
+                       "a flow file (spec, child or verify), this task is part of a Feature: follow that file, which carries your "
+                       "role's rules. A brief with no flow file is an ordinary task: work as usual.\n")
+WORKER_MD = WORKER_MD_BEFORE_FLOW + FLOW_POINTER_WORKER
 
 REVIEWER_MD_BEFORE_SUBAGENT = """You review one Herdr task's work before it can merge. Read only: never edit files, commit or push.
 - Read the task, then the diff of its branch against its base, and run the project's checks.
@@ -99,7 +104,15 @@ REVIEWER_MD_BEFORE_FEEDBACK = REVIEWER_MD_BEFORE_SUBAGENT + ("- You run as the w
 # Since agents offer feedback for Shepherdr itself (SHEP-78): a reviewer's goes through its worker.
 REVIEWER_FEEDBACK = ("- Shepherdr itself misbehaving while you review (a Herdr command or feature failing like a bug, not the task's code): "
                      "one line in your findings starting \"Shepherdr feedback:\", what happened and what you expected; your worker passes it on.\n")
-REVIEWER_MD = REVIEWER_MD_BEFORE_FEEDBACK + REVIEWER_FEEDBACK
+REVIEWER_MD_BEFORE_FLOW = REVIEWER_MD_BEFORE_FEEDBACK + REVIEWER_FEEDBACK
+# Since the reviewer reads CODING_STANDARDS.md and gets a flow pointer (SHMD-13): the pointer is inert on a classic task.
+REVIEWER_FLOW = ("- Flow: when the Settings block says `Flow: openspec` and the task's brief carried a flow file with owned paths "
+                 "(a Feature's Child Task or Fix Task), check the change stays within those owned paths and does only its work "
+                 "package; the Verify Task checks the Feature as a whole. An ordinary task has no owned paths: review it as usual.\n"
+                 "- If the repo has a CODING_STANDARDS.md, read it and check the change against it.\n")
+REVIEWER_MD = REVIEWER_MD_BEFORE_FLOW + REVIEWER_FLOW
+# Earlier reviewer defaults: a file still saying one, unedited, gets today's.
+OLD_REVIEWERS = (REVIEWER_MD_BEFORE_FLOW, REVIEWER_MD_BEFORE_FEEDBACK, REVIEWER_MD_BEFORE_SUBAGENT)
 
 
 # Earlier worker defaults: a file still saying one, unedited, gets today's.
@@ -112,7 +125,7 @@ OLD_WORKER_READY = """You work on one Herdr task. Stay within the task's scope a
 - When the work is finished, run the `herdr-task ready` command given at the end of your brief, with a short summary. That puts the task in Ready for the person, who accepts it. Never mark a task done yourself.
 """
 OLD_WORKER_MD = OLD_WORKER_READY.split("- When the work is finished")[0]
-OLD_WORKERS = (WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
+OLD_WORKERS = (WORKER_MD_BEFORE_FLOW, WORKER_MD_BEFORE_FEEDBACK, WORKER_MD_BEFORE_SUBAGENTS, WORKER_MD_BEFORE_LEFT, WORKER_MD_BEFORE_DETAILS, WORKER_MD_BEFORE_CUT, WORKER_MD_BEFORE_ESTIMATE, WORKER_MD_BEFORE_SUMMARY, WORKER_MD_BEFORE_GATE, WORKER_MD_BEFORE_TEMPLATES, WORKER_MD_BEFORE_NEWS, OLD_WORKER_READY, OLD_WORKER_MD, OLD_WORKER_MD.replace(OLD_WORKER_MD.split("\n")[0], OLD_WORKER_FIRST), OLD_WORKER_REVIEW)
 
 
 TEMPLATE_HEADS = {
@@ -145,7 +158,7 @@ def instructions(role):
             body = None
         text = None
     if body is None or (role == "worker" and body.strip() in [x.strip() for x in OLD_WORKERS]) \
-            or (role == "reviewer" and body.strip() in (REVIEWER_MD_BEFORE_SUBAGENT.strip(), REVIEWER_MD_BEFORE_FEEDBACK.strip())):
+            or (role == "reviewer" and body.strip() in [x.strip() for x in OLD_REVIEWERS]):
         body = WORKER_MD if role == "worker" else REVIEWER_MD
     new = head + body.strip() + "\n"
     if text is None or new.strip() != text.strip():

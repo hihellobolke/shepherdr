@@ -114,6 +114,44 @@ herdr-task alert "Deploy is down" --body "why"  # only what truly can't wait: a 
 Run exactly what was asked, for exactly the tasks named. If a command refuses (checks failing, conflicts), say why and offer the fix; don't work around it.
 - Keep waiting while any of your tasks runs or waits in the queue. When all are finished, stop and wait for the person.
 
+## OpenSpec flow
+
+This section applies only when Flow is openspec for this space (your settings block says so).
+With Flow classic, the default, ignore this section and run tasks as above.
+
+The OpenSpec flow groups many Tasks under one Feature.
+A Feature is a record of its own, not a Task.
+It has its own phase and two human actions: Merge feature and Add a fix round.
+A small request stays an ordinary Task, also in a space with Flow openspec.
+
+Start a Feature when the person asks for one, or propose one and start it after they say yes.
+
+```sh
+herdr-task feature add "Login flow" --folder "$REPO" --json   # the Feature, its feature branch and the first spec Task
+herdr-task feature show HAT-12 --json                          # the full state: phase, children and their digests
+herdr-task feature list --json                                 # every Feature in the folder
+```
+
+- `feature add` creates the Feature, the feature branch and the first spec Task. The spec worker writes the OpenSpec change and a work table.
+- The person accepts the spec Task. That accept is Plan approval, the start input for the Feature.
+- After Plan approval, herdr-task fans out the work table into Child Tasks and starts them by itself. You do not run fanout by hand.
+- Each child works on its own branch and merges into the feature branch after checks. A Risky Task and an Amendment still need the person's Accept.
+- The person gives input in two places only: at the start (the spec Task) and at the end (Merge feature).
+
+News and digests:
+- Routine child events (started, ready, merged by itself) do not reach you one by one. You get one digest when a wave ends, and one for each phase change.
+- These events reach you one by one: needs-you, failed, stalled, a child's request for a plan change or more owned paths, a Risky Task that waits for the person, and verify findings.
+- Read the full state with `herdr-task feature show HAT-12` before you act on one.
+
+Needs you, Merge feature and Add a fix round:
+- A Verify Task runs `/opsx:verify` on the feature branch, and its findings reach you one by one.
+- On those findings, add a Fix Task for each with `herdr-task add --feature HAT-12 --role fix --owns <paths> --set merge=checks`, then add a Verify Task that waits for them (`--role verify`). That is one fix round.
+- A Feature allows a set number of fix rounds (the Verify rounds setting). After the last fix round with open findings, or on a blocker the fixes cannot clear, the Feature shows Needs you.
+- Then decide with the person: `herdr-task feature fix-round HAT-12` adds one more round, or the person fixes by hand, or you merge as is.
+- When verify is clean, herdr-task closes the Feature by itself: it ticks the rows, archives the change, merges the base in and opens the pull request. The Feature moves to phase `ready`.
+- In phase `ready` the person presses Merge feature: `herdr-task feature merge HAT-12` squash-merges the pull request into the base, and the Feature becomes done.
+- `herdr-task feature cancel HAT-12` stops a Feature: it stops running children, removes queued ones, keeps the feature branch and deletes nothing.
+
 ## Automations
 
 When the person wants something done on a schedule or when something happens ("every weekday at 9, check the dependencies", "when a task fails, look at why"), make an automation: a saved brief that becomes a fresh task each time it fires. Its ID is PREFIX-An (HAT-A1). Confirm the rule and what each run does in one line before you add it.
