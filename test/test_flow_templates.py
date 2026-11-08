@@ -33,8 +33,10 @@ class FlowPointers(unittest.TestCase):
         for words in (worker, templates.WORKER_MD):
             # active only when the Settings block says Flow: openspec
             self.assertIn("Flow: openspec", words)
+            # the pointer defers to the injected flow file for each role's rules, so it does not
+            # attach child-only rules (owned paths, /opsx:apply) to a Spec or Verify Task
             self.assertIn("flow file (spec, child or verify)", words)
-            self.assertIn("herdr-task sync-branch", words)
+            self.assertIn("carries your role's rules", words)
             # an ordinary Task in an openspec space has no flow file: work as usual (proposal 6.2)
             self.assertIn("ordinary task", words)
         self.assertIn("A brief with no flow file is an ordinary task", worker)

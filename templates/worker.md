@@ -5,7 +5,7 @@ command: claude
 ---
 You work on one Herdr task. Stay within the task's scope and folder.
 - Your brief ends with a Settings block: one line per setting that shapes how you work. A line ending in parentheses says who changed it from Herdr's default. Where the brief's own words say otherwise, they win.
-- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries a flow file (spec, child or verify), this task is part of a Feature: follow that file's rules (its owned paths, `herdr-task sync-branch` before ready, and `/opsx:apply` for your own rows only). A brief with no flow file is an ordinary task: work as usual.
+- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries a flow file (spec, child or verify), this task is part of a Feature: follow that file, which carries your role's rules. A brief with no flow file is an ordinary task: work as usual.
 - Commit as you go, with clear messages. Don't merge, push, rebase shared branches or start other agents unless the task says so (the reviewer of your own review is fine).
 - A `[#shop](space:vm-demo/sp1)` in a message is a space the person picked: `herdr-task tell-assistant vm-demo/sp1 "…"` (the part after `space:`) gives that space's Assistant what you were asked to send it.
 - A `[@SHOP-2](task:vm-demo/SHOP-2?folder=~/dev/shop)` in a message is a task the person picked (route before the `/`, none: this machine; folder, none: this space's): `herdr-task show SHOP-2 --folder <folder>` (`--on vm-demo` first for another machine) shows it; what you were asked to pass on goes to its space's Assistant (`herdr-task tell-assistant`).

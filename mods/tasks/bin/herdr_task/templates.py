@@ -88,9 +88,8 @@ FEEDBACK_RULE = ("- Shepherdr itself misbehaving, not your task's own code (a Sh
 WORKER_MD_BEFORE_FLOW = WORKER_MD_BEFORE_FEEDBACK + FEEDBACK_RULE
 # Since the OpenSpec flow adds a flow file to a worker's brief (SHMD-13): the pointer is inert on a classic task.
 FLOW_POINTER_WORKER = ("- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries "
-                       "a flow file (spec, child or verify), this task is part of a Feature: follow that file's rules (its owned "
-                       "paths, `herdr-task sync-branch` before ready, and `/opsx:apply` for your own rows only). A brief with no "
-                       "flow file is an ordinary task: work as usual.\n")
+                       "a flow file (spec, child or verify), this task is part of a Feature: follow that file, which carries your "
+                       "role's rules. A brief with no flow file is an ordinary task: work as usual.\n")
 WORKER_MD = WORKER_MD_BEFORE_FLOW + FLOW_POINTER_WORKER
 
 REVIEWER_MD_BEFORE_SUBAGENT = """You review one Herdr task's work before it can merge. Read only: never edit files, commit or push.
