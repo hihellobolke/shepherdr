@@ -120,6 +120,9 @@ class Store:
         d["slug"] = self.slug
         d.setdefault("next", 1)
         d.setdefault("tasks", [])
+        # A Feature is a record of its own (ADR-0001). It lives in this list, separate from tasks.
+        # Old code keys on "tasks" and ignores "features" (is_task_list checks only folder + tasks).
+        d.setdefault("features", [])
         self.new_prefix = False
         if self.write:
             self.migrate()
@@ -155,30 +158,90 @@ class Store:
     def prefix(self):
         return self.data.get("prefix") or auto_prefix(os.path.basename(self.loc["folder"]))
 
-    def ref(self, task):
-        """What people and agents call it: HAT-4."""
-        return f"{self.prefix}-{task['id']}"
+    def ref(self, rec):
+        """What people and agents call a Task or a Feature: HAT-4. Both draw their number from
+        the same folder counter (ADR-0002), so a ref is computed the same way for either, and it
+        is never stored."""
+        return f"{self.prefix}-{rec['id']}"
 
-    def find(self, ref):
+    def _num_for(self, ref):
+        """The folder number a ref names, after the prefix is checked against this folder's."""
         pre, n = parse_ref(ref)
         if pre and pre != self.prefix:
-            raise Fail(f"{pre}-{n} isn't a task in {self.loc['folder']} (its tasks are {self.prefix}-n).")
-        for t in self.data["tasks"]:
-            if t["id"] == n:
-                return t
+            raise Fail(f"{pre}-{n} isn't in {self.loc['folder']} (it uses {self.prefix}-n).")
+        return n
+
+    def task_by_id(self, n):
+        return next((t for t in self.data["tasks"] if t["id"] == n), None)
+
+    def feature_by_id(self, n):
+        return next((f for f in self.data.get("features", []) if f["id"] == n), None)
+
+    def find(self, ref):
+        """The Task a ref names. A Feature draws from the same counter, so a number is a Task or a
+        Feature, never both (ADR-0002); a Feature's number here is a clear error, not a match."""
+        n = self._num_for(ref)
+        t = self.task_by_id(n)
+        if t:
+            return t
+        if self.feature_by_id(n):
+            raise Fail(f"{self.prefix}-{n} is a feature, not a task in {self.loc['folder']}; "
+                       f"use `feature show {self.prefix}-{n}`.")
         raise Fail(f"No task {self.prefix}-{n} in {self.loc['folder']}.")
+
+    def find_feature(self, ref):
+        """The Feature a ref names; raises if the ref is a Task or missing (C7 feature.get)."""
+        n = self._num_for(ref)
+        f = self.feature_by_id(n)
+        if f:
+            return f
+        if self.task_by_id(n):
+            raise Fail(f"{self.prefix}-{n} is a task, not a feature in {self.loc['folder']}.")
+        raise Fail(f"No feature {self.prefix}-{n} in {self.loc['folder']}.")
+
+    def resolve(self, ref):
+        """("feature", f) or ("task", t) for a ref that may be either; a number matches at most
+        one, so the answer is never ambiguous. Raises when the folder has neither."""
+        n = self._num_for(ref)
+        f = self.feature_by_id(n)
+        if f:
+            return "feature", f
+        t = self.task_by_id(n)
+        if t:
+            return "task", t
+        raise Fail(f"No task or feature {self.prefix}-{n} in {self.loc['folder']}.")
 
     def max_running(self):
         return int(settings_for(self)["tasks"].get("max_running") or MAX_RUNNING)
 
-    def new(self, title, prompt="", mode="here"):
+    def new(self, title, prompt="", mode="here", **fields):
+        """A new Task, drawing the next folder number. A classic Task passes no `fields`; a flow
+        Task stamps its flow fields here (`feature`, `role`, `owns`, `risk`, `rows`, ... of C2),
+        so the task dict is built in one place."""
         d = self.data
         t = {"id": d["next"], "title": title, "prompt": prompt, "mode": mode, "state": "todo",
              "created": now(), "agents": []}
+        t.update(fields)
         d["next"] += 1
         d["tasks"].append(t)
         self.dirty = True
         return t
+
+    def new_feature(self, title, change, branch, base="main", mode="remote",
+                    spec_task=None, auto_fanout=True):
+        """A new Feature record (ADR-0001, C2), drawing the next folder number from the same
+        counter the Tasks use (ADR-0002). The spec Task is created after and its id set on
+        `spec_task`. Returns the record; `s.ref(feature)` gives its ref."""
+        d = self.data
+        d.setdefault("features", [])
+        f = {"id": d["next"], "title": title, "change": change, "branch": branch, "base": base,
+             "mode": mode, "phase": "planning", "attention": "", "spec_task": spec_task,
+             "children": [], "verify_task": None, "fix_rounds": 0, "auto_fanout": auto_fanout,
+             "digests": {}, "created": now()}
+        d["next"] += 1
+        d["features"].append(f)
+        self.dirty = True
+        return f
 
     # The Tasks panel's old lists: <repo>/.git/herdr-tasks.json, and data/tasks/<slug>.json in the
     # app's home for folders outside git. Read once, then set aside as *.migrated.
