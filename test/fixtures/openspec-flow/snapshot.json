@@ -1,0 +1,162 @@
+{
+  "places": [
+    {
+      "id": "vm-demo/sp1",
+      "machine": "vm-demo",
+      "name": "shop",
+      "folder": "/tmp/throwaway/shop"
+    }
+  ],
+  "machines": [
+    "vm-demo",
+    "vm-b"
+  ],
+  "features": [
+    {
+      "id": 12,
+      "ref": "HAT-12",
+      "title": "Login flow",
+      "change": "add-login-flow",
+      "branch": "feature/HAT-12-login-flow",
+      "base": "main",
+      "mode": "remote",
+      "phase": "building",
+      "phaseLabel": "Building",
+      "attention": "",
+      "spec_task": 13,
+      "verify_task": 17,
+      "fix_rounds": 0,
+      "auto_fanout": true,
+      "merged": 1,
+      "total": 3,
+      "findings": 0,
+      "actions": [],
+      "folder": "/tmp/throwaway/shop",
+      "machine": null
+    },
+    {
+      "id": 18,
+      "ref": "HAT-18",
+      "title": "Checkout polish",
+      "change": "polish-checkout",
+      "branch": "feature/HAT-18-checkout-polish",
+      "base": "main",
+      "mode": "local",
+      "phase": "ready",
+      "phaseLabel": "Ready to merge",
+      "attention": "",
+      "spec_task": 19,
+      "verify_task": 31,
+      "fix_rounds": 1,
+      "auto_fanout": true,
+      "merged": 4,
+      "total": 4,
+      "findings": 0,
+      "actions": [
+        {
+          "id": "feature-merge",
+          "label": "Merge feature"
+        }
+      ],
+      "folder": "/tmp/throwaway/shop",
+      "machine": null
+    },
+    {
+      "id": 40,
+      "ref": "HAT-40",
+      "title": "Search revamp",
+      "change": "revamp-search",
+      "branch": "feature/HAT-40-search-revamp",
+      "base": "main",
+      "mode": "remote",
+      "phase": "verifying",
+      "phaseLabel": "Verifying",
+      "attention": "verify-open",
+      "spec_task": 41,
+      "verify_task": 55,
+      "fix_rounds": 2,
+      "auto_fanout": true,
+      "merged": 6,
+      "total": 6,
+      "findings": 2,
+      "actions": [
+        {
+          "id": "feature-fix-round",
+          "label": "Add a fix round"
+        }
+      ],
+      "folder": "/tmp/throwaway/shop",
+      "machine": null
+    }
+  ],
+  "tasks": [
+    {
+      "key": "shop#13",
+      "ref": "HAT-13",
+      "id": 13,
+      "title": "Plan the login flow",
+      "section": "done",
+      "machine": null,
+      "folder": "/tmp/throwaway/shop",
+      "feature": 12,
+      "role": "spec"
+    },
+    {
+      "key": "shop#14",
+      "ref": "HAT-14",
+      "id": 14,
+      "title": "Shared parser types",
+      "section": "done",
+      "machine": null,
+      "folder": "/tmp/throwaway/shop",
+      "feature": 12,
+      "role": "child",
+      "risk": "low"
+    },
+    {
+      "key": "shop#15",
+      "ref": "HAT-15",
+      "id": 15,
+      "title": "Parse body",
+      "section": "running",
+      "machine": "vm-b",
+      "folder": "/tmp/throwaway/shop",
+      "feature": 12,
+      "role": "child",
+      "risk": "high"
+    },
+    {
+      "key": "shop#16",
+      "ref": "HAT-16",
+      "id": 16,
+      "title": "Wire parser",
+      "section": "queued",
+      "machine": null,
+      "folder": "/tmp/throwaway/shop",
+      "feature": 12,
+      "role": "child",
+      "risk": "low"
+    },
+    {
+      "key": "shop#17",
+      "ref": "HAT-17",
+      "id": 17,
+      "title": "Verify login flow",
+      "section": "queued",
+      "machine": null,
+      "folder": "/tmp/throwaway/shop",
+      "feature": 12,
+      "role": "verify"
+    },
+    {
+      "key": "shop#7",
+      "ref": "HAT-7",
+      "id": 7,
+      "title": "Fix a typo in the footer",
+      "section": "ready",
+      "machine": null,
+      "folder": "/tmp/throwaway/shop",
+      "feature": null
+    }
+  ]
+}
