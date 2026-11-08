@@ -120,7 +120,8 @@ class FlowHooks(unittest.TestCase):
                     model=None, effort=None, reviewer=None, reviewer_model=None, reviewer_effort=None,
                     argv=None, parent=None, now=False, base=None, branch=None, start_notes=None,
                     finish_notes=None, set=None, summary=None, details=None, proof=None, agents_md=None,
-                    report=None, feature=None, role=None, owns=None, risk=None)
+                    report=None, feature=None, role=None, owns=None, risk=None, passed=False,
+                    findings_file=None, all=False, archived=False)
         return argparse.Namespace(**{**base, **kw})
 
     def call(self, fn, **kw):
@@ -417,6 +418,158 @@ class FlowHooks(unittest.TestCase):
         self.fake_module("feature", on_spec_accepted=lambda s, t: self.fail("hook ran for a child task"))
         self.call(self.commands.cmd_accept, id=ref)
         self.assertEqual(self.task(tid)["state"], "done")
+
+    # ---- is_flow and folder-mode flow tasks (round-1 review findings) ----------------------
+
+    def test_is_flow_covers_every_flow_field_and_no_classic_one(self):
+        for field in ("feature", "role", "owns", "risk"):
+            self.assertTrue(self.commands.is_flow({field: "x"}), field)
+        self.assertFalse(self.commands.is_flow({}))
+        self.assertFalse(self.commands.is_flow({"title": "classic"}))
+
+    def _folder_mode_flow_child(self, rel, owns):
+        """A running flow child that works in the repo folder itself (mode=here) on a branch off
+        main, with one commit changing `rel`."""
+        _, fid = self.make_feature()
+        self._git("checkout", "-q", "-b", "work", "main", cwd=self.folder)
+        self.write(self.folder, rel, "changed\n")
+        self._git("add", "-A", cwd=self.folder)
+        self._commit(self.folder, "work")
+        ref, tid = self.put_task({"feature": fid, "role": "child", "owns": owns},
+                                 mode="here", base="main", state="running", started=1,
+                                 review_gate=True, set={"review": "on", "review_rounds": 2})
+        return ref, tid
+
+    def test_owned_paths_guard_runs_for_a_folder_mode_flow_task(self):
+        ref, tid = self._folder_mode_flow_child("src/other.py", ["src/mine.py"])
+        with self.store() as s:
+            refused = self.commands.flow_ready_guards(s, s.find(ref), None)
+        self.assertIsNotNone(refused)
+        self.assertEqual(refused[1], "owned-paths")
+        self.assertEqual(refused[2], self.ready_guards.OWNED_PATHS)
+
+    def test_folder_mode_flow_review_goes_stale_after_a_content_change(self):
+        ref, tid = self._folder_mode_flow_child("src/mine.py", ["src/mine.py"])
+        self.call(self.commands.cmd_reviewed, id=ref, report="ok")
+        self.assertTrue(self.task(tid)["reviews"][-1]["patch_id"])  # patch-id recorded in folder mode
+        self.write(self.folder, "src/mine.py", "again\n")
+        self._git("add", "-A", cwd=self.folder)
+        self._commit(self.folder, "more")
+        with self.store() as s:
+            refused = self.commands.review_refusal(s, s.find(ref), None)
+        self.assertIsNotNone(refused)
+        self.assertEqual(refused[1], "review-stale")
+
+    def test_folder_mode_flow_review_stays_valid_with_no_change(self):
+        ref, tid = self._folder_mode_flow_child("src/mine.py", ["src/mine.py"])
+        self.call(self.commands.cmd_reviewed, id=ref, report="ok")
+        with self.store() as s:
+            self.assertIsNone(self.commands.review_refusal(s, s.find(ref), None))
+
+    def test_classic_folder_mode_review_accepts_any_round_as_before(self):
+        self._git("checkout", "-q", "-b", "work2", "main", cwd=self.folder)
+        self.write(self.folder, "src/mine.py", "x\n")
+        self._git("add", "-A", cwd=self.folder)
+        self._commit(self.folder, "work")
+        ref, tid = self.put_task(None, mode="here", state="running", started=1, review_gate=True,
+                                 set={"review": "on", "review_rounds": 2},
+                                 reviews=[{"round": 1, "result": "report", "at": 2, "head": "anything"}])
+        with self.store() as s:
+            self.assertIsNone(self.commands.review_refusal(s, s.find(ref), None))
+
+    # ---- verify-report (C4, C6, C8) -------------------------------------------------------
+
+    def _feature_with_verify(self, verify_state="running", extra_verify=False):
+        _, fid = self.make_feature()
+        vref, vid = self.put_task({"feature": fid, "role": "verify"}, mode="here", state=verify_state)
+        with self.store() as s:
+            s.feature_by_id(fid)["verify_task"] = vid
+            s.dirty = True
+        if extra_verify:
+            self.put_task({"feature": fid, "role": "verify"}, mode="here", state="running")
+        return fid, vref, vid
+
+    def test_verify_report_pass(self):
+        fid, vref, vid = self._feature_with_verify()
+        got = self.call(self.commands.cmd_verify_report, passed=True)
+        self.assertEqual(got, {"ok": True, "task": vref, "findings": 0, "blockers": 0})
+        t = self.task(vid)
+        self.assertIs(t["verify_pass"], True)
+        self.assertEqual(t["findings"], [])
+
+    def test_verify_report_findings(self):
+        fid, vref, vid = self._feature_with_verify()
+        findings = [{"level": "blocker", "title": "Auth bypass", "detail": "d", "paths": ["src/a.ts"], "row": "2.2"},
+                    {"level": "minor", "title": "nit", "detail": "d", "paths": [], "row": None}]
+        path = os.path.join(self.tmp, "findings.json")
+        with open(path, "w") as f:
+            json.dump(findings, f)
+        got = self.call(self.commands.cmd_verify_report, findings_file=path)
+        self.assertEqual(got["findings"], 2)
+        self.assertEqual(got["blockers"], 1)
+        t = self.task(vid)
+        self.assertIs(t["verify_pass"], False)
+        self.assertEqual(len(t["findings"]), 2)
+
+    def test_verify_report_rejects_a_bad_findings_file(self):
+        self._feature_with_verify()
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w") as f:
+            json.dump({"not": "a list"}, f)
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(findings_file=path))
+
+    def test_verify_report_rejects_a_bad_level(self):
+        self._feature_with_verify()
+        path = os.path.join(self.tmp, "bad.json")
+        with open(path, "w") as f:
+            json.dump([{"level": "huge", "title": "x"}], f)
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(findings_file=path))
+
+    def test_verify_report_needs_a_running_verify_task(self):
+        self.make_feature()  # no verify task running
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(passed=True))
+
+    def test_verify_report_refuses_two_verify_tasks_without_feature(self):
+        self._feature_with_verify(extra_verify=True)
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_verify_report(self.ns(passed=True))
+
+    def test_verify_report_picks_the_feature(self):
+        fid, vref, vid = self._feature_with_verify(extra_verify=True)
+        got = self.call(self.commands.cmd_verify_report, passed=True, feature=vref.rsplit("-", 1)[0] + f"-{fid}")
+        self.assertEqual(got["task"], vref)
+        self.assertIs(self.task(vid)["verify_pass"], True)
+
+    # ---- list --feature (C4, C8) ----------------------------------------------------------
+
+    def test_list_feature_filters_to_the_features_tasks(self):
+        fref, fid = self.make_feature()
+        self.call(self.commands.cmd_add, title="Child A", here=True, feature=fref)
+        self.call(self.commands.cmd_add, title="Child B", here=True, feature=fref)
+        self.call(self.commands.cmd_add, title="Unrelated", here=True)  # not in the feature
+        got = self.call(self.commands.cmd_list, feature=fref)
+        self.assertEqual(got["feature"]["ref"], fref)
+        self.assertEqual(len(got["tasks"]), 2)
+        for v in got["tasks"]:
+            self.assertEqual(v["feature"], fid)
+
+    def test_list_feature_text_shows_the_tree(self):
+        fref, fid = self.make_feature()
+        self.call(self.commands.cmd_add, title="Child A", here=True, feature=fref)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.commands.cmd_list(self.ns(json=False, feature=fref))
+        text = out.getvalue()
+        self.assertIn(f"{fref} Login flow", text)
+        self.assertIn("Child A", text)
+
+    def test_list_feature_rejects_a_task_ref(self):
+        ref, tid = self.put_task(None, mode="here", state="todo")
+        with self.assertRaises(self.Fail):
+            self.commands.cmd_list(self.ns(feature=ref))
 
 
 if __name__ == "__main__":

@@ -45,6 +45,8 @@ def cmd_where(args):
 
 
 def cmd_list(args):
+    # --feature (C4, C8): only this Feature's Tasks, shown under the Feature as its tree.
+    want_feature = getattr(args, "feature", None)
     if args.all:
         folders = [d["folder"] for d in map(read_list, store_files()) if is_task_list(d)]
     else:
@@ -54,9 +56,19 @@ def cmd_list(args):
         if not os.path.isdir(folder):
             continue
         with Store(locate(folder)) as s:
+            feat = None
+            if want_feature:
+                try:
+                    feat = s.find_feature(want_feature)
+                except Fail:
+                    if not args.all:
+                        raise  # a named Feature must be a real Feature in this folder
+                    continue  # with --all, skip a folder that has no such Feature
             out = []
             archived = sum(1 for t in s.data["tasks"] if t.get("archived"))
             for t in s.data["tasks"]:
+                if feat and t.get("feature") != feat["id"]:
+                    continue
                 if bool(t.get("archived")) != args.archived:
                     continue
                 mine = live_agents(s.key(t)) if t["state"] in ("running", "ready") else []
@@ -68,17 +80,24 @@ def cmd_list(args):
                 out.append(v)
             if args.archived:
                 out.sort(key=lambda v: -(v.get("archived") or 0))
-            groups.append({"folder": s.loc["folder"], "name": s.loc["name"], "kind": s.loc["kind"], "tasks": out,
-                           **({} if args.archived else {"archived": archived})})
+            group = {"folder": s.loc["folder"], "name": s.loc["name"], "kind": s.loc["kind"], "tasks": out,
+                     **({} if args.archived else {"archived": archived})}
+            if feat:
+                group["feature"] = {"ref": s.ref(feat), "title": feat.get("title"), "phase": feat.get("phase")}
+            groups.append(group)
     if args.json:
-        print(json.dumps(groups if args.all else groups[0]))
+        print(json.dumps(groups if (args.all or not groups and want_feature) else groups[0]))
         return
     for g in groups:
         if args.all:
             print(f"{g['name']}  {g['folder']}")
+        if g.get("feature"):
+            # The Feature's tree: its ref and title, then each of its Tasks indented (HAT-12 > HAT-14).
+            print(("  " if args.all else "") + f"{g['feature']['ref']} {g['feature']['title']}".rstrip())
+        tree = bool(g.get("feature"))
         for v in g["tasks"]:
             if v["state"] != "done" or args.all or args.archived:
-                print(("  " if args.all else "") + line(v))
+                print(("    " if (args.all and tree) else "  " if (args.all or tree) else "") + line(v))
         hidden = sum(1 for v in g["tasks"] if v["state"] == "done") if not args.archived else 0
         more = [f"{hidden} done"] if hidden and not args.all else []
         if g.get("archived") and not args.all:
@@ -86,7 +105,8 @@ def cmd_list(args):
         if more:
             print(f"({'; '.join(more)})")
         elif not g["tasks"] and not args.all:
-            print("No archived tasks." if args.archived else "No tasks.")
+            print(f"No tasks for {g['feature']['ref']}." if g.get("feature") else
+                  "No archived tasks." if args.archived else "No tasks.")
 
 
 # ---- OpenSpec flow hooks (T20b, contract C8) ------------------------------------------------
@@ -99,9 +119,18 @@ PLAN_INVALID = 3  # the `ready` plan-check exit code (C6); owned-paths and revie
 
 
 def is_flow(t):
-    """True for a flow Task: one that carries at least one flow field (C2). A classic Task carries
-    none of them, so every flow check is a no-op for it."""
-    return bool(t.get("feature") or t.get("role") or t.get("owns"))
+    """True for a flow Task: one that carries at least one flow field of C2 (`feature`, `role`,
+    `owns` or `risk`). A classic Task carries none of them, so every flow check is a no-op for it."""
+    return bool(t.get("feature") or t.get("role") or t.get("owns") or t.get("risk"))
+
+
+def flow_folder(s, t, wt):
+    """Where git runs for a flow Task's checks: its worktree when it has one, else the repo folder
+    itself (a flow Task that works in the folder is still checked against its base). None when the
+    folder is not a git repo, so there is nothing to diff."""
+    if wt and os.path.isdir(wt):
+        return wt
+    return s.loc["folder"] if s.loc["kind"] == "repo" else None
 
 
 def owns_list(values):
@@ -503,10 +532,13 @@ def flow_ready_guards(s, t, wt):
     - Owned paths: the diff against the base must change only the Task's owned paths (plus the
       exempt lockfiles and generated files, which `tasks.owns_exempt` extends). Refused with code 2.
     - The plan (a spec Task only): `fanout.check_plan` must pass (`openspec validate` and a valid
-      work table). Refused with code 3."""
-    folder = wt if (wt and os.path.isdir(wt)) else None
+      work table). Refused with code 3.
+
+    A flow Task normally works in a worktree, but one that works in the folder itself is still
+    checked against its base (never silently waved through)."""
+    folder = flow_folder(s, t, wt)
     if not folder:
-        return None  # a flow Task works in a worktree; with none there is nothing to diff
+        return None  # not a git repo: nothing to diff
     base = t.get("base") or "main"
     owns = t.get("owns") or []
     if owns:
@@ -547,17 +579,20 @@ def review_refusal(s, t, wt):
     if wt and t.get("start") and t.get("head") == t["start"]:
         return None  # no commits of its own: nothing to review (nothing to merge)
     revs = [r for r in t.get("reviews") or [] if r.get("result") in REVIEWED and (r.get("at") or 0) >= (t.get("started") or 0)]
-    head = t.get("head") if wt else None
     flow = is_flow(t)
-    if wt:
-        if flow and head:
-            folder = wt if os.path.isdir(wt) else s.loc["folder"]
-            patch = ready_guards.patch_id(folder, t.get("base") or "main")
+    if flow:
+        # A flow Task (worktree or folder) matches a round by commit hash or patch-id, so a clean
+        # rebase keeps the review valid. Its final commit is the worktree's head, else the folder's.
+        wd = flow_folder(s, t, wt)
+        head = t.get("head") if wt else ((git(wd, "rev-parse", "HEAD")[1] or None) if wd else None)
+        if wd and head:
+            patch = ready_guards.patch_id(wd, t.get("base") or "main")
             matched = ready_guards.review_valid({"reviews": revs}, head, patch)
         else:
-            matched = any(r.get("head") == head for r in revs)
+            matched = bool(revs)
     else:
-        matched = bool(revs)
+        head = t.get("head") if wt else None
+        matched = any(r.get("head") == head for r in revs) if wt else bool(revs)
     if matched:
         return None
     ref, ht, folder = s.ref(t), own_path(), shlex.quote(s.loc["folder"])
@@ -602,14 +637,68 @@ def cmd_reviewed(args):
         # hash (C8, proposal 6.9): `ready` then accepts the final commit across a clean rebase, which
         # keeps the patch-id even as the commit hash changes. A classic Task stores none, unchanged.
         if is_flow(t) and head:
-            folder = wt if (wt and os.path.isdir(wt)) else s.loc["folder"]
-            rec["patch_id"] = ready_guards.patch_id(folder, t.get("base") or "main")
+            wd = flow_folder(s, t, wt)
+            if wd:
+                rec["patch_id"] = ready_guards.patch_id(wd, t.get("base") or "main")
         t.setdefault("reviews", []).append(rec)
         t.pop("review_out", None)
         s.dirty = True
         v = view(s, t)
     on_what = f" for commit {head[:7]}" if head else ""
     say(args, {**v, "round": used + 1, "rounds": rounds}, f"{s.ref(t)}: review round {used + 1} of {rounds} recorded{on_what}.")
+
+
+VERIFY_LEVELS = ("blocker", "major", "minor")  # a verify finding's level (C5)
+
+
+def verify_task_of(s, feature_ref):
+    """The Verify Task a `verify-report` applies to (C4): the one of `--feature`, else the single
+    running Verify Task in the folder. Raises when the folder has none, or has more than one and no
+    `--feature` to pick it."""
+    if feature_ref:
+        feat = s.find_feature(feature_ref)
+        tid = feat.get("verify_task")
+        t = s.task_by_id(tid) if tid is not None else None
+        if not t:
+            raise Fail(f"{s.ref(feat)} has no Verify Task yet.")
+        if t.get("role") != "verify":
+            raise Fail(f"{s.ref(t)} is not a Verify Task.")
+        return t
+    running = [t for t in s.data["tasks"]
+               if t.get("role") == "verify" and t.get("state") in ("running", "ready")]
+    if not running:
+        raise Fail("No running Verify Task in this folder. Name its Feature with --feature.")
+    if len(running) > 1:
+        raise Fail("This folder has more than one running Verify Task: name its Feature with --feature.")
+    return running[0]
+
+
+def cmd_verify_report(args):
+    """A Verify Task reports its result (C4, C6, C8): `--pass` (no findings) or `--findings-file`
+    (a JSON list of findings, the shape of C5). Stores `verify_pass` and, for findings, the
+    `findings` list on the Verify Task (C2); the next tick reads the result through
+    `phases.phase_of`. Prints `{"ok": true, "findings": <n>, "blockers": <n>}` (exit 0); a bad
+    findings file, or no running Verify Task, is an error (exit 1)."""
+    findings = []
+    if not args.passed:
+        try:
+            with open(args.findings_file) as f:
+                findings = json.load(f)
+        except (OSError, ValueError) as e:
+            raise Fail(f"Couldn't read the findings file {args.findings_file!r}: {e}")
+        if not isinstance(findings, list) or not all(
+                isinstance(x, dict) and x.get("level") in VERIFY_LEVELS for x in findings):
+            raise Fail("The findings file must be a JSON list of findings, each a JSON object with a "
+                       "level of blocker, major or minor (the contract's findings shape).")
+    with open_store(args) as s:
+        t = verify_task_of(s, getattr(args, "feature", None))
+        t["verify_pass"] = bool(args.passed)
+        t["findings"] = [] if args.passed else findings
+        s.dirty = True
+        ref = s.ref(t)
+    blockers = sum(1 for x in findings if x.get("level") == "blocker")
+    how = "passed" if args.passed else f"reported {len(findings)} finding(s), {blockers} blocker(s)"
+    say(args, {"ok": True, "task": ref, "findings": len(findings), "blockers": blockers}, f"{ref}: verify {how}.")
 
 
 def cmd_review_more(args):
