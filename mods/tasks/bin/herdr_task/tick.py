@@ -21,7 +21,7 @@ from .queues import machine_hold, refresh_ext, running_count, set_hold, waiting_
 from .archive import archive_pass
 from .browsers import browser_pass
 from .output import progress_clock, say
-from .commands import back_to_work, begin, merge_now, MERGE_FAILED
+from .commands import back_to_work, begin, merge_now, start_again, MERGE_FAILED
 from . import news
 from .news import news_pass, typing
 from .takeover import cant_go_on, takeover
@@ -487,16 +487,21 @@ def one_feature(s, feature, report):
         return
     if phase_before == phases.DONE:
         _maybe_retro(s, feature, report)
+        _flush_news(s, feature, report)
         return
 
     gathered = _gather(s, feature, report) if phase_before in _ACTIVE_PHASES else {"children": []}
     _store_digests(s, feature, gathered)
 
     # The fan-out trigger: once the Plan is approved (building), fan-out is on for this Feature, and
-    # the approved work table has landed on the feature branch, turn it into child Tasks. It runs once
-    # (the children then exist); a deferred spec merge simply delays it to a later tick.
+    # the approved work table has landed on the feature branch, turn it into child Tasks. It runs while
+    # the Verify Task is not there yet, because `fanout.run` creates the children first and the Verify
+    # Task last (`fanout._ensure_verify`): a run that stopped part way (a child made, then a crash)
+    # leaves no Verify Task, so a later tick runs `fanout.run` again and, being idempotent, creates only
+    # the children still missing and then the Verify Task. A deferred spec merge simply delays the first
+    # run to a later tick, and a tick that fires twice creates no duplicates.
     if (phase_before == phases.BUILDING and feature.get("auto_fanout", True)
-            and not feature.get("children") and feature_mod.spec_merged(s, feature)):
+            and not feature.get("verify_task") and feature_mod.spec_merged(s, feature)):
         _fanout(s, feature, report)
 
     children = _flow_children(s, feature, gathered)
@@ -527,6 +532,7 @@ def one_feature(s, feature, report):
 
     _waves_pass(s, feature, children, report)
     _phase_news(s, feature, phase_before, report)
+    _flush_news(s, feature, report)
 
 
 # ---- gather, digests and fan-out ------------------------------------------------------------
@@ -546,13 +552,17 @@ def _gather(s, feature, report):
 def _store_digests(s, feature, gathered):
     """Write the digest of every child that has ended into `feature.digests` (contract C8, keyed by
     `digest.child_key`). `gather` carries a home child's digest (built by `feature_status.collect`)
-    and a remote child's digest (built on its own machine), so both are stored the one way."""
-    by_ref = {c.get("ref"): c.get("digest") for c in (gathered.get("children") or []) if c.get("digest")}
-    if not by_ref:
+    and a remote child's digest (built on its own machine), so both are stored the one way. Each child
+    is matched by its machine-qualified key so one machine's digest never lands on another machine's
+    child with the same ref (contract C2)."""
+    by_key = _gathered_by_key(s, gathered)
+    if not by_key:
         return
     digests = feature.setdefault("digests", {})
     for entry in feature.get("children") or []:
-        d = by_ref.get(f"{s.prefix}-{entry.get('ref')}")
+        m = _norm_machine(entry.get("machine"))
+        c = by_key.get((m, f"{s.prefix}-{entry.get('ref')}"))
+        d = (c or {}).get("digest")
         if d and digests.get(digest.child_key(entry)) != d:
             digests[digest.child_key(entry)] = d
             s.dirty = True
@@ -575,25 +585,55 @@ def _fanout(s, feature, report):
 
 # ---- the children the phase rules read ------------------------------------------------------
 
+def _norm_machine(machine):
+    """One spelling of the home machine (contract C2): `None` and `"local"` both mean home."""
+    return None if machine in (None, "local") else machine
+
+
+def _gathered_by_key(s, gathered):
+    """Map `(machine, ref-string)` -> one child's feature-status entry, from the per-machine gather
+    results (contract C5). A child id is unique only within its own machine's store (contract C2), and
+    `feature_status` names every child with the Feature's home prefix, so two machines can both hold a
+    child the same ref names (`HAT-2`); keying by `(machine, ref)` keeps them apart. The home machine's
+    result carries `machine` null. A gather that returns only a flat `children` list (no per-machine
+    split) is read as the home machine's, which is the only machine that can collide with itself."""
+    out = {}
+    results = gathered.get("machines")
+    if results:
+        for result in results:
+            m = _norm_machine(result.get("machine"))
+            for c in result.get("children") or []:
+                out[(m, c.get("ref"))] = c
+    else:
+        for c in gathered.get("children") or []:
+            out[(None, c.get("ref"))] = c
+    return out
+
+
 def _flow_children(s, feature, gathered):
     """The flow Task records `phases.phase_of` needs, one per Feature child plus the Verify and Fix
     Tasks (contract C7). A home child, Verify, Fix or Integration Task is its real Task record in this
     store. A remote child's Task lives only on its own machine (proposal 6.13), so it is synthesized
-    from the gathered feature-status (its live state) and its stored digest (its end state)."""
+    from the gathered feature-status (its live state) and its stored digest (its end state), matched by
+    its machine-qualified key so two machines' children with the same ref never collide (contract C2)."""
     records = [t for t in s.data.get("tasks") or []
                if t.get("feature") == feature.get("id") and t.get("role") in _CHILD_ROLES]
-    by_ref = {c.get("ref"): c for c in (gathered.get("children") or [])}
+    by_key = _gathered_by_key(s, gathered)
     for entry in feature.get("children") or []:
-        if entry.get("machine") is None:
+        m = _norm_machine(entry.get("machine"))
+        if m is None:
             continue
-        records.append(_remote_record(entry, by_ref.get(f"{s.prefix}-{entry.get('ref')}")))
+        records.append(_remote_record(entry, by_key.get((m, f"{s.prefix}-{entry.get('ref')}"))))
     return records
 
 
 def _remote_record(entry, status):
     """A synthetic child record for a remote child, from its gathered status and its digest. The
     record carries only what the phase rules read: role, rows, and the state (`merged`/`skipped`/
-    `cancelled`/`failed`/running) the digest or the live state says."""
+    `cancelled`/`failed`/running) the digest or the live state says. A remote child cannot be restarted
+    from the home machine, so a failed one is marked with its retry already used (`retries` 1): the
+    phase rules then surface it as `child-failed` at once rather than waiting for a retry that never
+    comes (remote child restart is deferred with remote child creation, proposal 6.13)."""
     rec = {"id": entry.get("ref"), "machine": entry.get("machine"),
            "role": entry.get("role") or "child", "rows": list(entry.get("rows") or [])}
     dstate = ((status or {}).get("digest") or {}).get("state")
@@ -605,7 +645,7 @@ def _remote_record(entry, status):
     elif dstate == "cancelled":
         rec["state"], rec["cancelled"] = "cancelled", True
     elif dstate == "failed":
-        rec["state"], rec["attention"] = "failed", "failed"
+        rec["state"], rec["attention"], rec["retries"] = "failed", "failed", 1
     else:
         rec["state"] = live_state or "running"
     return rec
@@ -627,7 +667,7 @@ def _child_pass(s, feature, children, report):
         live = [detail(k) for k in live_agents(s.key(t))]
         ev = _child_exception(s, t, live)
         if ev in ("failed", "stalled") and int(t.get("retries") or 0) < 1:
-            _retry_child(s, t, ev, live, report)
+            _retry_child(s, feature, t, ev, live, report)
         elif ev in CHILD_EXCEPTIONS:
             if t.get("attention") != ev:
                 t["attention"] = ev
@@ -671,20 +711,34 @@ def _child_exception(s, t, live):
     return None
 
 
-def _retry_child(s, t, ev, live, report):
-    """Restart a failed or stalled child once, from its own branch (contract C8, proposal 6.12). Its
-    stuck agent is ended, its retry counted, its flow attention cleared, and it is put back in the
-    queue; the queue starts it again when there is room, so it never surfaces to the person on its
-    first failure."""
+# What a restarted child hears, so its new agent knows why it was restarted and carries on from its
+# own branch (the resume path adds it after the session handoff).
+RETRY_NOTE = ("Herdr restarted you because your task {0} without finishing. Your branch and its commits "
+              "are still here. Pick up where you left off, run the checks, and say ready.")
+
+
+def _retry_child(s, feature, t, ev, live, report):
+    """Restart a failed or stalled child once, from its own branch (contract C8, proposal 6.12).
+
+    It goes through the existing resume path (`commands.start_again`), which resumes the child's own
+    session (or hands off to a fresh agent of the same kind) with a note that says why it was
+    restarted, so the restart keeps the child's context and never starts from the bare brief. A stalled
+    child's agent is still alive, so it is ended first; if that kill is refused, the restart is left for
+    the next tick and the one retry is not spent, so two workers never run in the same checkout."""
     for k in live:
-        if k.get("address"):
-            run(["hc", "kill", k["address"]])
+        if k.get("address") and run(["hc", "kill", k["address"]]).returncode != 0:
+            report.setdefault("feature_retry_blocked", []).append(s.ref(t))
+            return
+    space = _feature_space(s, feature)
     t["retries"] = int(t.get("retries") or 0) + 1
     t.pop("attention", None)
-    for k in ("done_at", "ended_at", "merged"):
-        t.pop(k, None)
-    t["state"], t["queued_at"] = "queued", now()
-    t.setdefault("queue", {})
+    t["state"] = "running"
+    try:
+        start_again(s, t, space, message=RETRY_NOTE.format("failed" if ev == "failed" else "stalled"))
+    except Exception as e:  # a restart that cannot launch is left for the next tick
+        t["retries"] -= 1
+        report.setdefault("feature_retry_error", []).append(f"{s.ref(t)}: {e}")
+        return
     s.dirty = True
     report.setdefault("feature_retry", []).append({"ref": s.ref(t), "event": ev, "retries": t["retries"]})
 
@@ -784,8 +838,11 @@ def _apply_phase(s, feature, phase, attention):
 
 def _waves_pass(s, feature, children, report):
     """Tell the Assistant when a wave ends: one digest message when every child of a wave is merged or
-    skipped (proposal 6.14). A wave is the leading number of a child's row ids (`2.1` is wave 2). Each
-    wave is told once (`waves_told`)."""
+    skipped (proposal 6.14). A wave is the leading number of a child's row id: the work-table grammar
+    defines a row id as "a wave number, a dot, a row number" (contract C3), so `2.1` is wave 2 and the
+    id prefix is the authored wave the person labelled the rows with. This is deliberately the authored
+    wave, not the topological depth `worktable.waves` recomputes: the summary speaks of the waves the
+    person wrote. Each wave is told once (`waves_told`)."""
     waves = {}
     for c in children:
         if c.get("role") != "child":
@@ -850,24 +907,50 @@ def _feature_news_line(ref, event, text):
 
 
 def _send_feature_news(s, feature, event, text, report, once=None):
-    """Send one line to the Feature's Assistant, held while the person is writing to it (as the task
-    news is). `once` dedupes a repeating event across ticks (stored under `feature.told`)."""
+    """Queue one line for the Feature's Assistant (proposal 6.14). It is not delivered here: it is put
+    on the Feature's own outbox (`news_pending`) and `_flush_news` delivers it, so a moment with no live
+    Assistant, or a send that cannot go now, does not lose the event - a later tick delivers it. `once`
+    dedupes a repeating event across ticks (stored under `feature.told`), so the same event is queued
+    only once, whatever happens to its delivery."""
     if once is not None:
         told = feature.setdefault("told", {})
         if told.get(once):
             return
         told[once] = now()
-        s.dirty = True
-    line = _feature_news_line(s.ref(feature), event, text)
-    report.setdefault("feature_news", []).append(
-        {"feature": s.ref(feature), "event": event, "text": text, "line": line})
+    feature.setdefault("news_pending", []).append({"event": event, "text": text, "at": now()})
+    s.dirty = True
+    report.setdefault("feature_news", []).append({"feature": s.ref(feature), "event": event, "text": text})
+
+
+def _flush_news(s, feature, report):
+    """Deliver the Feature's queued news to its Assistant, keeping an item that cannot be delivered now
+    for a later tick (proposal 6.14). An item is dropped only once it is delivered or has waited longer
+    than the task news keeps an undelivered line (`news.NEWS_KEEP_MS`). Delivery is held while the person
+    is writing to the Assistant, the way the task news is (`news.send_or_hold`)."""
+    pending = feature.get("news_pending")
+    if not pending:
+        return
     space = _feature_space(s, feature)
     to = coordinator_in(space) if space else None
-    if to:
-        try:
-            news.send_or_hold(to, line, how="news")
-        except Exception as e:  # never stops the Feature pass
-            report.setdefault("feature_news_error", []).append(str(e))
+    kept = []
+    for item in pending:
+        if now() - (item.get("at") or 0) > news.NEWS_KEEP_MS:
+            continue  # too old to still be news: drop it
+        delivered = False
+        if to:
+            line = _feature_news_line(s.ref(feature), item["event"], item["text"])
+            try:
+                delivered = bool(news.send_or_hold(to, line, how="news"))
+            except Exception as e:  # a bad send never stops the Feature pass
+                report.setdefault("feature_news_error", []).append(str(e))
+        if delivered:
+            report.setdefault("feature_news_sent", []).append(
+                {"feature": s.ref(feature), "event": item["event"]})
+        else:
+            kept.append(item)
+    if kept != pending:
+        feature["news_pending"] = kept
+        s.dirty = True
 
 
 def cmd_tick(args):

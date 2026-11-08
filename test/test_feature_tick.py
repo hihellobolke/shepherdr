@@ -92,10 +92,12 @@ class FeatureTickBase(unittest.TestCase):
                                         return_value={"created": {"children": 0, "verify": 0}}),
             "close": mock.patch.object(tick.closing, "close", return_value={}),
             "retro": mock.patch.object(tick.retro, "start", return_value=None),
-            "coordinator": mock.patch.object(tick, "coordinator_in", return_value=None),
+            "coordinator": mock.patch.object(tick, "coordinator_in", return_value="t-assistant"),
             "send": mock.patch.object(tick.news, "send_or_hold", return_value="sent"),
             "live": mock.patch.object(tick, "live_agents", return_value=[]),
+            "detail": mock.patch.object(tick, "detail", side_effect=lambda k: k),
             "run": mock.patch.object(tick, "run", return_value=mock.Mock(returncode=0)),
+            "start_again": mock.patch.object(tick, "start_again", return_value=(mock.Mock(), True)),
             "news_state": mock.patch.object(tick.news, "news_state", side_effect=news_state_for({})),
         }
         self.mocks = {k: p.start() for k, p in self.m.items()}
@@ -141,10 +143,21 @@ class PhaseChanges(FeatureTickBase):
         self.assertEqual(self.mocks["fanout"].call_args.args[1], "add-login-flow")
         self.assertTrue(any(n["event"] == "fanout" for n in report.get("feature_news", [])))
 
-    def test_fanout_not_fired_when_children_exist(self):
+    def test_fanout_retries_until_verify_task_exists(self):
+        # A partial fan-out (a child made, no Verify Task yet) is retried; fanout.run is idempotent.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        self.child(s, f, rows=("1.1",), state="running")  # a child exists, but no verify_task
+        self.mocks["spec_merged"].return_value = True
+        tick.one_feature(s, f, {})
+        self.mocks["fanout"].assert_called_once()
+
+    def test_fanout_not_fired_once_verify_task_exists(self):
         s = self.store()
         f = self.feature(s, phase="building")
         self.child(s, f, rows=("1.1",), state="running")
+        v = self.verify(s, f)
+        f["verify_task"] = v["id"]  # fan-out already completed
         self.mocks["spec_merged"].return_value = True
         tick.one_feature(s, f, {})
         self.mocks["fanout"].assert_not_called()
@@ -219,7 +232,7 @@ class Retry(FeatureTickBase):
         report = {}
         tick.one_feature(s, f, report)
         self.assertEqual(c["retries"], 1)
-        self.assertEqual(c["state"], "queued")
+        self.mocks["start_again"].assert_called_once()  # the existing resume path, not a bare re-queue
         self.assertNotIn("attention", c)
         self.assertEqual(f["attention"], "")  # not surfaced on the first failure
         self.assertTrue(any(r["event"] == "failed" for r in report.get("feature_retry", [])))
@@ -230,7 +243,21 @@ class Retry(FeatureTickBase):
         c = self.child(s, f, rows=("1.1",), state="running", _ev="stalled")
         tick.one_feature(s, f, {})
         self.assertEqual(c["retries"], 1)
-        self.assertEqual(c["state"], "queued")
+        self.mocks["start_again"].assert_called_once()
+
+    def test_stalled_child_not_restarted_if_its_agent_cannot_be_killed(self):
+        # A stalled child's agent is still alive; if hc kill is refused, do not start a second worker
+        # in the same checkout, and do not spend the one retry.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        c = self.child(s, f, rows=("1.1",), state="running", _ev="stalled")
+        self.mocks["live"].return_value = [{"address": "t-child"}]
+        self.mocks["run"].return_value = mock.Mock(returncode=1)  # kill refused
+        report = {}
+        tick.one_feature(s, f, report)
+        self.mocks["start_again"].assert_not_called()
+        self.assertEqual(c["retries"], 0)
+        self.assertIn("HAT-%d" % c["id"], report.get("feature_retry_blocked", []))
 
     def test_second_failure_surfaces_child_failed(self):
         s = self.store()
@@ -348,6 +375,24 @@ class News(FeatureTickBase):
         self.assertIn("‹script›", line)
         self.assertIn("feature=\"a &quot;ref&quot;\"", line)
 
+    def test_news_is_retried_until_delivered(self):
+        # No live Assistant on the first tick: the event is queued, not lost. A later tick with an
+        # Assistant delivers it.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        self.child(s, f, rows=("1.1",), state="running", retries=1, _ev="failed", space="sp1")
+        self.mocks["coordinator"].return_value = None  # no Assistant yet
+        tick.one_feature(s, f, {})
+        self.assertTrue(f.get("news_pending"))  # kept for later
+        self.mocks["send"].assert_not_called()
+        # The Assistant comes online; the next tick delivers the pending event.
+        self.mocks["coordinator"].return_value = "t-assistant"
+        report = {}
+        tick.one_feature(s, f, report)
+        self.assertTrue(self.mocks["send"].called)
+        self.assertFalse(f.get("news_pending"))
+        self.assertTrue(any(n["event"] == "failed" for n in report.get("feature_news_sent", [])))
+
     def test_wave_end_summary(self):
         s = self.store()
         f = self.feature(s, phase="building")
@@ -372,12 +417,49 @@ class Digests(FeatureTickBase):
         c = self.child(s, f, rows=("1.1",), state="done", merged=True)
         d = {"ref": "HAT-%d" % c["id"], "state": "merged", "rows": ["1.1"]}
         self.mocks["gather"].return_value = {
-            "children": [{"ref": "HAT-%d" % c["id"], "state": "done", "role": "child",
-                          "rows": ["1.1"], "digest": d}],
+            "machines": [{"machine": None, "reachable": True, "children": [
+                {"ref": "HAT-%d" % c["id"], "state": "done", "role": "child", "rows": ["1.1"], "digest": d}]}],
         }
         tick.one_feature(s, f, {})
-        key = "local:%d" % c["id"]
-        self.assertEqual(f["digests"].get(key), d)
+        self.assertEqual(f["digests"].get("local:%d" % c["id"]), d)
+
+    def test_remote_children_with_the_same_ref_do_not_collide(self):
+        # Two machines both hold a child whose id is 2 (ids are machine-local): the digest and the
+        # phase read must keep them apart by machine, not by ref alone.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        # A home child (id from the counter) plus two remote children both carrying ref 2.
+        f["children"] = [
+            {"ref": 2, "machine": "a", "rows": ["1.1"], "role": "child"},
+            {"ref": 2, "machine": "b", "rows": ["1.2"], "role": "child"},
+        ]
+        da = {"ref": "HAT-2", "state": "running"}
+        db = {"ref": "HAT-2", "state": "merged"}
+        self.mocks["gather"].return_value = {"machines": [
+            {"machine": "a", "reachable": True, "children": [
+                {"ref": "HAT-2", "state": "running", "role": "child", "rows": ["1.1"], "digest": None}]},
+            {"machine": "b", "reachable": True, "children": [
+                {"ref": "HAT-2", "state": "done", "role": "child", "rows": ["1.2"], "digest": db}]},
+        ]}
+        tick.one_feature(s, f, {})
+        # Only machine b's child is merged; its digest lands under b, not a, and a stays absent.
+        self.assertEqual(f["digests"].get("b:2"), db)
+        self.assertNotIn("a:2", f["digests"])
+        # Machine a's child is still running, so the Feature has not advanced out of building.
+        self.assertEqual(f["phase"], "building")
+
+    def test_remote_failed_child_surfaces(self):
+        # A remote child cannot be restarted from here, so a failed one surfaces at once (its synthetic
+        # record is marked with its retry used) rather than waiting for a retry that never comes.
+        s = self.store()
+        f = self.feature(s, phase="building")
+        f["children"] = [{"ref": 2, "machine": "a", "rows": ["1.1"], "role": "child"}]
+        self.mocks["gather"].return_value = {"machines": [
+            {"machine": "a", "reachable": True, "children": [
+                {"ref": "HAT-2", "state": "failed", "role": "child", "rows": ["1.1"],
+                 "digest": {"state": "failed"}}]}]}
+        tick.one_feature(s, f, {})
+        self.assertEqual(f["attention"], phases.ATTENTION_CHILD_FAILED)
 
 
 class Retro(FeatureTickBase):
