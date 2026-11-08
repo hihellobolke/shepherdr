@@ -97,9 +97,19 @@ class RetroAgent(RetroBase):
         # Neither retro nor reviewer names an agent: the Reviewer's effective default stands in, the
         # other CLI from the worker, so the retro never silently runs as the worker's own CLI.
         self.everywhere(worker={"agent": "claude"})
-        with mock.patch.object(self.settings, "other_cli", lambda a: "codex"):
+        other = {"claude": "codex", "codex": "claude"}
+        with mock.patch.object(self.settings, "other_cli", lambda a: other[a]):
             with self._store() as s:
                 self.assertEqual(self.retro.retro_agent(s), {"agent": "codex", "model": None, "effort": None})
+
+    def test_argv_only_worker_picks_the_other_cli(self):
+        # A worker set by raw argv (no `agent` key): its CLI is the argv's command, so the retro
+        # must still take the other CLI, not default to claude and land on the worker's own CLI.
+        self.everywhere(worker={"argv": ["codex", "--no-daemon"]})
+        other = {"claude": "codex", "codex": "claude"}
+        with mock.patch.object(self.settings, "other_cli", lambda a: other[a]):
+            with self._store() as s:
+                self.assertEqual(self.retro.retro_agent(s)["agent"], "claude")
 
 
 class Instructions(RetroBase):

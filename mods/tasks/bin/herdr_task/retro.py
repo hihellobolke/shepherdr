@@ -48,7 +48,8 @@ BUILT_IN_FALLBACK = (
 def retro_template():
     """The built-in retro role instructions: the body of the installed templates/retro.md (the copy
     the person edits, which `hc templates` lists), without its frontmatter. None when it is not
-    installed on this machine, so the caller falls back to BUILT_IN_FALLBACK."""
+    installed, or installed with no body, so the caller always has instructions (BUILT_IN_FALLBACK):
+    an empty brief would leave the retro agent with nothing to do, never the intent."""
     try:
         with open(os.path.join(settings.TEMPLATES, "retro.md")) as f:
             text = f.read()
@@ -68,7 +69,12 @@ def _retro_role(s, space=None):
     if not pick:
         pick = dict(cfg.get("reviewer") or {})
     if not pick.get("agent") and not pick.get("argv"):
-        pick["agent"] = settings.other_cli((cfg.get("worker") or {}).get("agent") or "claude")
+        # The worker's own CLI is its `agent`, or the command of its `argv` when it is set that way,
+        # else claude. The retro runs on the other CLI, so an argv-only worker never makes the retro
+        # read with the same CLI as the code it reviews.
+        worker = cfg.get("worker") or {}
+        worker_cli = worker.get("agent") or (settings.agent_key(worker["argv"]) if worker.get("argv") else "claude")
+        pick["agent"] = settings.other_cli(worker_cli)
     return pick
 
 
