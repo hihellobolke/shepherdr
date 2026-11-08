@@ -592,6 +592,25 @@ class AmendTest(Base):
         self.assertEqual(child["risk"], "high")
         self.assertEqual(child["set"]["merge"], "ask")
 
+    def test_risk_escalation_reaches_a_started_child(self):
+        # Raising a running child to high risk must set merge=ask too: merge only gates the merge, so
+        # this keeps a now-risky change from merging without the person, without disturbing its work.
+        with st.Store(self.loc) as s:
+            t = next(t for t in s.data["tasks"] if t.get("rows") == ["1.1"])
+            t["state"], t["started"] = "running", 1700000000000
+            s.dirty = True
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts |  | low | S |\n"
+            "| 1.1 | H | src/h.ts | 0.1 | high | S |\n"
+            "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
+        )
+        r = self.run_fanout(amend=True)
+        child = next(t for t in self.read()["tasks"] if t.get("rows") == ["1.1"])
+        self.assertEqual(child["risk"], "high")
+        self.assertEqual(child["set"]["merge"], "ask")
+        self.assertEqual(child["owns"], ["src/h.ts"])  # owns untouched on the running child
+        self.assertTrue(any("1.1" in w for w in r["warnings"]))
+
     def test_started_child_is_not_cancelled_even_if_requeued(self):
         # A child that ran and was re-queued (state queued, but with a start history) must not be
         # cancelled by an amendment that drops its row; it is kept with a warning.

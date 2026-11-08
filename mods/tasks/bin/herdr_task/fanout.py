@@ -105,13 +105,19 @@ def plan(s, change, machines=None, amend=False, folder=None):
             "brief": _child_brief(s, feature, change, pkg),
         })
 
+    verify_after = [refs[p["id"]]["ref_q"] for p in packages]
+    if amend:
+        # A started or remote child of a removed row is kept, and the Verify Task still waits for it;
+        # show that in the preview so the plan matches what Verify will wait for.
+        verify_after += _retained_refs(s, feature, packages)
+
     return {
         "change": change,
         "feature": s.ref(feature),
         "valid": True,
         "waves": waves,
         "packages": out,
-        "verify_task": {"after": [refs[p["id"]]["ref_q"] for p in packages]},
+        "verify_task": {"after": verify_after},
         "warnings": _amend_warnings(s, feature, packages) if amend else [],
     }
 
@@ -667,9 +673,25 @@ def _amend_warnings(s, feature, packages):
             warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed owns to "
                             f"{', '.join(pkg['owns'])}, but child {_ref_of(s, c)} keeps {', '.join(t.get('owns') or [])}")
         if pkg and t and _started(t) and pkg["risk"] != t.get("risk"):
-            warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed risk to {pkg['risk']}, "
-                            f"but child {_ref_of(s, c)} has started; its merge policy is unchanged")
+            merge = "ask" if pkg["risk"] == "high" else "checks"
+            warnings.append(f"row(s) {', '.join(sorted(rows))}: the table changed risk to {pkg['risk']}; "
+                            f"child {_ref_of(s, c)} has started, so its merge is now {merge}")
     return warnings
+
+
+def _retained_refs(s, feature, packages):
+    """The qualified refs of children whose row the table no longer has but that stay anyway (a started
+    child, or one on another machine). The Verify Task keeps waiting for them, so the preview lists them
+    too; a cancellable (unstarted, home) child is not listed."""
+    all_rows = {r for pkg in packages for r in pkg["rows"]}
+    out = []
+    for c in feature.get("children", []):
+        rows = set(c.get("rows") or [])
+        if rows and not (rows & all_rows):
+            t = _child_record(s, c)
+            if c.get("machine") or (t and _started(t)):
+                out.append(_ref_of(s, c))
+    return out
 
 
 def _amend_cancel(s, feature, packages):
@@ -706,16 +728,18 @@ def _started(task):
 
 
 def _amend_reconcile_risk(s, feature, packages):
-    """On an amendment, bring an unstarted existing child's risk and merge policy in line with its row
-    (section 6.6, contract C2: a high-risk Task uses merge=ask). A started child is not changed under
-    the person; its change is surfaced as a warning in the plan instead."""
+    """On an amendment, bring an existing child's risk and merge policy in line with its row (section
+    6.6, contract C2: a high-risk Task uses merge=ask). This applies to a started child too: merge
+    policy only gates the merge, so raising it to `ask` keeps a newly-risky change from merging without
+    the person, and it does not disturb the running work. Only the owned paths of a running child are
+    left unchanged (that is `_amend_warnings`' job)."""
     pkg_by_rows = {frozenset(pkg["rows"]): pkg for pkg in packages}
     for c in feature.get("children", []):
         if c.get("machine"):
             continue
         pkg = pkg_by_rows.get(frozenset(c.get("rows") or []))
         t = s.task_by_id(c["ref"])
-        if not pkg or not t or _started(t):
+        if not pkg or not t:
             continue
         if pkg["risk"] != t.get("risk"):
             t["risk"] = pkg["risk"]
