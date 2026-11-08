@@ -14,8 +14,12 @@ model:
   regenerated file or a new commit changes the patch-id, so the worker then needs a fresh review.
 
 The diff against the base is the three-dot `<base>...HEAD` diff (from the merge-base), so it holds
-only the Task's own changes and stays the same when the base moves ahead by itself. Everything here
-shells out to git in a real folder; the tests use a real throwaway repo.
+only the Task's own changes and stays the same when the base moves ahead by itself. The diff is read
+with `--no-renames` (so a rename shows as both its removed source and its added destination: owning
+the destination never hides a change to an unowned source) and with `-z` (so a path with a non-ASCII
+or special character is not quoted and still matches its owned entry). `--no-renames` also pins the
+patch-id so it does not depend on the machine's `diff.renames` setting. Everything here shells out to
+git in a real folder; the tests use a real throwaway repo.
 """
 
 import re
@@ -41,6 +45,12 @@ DEFAULT_EXEMPT = [
     "web/generated/**",
     "**/*.generated.*",
 ]
+
+
+# The wildcards an owns/exempt glob may use. A `[` or `]` is a literal path character, not a
+# character class: the contract's globs are `*`, `**` and `?` only (C6), so a pattern with none of
+# these is matched as a literal path or directory.
+_GLOB_WILDCARDS = "*?"
 
 
 def _glob_to_regex(pattern):
@@ -81,7 +91,7 @@ def _matches(path, pattern):
     A plain path with no wildcard matches itself, and, when it names a directory, every path under
     it (`src/parser` covers `src/parser/types.ts`). A glob is matched with `_glob_to_regex`.
     """
-    if any(ch in pattern for ch in "*?[]"):
+    if any(ch in pattern for ch in _GLOB_WILDCARDS):
         return _glob_to_regex(pattern).match(path) is not None
     prefix = pattern.rstrip("/")
     return path == prefix or path.startswith(prefix + "/")
@@ -100,11 +110,15 @@ def owned_paths_check(changed, owns, exempt=None):
 
 
 def changed_paths(folder, base):
-    """The names the three-dot diff against `base` changes (`git diff --name-only <base>...HEAD`)."""
-    r = run(["git", "-C", folder, "diff", "--name-only", f"{base}...HEAD"])
+    """The names the three-dot diff against `base` changes.
+
+    Read with `--no-renames` (a rename counts as both its removed source and its added destination)
+    and `-z` (NUL-separated, so a path with a special or non-ASCII character is not quoted).
+    """
+    r = run(["git", "-C", folder, "diff", "--no-renames", "--name-only", "-z", f"{base}...HEAD"])
     if r.returncode != 0:
         raise Fail((r.stderr or r.stdout).strip() or f"git diff against {base} failed")
-    return [line for line in r.stdout.splitlines() if line]
+    return [name for name in r.stdout.split("\0") if name]
 
 
 def patch_id(folder, base):
@@ -113,7 +127,7 @@ def patch_id(folder, base):
     The patch-id ignores commit hashes and (with `--stable`) the order of files, so a clean rebase
     that keeps the changed lines keeps the patch-id.
     """
-    r = run(["git", "-C", folder, "diff", f"{base}...HEAD"])
+    r = run(["git", "-C", folder, "diff", "--no-renames", f"{base}...HEAD"])
     if r.returncode != 0:
         raise Fail((r.stderr or r.stdout).strip() or f"git diff against {base} failed")
     if not r.stdout.strip():

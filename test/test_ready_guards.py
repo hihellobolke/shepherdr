@@ -87,6 +87,11 @@ class OwnedPathsCheck(unittest.TestCase):
         self.assertEqual(rg.OWNED_PATHS, 2)
         self.assertEqual(rg.REVIEW_STALE, 4)
 
+    def test_brackets_are_literal_path_characters_not_a_character_class(self):
+        # The supported glob subset is *, ** and ? only; [ and ] match themselves.
+        self.assertFalse(rg.owned_paths_check(["src/a.py"], ["src/[ab].py"])["ok"])
+        self.assertTrue(rg.owned_paths_check(["src/[ab].py"], ["src/[ab].py"])["ok"])
+
 
 class ReviewValid(unittest.TestCase):
     """review_valid: a round matches on the commit hash or the patch-id (C2, section 6.9)."""
@@ -170,6 +175,34 @@ class GitGuards(unittest.TestCase):
         self.worker_branch()
         with self.assertRaises(Fail):
             rg.changed_paths(self.repo, "no-such-branch")
+
+    def test_a_rename_out_of_an_unowned_path_is_not_hidden(self):
+        # A base file the worker does not own, renamed into an owned path, must still list its
+        # source: owning the destination must not let the worker delete an unowned file.
+        self.write("other/foo.txt", "content that stays the same\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "base owns other/foo.txt")
+        self.git("checkout", "-q", "-b", "worker")
+        os.makedirs(os.path.join(self.repo, "owned"))
+        os.rename(os.path.join(self.repo, "other/foo.txt"), os.path.join(self.repo, "owned/foo.txt"))
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "move foo into owned/")
+        changed = rg.changed_paths(self.repo, "main")
+        self.assertIn("other/foo.txt", changed)  # the removed source is visible
+        self.assertIn("owned/foo.txt", changed)
+        # Owning only the destination does not pass: the unowned source is outside.
+        r = rg.owned_paths_check(changed, ["owned/**"])
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["outside"], ["other/foo.txt"])
+
+    def test_changed_paths_returns_a_non_ascii_name_unquoted(self):
+        self.git("checkout", "-q", "-b", "worker")
+        self.write("café.txt", "resume\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "add a non-ascii file")
+        changed = rg.changed_paths(self.repo, "main")
+        self.assertEqual(changed, ["café.txt"])  # not the quoted "caf\303\251.txt"
+        self.assertTrue(rg.owned_paths_check(changed, ["café.txt"])["ok"])
 
     def test_patch_id_of_an_empty_diff_is_empty(self):
         self.assertEqual(rg.patch_id(self.repo, "main"), "")
