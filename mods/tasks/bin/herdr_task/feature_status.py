@@ -27,7 +27,7 @@ import sys
 from . import digest
 from .base import ENTRY, hc_json
 from .output import say
-from .store import open_store
+from .store import open_store, parse_ref
 
 # How long to wait for one machine to answer before it counts as unreachable (seconds). A machine
 # that is offline or slow does not hold up the rest of the tick.
@@ -36,6 +36,12 @@ REMOTE_TIMEOUT = 60
 # A child Task state that means the child has ended, so its digest can be built (C5). A child in
 # any other state (todo, queued, running, ready) carries `digest: null`.
 ENDED_STATES = {"done", "cancelled", "failed"}
+
+# The flow roles whose Tasks are a Feature's children for feature-status (C2): the work packages and
+# the fix/integration/verify Tasks, not the spec Task. A remote machine reconstructs its children
+# from the local Tasks that carry these roles (the Feature record itself lives only on the home
+# machine, proposal 6.13).
+CHILD_ROLES = {"child", "fix", "integration", "verify"}
 
 
 # ---- one machine's children (local) ---------------------------------------------------------
@@ -98,23 +104,34 @@ def _child_ref(s, feature, cid):
 
 
 def _local_machine(s, feature):
-    """None when this is the home machine (the Feature record lives in this store, so its children
-    with `machine` null are this machine's), else this machine's herdr-core name (a remote answers
-    for the children that carry its name)."""
+    """None when this is the home machine, else this machine's herdr-core name.
+
+    The home machine is the one whose store holds this exact Feature record (proposal 6.13), so the
+    test is object identity, not a matching id: each machine's counter is its own (C2), so a
+    different Feature could share the number, and an unrelated local Feature must not make a remote
+    machine think it is home."""
     fid = feature.get("id")
-    if fid is not None and s.feature_by_id(fid) is not None:
+    if fid is not None and s.feature_by_id(fid) is feature:
         return None
     return _this_machine()
 
 
+_MACHINE_NAME = {}
+
+
 def _this_machine():
-    """This machine's herdr-core name, or None. (The same read as `digest._this_machine`; kept
-    here so this module does not lean on another module's private helper.)"""
+    """This machine's herdr-core name, or None, read once per process. (The same read as
+    `digest._this_machine`; kept here so this module does not lean on another module's private
+    helper.)"""
+    if "name" in _MACHINE_NAME:
+        return _MACHINE_NAME["name"]
     try:
         d = hc_json("server", "status") or {}
-        return (d.get("core") or {}).get("name") or None
+        name = (d.get("core") or {}).get("name") or None
     except Exception:
-        return None
+        name = None
+    _MACHINE_NAME["name"] = name
+    return name
 
 
 # ---- every machine, from the home machine ---------------------------------------------------
@@ -157,7 +174,9 @@ def _ask_machine(ref, machine, timeout=REMOTE_TIMEOUT):
     try:
         r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            universal_newlines=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        # ValueError covers a UnicodeDecodeError while decoding the machine's output (text mode):
+        # one machine's garbled answer must not stop the gather.
         return _unreachable(ref, machine)
     if r.returncode != 0:
         return _unreachable(ref, machine)
@@ -191,9 +210,35 @@ def cmd_feature_status(args):
         # Build the digests (a child's log is replayed) after the store lock is released, as
         # `retro_data` does, so a slow replay never blocks other writers of the store.
         with open_store(args, write=False) as s:
-            feature = s.find_feature(ref)
+            feature = _resolve(s, ref)
         data = collect(s, feature)
     say(args, data, _text(data))
+
+
+def _resolve(s, ref):
+    """The Feature to answer for in this store.
+
+    On the home machine the Feature record is in this store (C2), so it is returned whole. On
+    another machine the record does not live here (proposal 6.13): the children are reconstructed
+    from the local Tasks tagged with this Feature's id, so the machine can still answer in one call
+    for the children fanout created on it, with no Feature record and without failing."""
+    pre, n = parse_ref(ref)
+    if (pre is None or pre == s.prefix) and s.feature_by_id(n) is not None:
+        return s.feature_by_id(n)
+    return _remote_feature(s, ref, n)
+
+
+def _remote_feature(s, ref, n):
+    """A Feature view built from the local child Tasks tagged with Feature id `n`, for a machine
+    that does not hold the Feature record. Each child carries this machine's name, so `collect`
+    answers for them; a child's id is this machine's own (C2), read as the home ref in `_child_ref`."""
+    me = _this_machine()
+    children = [
+        {"ref": t["id"], "machine": me, "rows": list(t.get("rows") or []), "role": t.get("role")}
+        for t in s.data.get("tasks", [])
+        if t.get("feature") == n and t.get("role") in CHILD_ROLES
+    ]
+    return {"id": n, "ref": ref, "children": children, "digests": {}}
 
 
 def _text(data):

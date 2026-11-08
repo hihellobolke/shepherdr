@@ -134,6 +134,24 @@ class Collect(Base):
             out = feature_status.collect(s, f)
         self.assertTrue(out["children"][0]["digest"]["stub"])
 
+    def test_an_unrelated_local_feature_does_not_make_a_remote_think_it_is_home(self):
+        """Each machine's counter is its own (C2), so a different Feature can share the number. The
+        home test is object identity, not a matching id: an unrelated local Feature numbered the same
+        must not make a remote machine answer as home (and so drop its own children)."""
+        with self._store() as s:
+            t = s.new("Remote child", "", "worktree", role="child", rows=["2.1"])
+            t["state"] = "done"
+            # An unrelated local Feature that happens to share the remote Feature's number.
+            unrelated = s.new_feature("Something else", "other", "feature/other")
+            feature = {
+                "id": unrelated["id"], "ref": f"HAT-{unrelated['id']}", "digests": {},
+                "children": [{"ref": t["id"], "machine": "home-mac", "rows": ["2.1"], "role": "child"}],
+            }
+            out = feature_status.collect(s, feature)
+        # Detected as the remote "home-mac", not home: the child is answered, not dropped.
+        self.assertEqual(out["machine"], "home-mac")
+        self.assertEqual([c["ref"] for c in out["children"]], [f"HAT-{t['id']}"])
+
     def test_the_child_ref_uses_the_feature_prefix_on_a_remote_machine(self):
         """A remote machine answers for the children that carry its name, and reads each child's
         ref with the Feature's (home) prefix, so the ref is the same on every machine. The Feature
@@ -216,6 +234,14 @@ class AskMachine(Base):
         fake = FakeRun([(0, json.dumps({"error": "No feature HAT-12"}))])
         self._patch_run(fake)
         self.assertFalse(feature_status._ask_machine("HAT-12", "vm-b")["reachable"])
+
+    def test_undecodable_output_is_unreachable(self):
+        """A UnicodeDecodeError while decoding the machine's output (text mode) is one machine's bad
+        answer, not a crash: it is unreachable, so the gather goes on to the next machine."""
+        fake = FakeRun([(UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"), "")])
+        self._patch_run(fake)
+        out = feature_status._ask_machine("HAT-12", "vm-b")
+        self.assertEqual(out, {"feature": "HAT-12", "machine": "vm-b", "reachable": False, "children": []})
 
 
 # ---- gather: one call per machine, offline does not stop the others --------------------------
@@ -323,6 +349,32 @@ class Command(Base):
         self.assertEqual(data["feature"], ref)
         self.assertIsNone(data["machine"])
         self.assertEqual(data["children"][0]["ref"], f"{ref.rsplit('-', 1)[0]}-{child['id']}")
+
+    def test_a_remote_machine_answers_without_holding_the_feature_record(self):
+        """The home machine polls a remote with `herdr-task --on <machine> feature-status <ref>`,
+        which runs here with no `--on` on a store that does NOT hold the Feature record (proposal
+        6.13). The children are reconstructed from the local Tasks tagged with the Feature id, so the
+        machine answers in one call instead of failing (which the home would read as unreachable)."""
+        with self._store() as s:
+            # Children fanout created on this machine, tagged with the home Feature's id (12); no
+            # Feature record lives here. A classic task and a different Feature's child are ignored.
+            c1 = s.new("Parse headers", "", "worktree", feature=12, role="child", rows=["1.1"])
+            c1["state"] = "done"
+            c2 = s.new("Parse body", "", "worktree", feature=12, role="child", rows=["1.2"])
+            c2["state"] = "running"
+            other = s.new("Other feature child", "", "worktree", feature=99, role="child", rows=["1.1"])
+            other["state"] = "done"
+            s.new("Classic task", "", "worktree")  # no feature
+            s.dirty = True
+        feature_status._this_machine = lambda: "vm-b"
+        out = json.loads(self._run(Args(id="HAT-12", folder=self.folder, on=None, json=True)))
+        self.assertEqual(out["machine"], "vm-b")
+        self.assertTrue(out["reachable"])
+        # Only Feature 12's two children, with the home prefix and this machine's own ids.
+        self.assertEqual({c["ref"] for c in out["children"]}, {f"HAT-{c1['id']}", f"HAT-{c2['id']}"})
+        by_ref = {c["ref"]: c for c in out["children"]}
+        self.assertTrue(by_ref[f"HAT-{c1['id']}"]["digest"]["stub"])  # the ended child
+        self.assertIsNone(by_ref[f"HAT-{c2['id']}"]["digest"])        # the running child
 
     def test_with_on_it_asks_that_machine(self):
         answer = {"feature": "HAT-12", "machine": None, "reachable": True, "children": []}
