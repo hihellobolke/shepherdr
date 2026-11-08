@@ -215,9 +215,11 @@ class FlowFakes:
         fakes being `hc` and `gh`, not from a changed `HOME`. Pass `home=` only to test the fakes
         themselves in isolation (they read `FLOWFAKES_STATE`, never `HOME`).
 
-        Worker Task worktrees are redirected with `HERDR_TASK_WORKTREES` (which `base.WORKTREES`
-        reads), so a Task the real `herdr-task` starts in worktree mode creates its worktree under
-        the scratch root, not the real `~/.herdr/worktrees`, even though `HOME` stays real."""
+        This redirects every writable path the real `herdr-task` derives from `HOME` that has an
+        environment override (`HERDR_TASK_STORE`, `HERDR_TASK_WORKTREES`, `HERDR_TASK_SETTINGS`,
+        `HERDR_TASK_TEMPLATES`), so a normal Task start, which can create or upgrade worktrees and
+        role templates, writes under the scratch root and never the real `~/.herdr` or
+        `~/.config/herdr-core`, even though `HOME` stays real for `base.guard`."""
         env = dict(os.environ)
         env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
         env["HERDR_TASK_GH"] = os.path.join(self.bin_dir, "gh")
@@ -227,6 +229,7 @@ class FlowFakes:
         env["HERDR_TASK_STORE"] = store or os.path.join(self.root, "store")
         env["HERDR_TASK_SETTINGS"] = settings or os.path.join(self.root, "shepherdr.json")
         env["HERDR_TASK_WORKTREES"] = os.path.join(self.root, "worktrees")  # base.WORKTREES reads this
+        env["HERDR_TASK_TEMPLATES"] = os.path.join(self.root, "templates")  # settings.TEMPLATES reads this
         env.update(_GIT_ENV)  # a git identity and no global/system config, so git stays isolated too
         if extra:
             env.update(extra)
@@ -785,6 +788,7 @@ def _hc_exec(state_dir, argv):
         env["HERDR_TASK_STORE"] = rec["store"]
         env["HERDR_TASK_SETTINGS"] = os.path.join(home, ".herdr", "shepherdr.json")
         env["HERDR_TASK_WORKTREES"] = os.path.join(home, ".herdr", "worktrees")
+        env["HERDR_TASK_TEMPLATES"] = os.path.join(home, ".config", "herdr-core", "templates")
         stdin = sys.stdin.read() if flags.get("--stdin") else None
         r = subprocess.run(after, env=env, cwd=home, input=stdin, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True)

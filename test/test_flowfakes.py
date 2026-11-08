@@ -88,8 +88,25 @@ class Environment(Base):
         # An explicit home= is honoured, for tests that drive the fakes on their own.
         self.assertEqual(self.fakes.env(home="/tmp/x")["HOME"], "/tmp/x")
 
-    def test_env_redirects_worktrees_under_the_scratch_root(self):
-        self.assertTrue(self.env["HERDR_TASK_WORKTREES"].startswith(self.root))
+    def test_env_redirects_every_writable_home_path_under_the_scratch_root(self):
+        for key in ("HERDR_TASK_STORE", "HERDR_TASK_SETTINGS", "HERDR_TASK_WORKTREES",
+                    "HERDR_TASK_TEMPLATES"):
+            self.assertTrue(self.env[key].startswith(self.root), f"{key}={self.env[key]}")
+
+    def test_role_templates_are_written_under_the_scratch_root_not_the_real_home(self):
+        # launch.brief()/templates.instructions() can create or upgrade role templates; with
+        # HERDR_TASK_TEMPLATES redirected they land under the scratch root, not ~/.config/herdr-core.
+        bin_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "mods", "tasks", "bin")
+        code = ("import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]);"
+                "from herdr_task import templates; templates.instructions('worker');"
+                "from herdr_task.settings import TEMPLATES; import os;"
+                "print(os.path.isfile(os.path.join(TEMPLATES, 'worker.md')), TEMPLATES)")
+        r = subprocess.run([sys.executable, "-c", code, bin_dir], env=self.env,
+                           capture_output=True, text=True)
+        wrote, templates_dir = r.stdout.split(maxsplit=1)
+        self.assertEqual(wrote, "True", r.stderr)
+        self.assertTrue(templates_dir.strip().startswith(self.root))
 
     def test_base_honours_the_worktrees_override_so_worktrees_stay_off_the_real_home(self):
         # base.WORKTREES must read HERDR_TASK_WORKTREES, so a real herdr-task's worktrees land in the
