@@ -54,7 +54,9 @@ def _git(repo, *args):
 
 
 class Base(unittest.TestCase):
-    """A fresh throwaway git repo with an OpenSpec change and a Feature in its store."""
+    """A fresh throwaway git repo with an OpenSpec change and a Feature in its store. The approved work
+    table lives on the feature branch (contract C8), so `write_table` commits it there and leaves the
+    main checkout clean; a test that stands in for the spec worktree writes to a working tree instead."""
 
     change = "add-login-flow"
 
@@ -62,15 +64,14 @@ class Base(unittest.TestCase):
         self.repo = tempfile.mkdtemp(prefix="herdr-fanout-repo-")
         self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         _git(self.repo, "init")
+        _git(self.repo, "config", "user.email", "t@example.com")
+        _git(self.repo, "config", "user.name", "Test")
         _git(self.repo, "commit", "--allow-empty", "-m", "init")
+        self.main_branch = subprocess.run(
+            ["git", "-C", self.repo, "rev-parse", "--abbrev-ref", "HEAD"],
+            stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+        self.feature_branch = None
         self.loc = st.locate(self.repo)
-
-    def write_table(self, text, change=None):
-        change = change or self.change
-        cdir = os.path.join(self.repo, "openspec", "changes", change)
-        os.makedirs(cdir, exist_ok=True)
-        with open(os.path.join(cdir, "tasks.md"), "w") as f:
-            f.write(text)
 
     def make_feature(self, mode="remote", change=None, auto_fanout=True):
         change = change or self.change
@@ -80,8 +81,32 @@ class Base(unittest.TestCase):
             f["spec_task"] = spec["id"]
             f["branch"] = f"feature/{s.ref(f)}-login-flow"
             f["phase"] = "building"
-            ref = s.ref(f)
+            ref, branch = s.ref(f), f["branch"]
+        _git(self.repo, "branch", branch, self.main_branch)  # the feature branch, not checked out
+        self.feature_branch = branch
         return ref
+
+    def write_table(self, text, change=None, branch=None):
+        """Commit tasks.md on the feature branch (where the approved table lives), keeping main clean."""
+        change = change or self.change
+        branch = branch or self.feature_branch
+        rel = f"openspec/changes/{change}/tasks.md"
+        _git(self.repo, "checkout", "-q", branch)
+        full = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+        _git(self.repo, "add", rel)
+        _git(self.repo, "commit", "-q", "-m", f"table {change}")
+        _git(self.repo, "checkout", "-q", self.main_branch)
+
+    def write_worktree_table(self, folder, text, change=None):
+        """Write tasks.md into a working tree without committing (the spec worktree, for check_plan)."""
+        change = change or self.change
+        cdir = os.path.join(folder, "openspec", "changes", change)
+        os.makedirs(cdir, exist_ok=True)
+        with open(os.path.join(cdir, "tasks.md"), "w") as f:
+            f.write(text)
 
     def plan(self, **kw):
         with st.Store(self.loc, write=False) as s:
@@ -101,8 +126,8 @@ class Base(unittest.TestCase):
 class PlanTest(Base):
     def setUp(self):
         super().setUp()
-        self.write_table(VALID_TABLE)
         self.feature_ref = self.make_feature()
+        self.write_table(VALID_TABLE)
 
     def test_valid_shape(self):
         p = self.plan()
@@ -155,22 +180,18 @@ class PlanTest(Base):
             with self.assertRaises(Fail):
                 fanout.plan(s, "no-such-change")
 
-    def test_folder_override_reads_that_tree(self):
-        # The spec worker runs `ready` in its own worktree, so the plan guard must read the table from
-        # the given folder, not from the Feature's checkout. Put a broken table in the main checkout
-        # and a good one in a separate tree; `folder=` picks the tree to read.
+    def test_reads_feature_branch_not_the_checkout(self):
+        # Fan-out reads the approved table from the feature branch (where setUp committed VALID_TABLE),
+        # even though the checkout is on main and main has no such table. `folder=` overrides that with a
+        # working tree (the spec worktree for the ready plan guard).
         broken = ("## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
                   "| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
-        self.write_table(broken)  # main checkout now has a cyclic table
         other = tempfile.mkdtemp(prefix="herdr-fanout-wt-")
         self.addCleanup(shutil.rmtree, other, ignore_errors=True)
-        cdir = os.path.join(other, "openspec", "changes", self.change)
-        os.makedirs(cdir)
-        with open(os.path.join(cdir, "tasks.md"), "w") as f:
-            f.write(VALID_TABLE)
+        self.write_worktree_table(other, broken)
         with st.Store(self.loc, write=False) as s:
-            self.assertFalse(fanout.plan(s, self.change)["valid"])  # reads the broken main table
-            self.assertTrue(fanout.plan(s, self.change, folder=other)["valid"])  # reads the good tree
+            self.assertTrue(fanout.plan(s, self.change)["valid"])  # the feature branch's good table
+            self.assertFalse(fanout.plan(s, self.change, folder=other)["valid"])  # the override tree
 
 
 # ---- work-table error codes (C5/C6) ----------------------------------------------------------
@@ -217,8 +238,8 @@ class InvalidTableTest(Base):
 class RunTest(Base):
     def setUp(self):
         super().setUp()
-        self.write_table(VALID_TABLE)
         self.feature_ref = self.make_feature()
+        self.write_table(VALID_TABLE)
 
     def test_creates_children_and_verify(self):
         r = self.run_fanout()
@@ -314,6 +335,7 @@ class RunTest(Base):
 class PlacementTest(Base):
     def setUp(self):
         super().setUp()
+        self.make_feature()
         # One wave-0 contract and two independent chains off it, to show the spread.
         self.write_table(
             "## Work table\n\n"
@@ -323,7 +345,6 @@ class PlacementTest(Base):
             "| 1.2 | B | b/b.ts | 0.1 | low | M |\n"
             "| 2.1 | Wire | w/w.ts | 1.1,1.2 | low | M |\n"
         )
-        self.make_feature()
 
     def test_home_only_when_no_machines(self):
         for pkg in self.plan()["packages"]:
@@ -347,6 +368,23 @@ class PlacementTest(Base):
     def test_deterministic_placement(self):
         self.assertEqual(self.plan(machines=["vm-a", "vm-b"]), self.plan(machines=["vm-a", "vm-b"]))
 
+    def test_refusal_is_only_for_packages_that_need_creation(self):
+        # The refusal fires for a package that still has to be made on another machine, but not for a
+        # child already placed there (recorded by the integration layer): a plain home rerun then does
+        # not refuse. (A full run with a remote child reaches that machine to link it, which the tests
+        # never do, so this checks the refusal's own logic and the filter run() applies.)
+        self.run_fanout()
+        existing = None
+        with st.Store(self.loc, write=False) as s:
+            p = fanout.plan(s, self.change, machines=["vm-a", "vm-b"])
+            existing = {frozenset(c["rows"]) for c in s.data["features"][0]["children"]}
+        # Every package already has a child, so nothing needs creating: the filtered list is empty.
+        needs_creation = [pkg for pkg in p["packages"] if frozenset(pkg["rows"]) not in existing]
+        self.assertEqual(needs_creation, [])
+        fanout._refuse_remote_creation(needs_creation)  # does not raise
+        with self.assertRaises(Fail):
+            fanout._refuse_remote_creation([{"machine": "vm-a", "rows": ["9.9"]}])
+
     def test_real_run_refuses_remote_placement(self):
         # The dry run previews the spread, but a real run creates on the home machine only: creating a
         # child on another machine needs contract support this module does not have, so it is refused
@@ -364,8 +402,8 @@ class PlacementTest(Base):
 class LocalModeTest(Base):
     def setUp(self):
         super().setUp()
-        self.write_table(VALID_TABLE)
         self.make_feature(mode="local")
+        self.write_table(VALID_TABLE)
 
     def test_refuses_machines(self):
         with st.Store(self.loc, write=False) as s:
@@ -386,6 +424,7 @@ class LocalModeTest(Base):
 class AmendTest(Base):
     def setUp(self):
         super().setUp()
+        self.make_feature()
         self.write_table(
             "## Work table\n\n"
             "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
@@ -393,7 +432,6 @@ class AmendTest(Base):
             "| 1.1 | H | src/h.ts | 0.1 | low | S |\n"
             "| 1.2 | B | src/b.ts | 0.1 | low | S |\n"
         )
-        self.make_feature()
         self.run_fanout()
 
     def _amend_table(self, rows):
@@ -456,6 +494,22 @@ class AmendTest(Base):
                  if t.get("role") == "child"}
         self.assertEqual(after[("1.1",)], [])  # the removed dependency was reconciled away
 
+    def test_reversed_dependency_does_not_false_cycle(self):
+        # Initially 1.1 depends on 0.1. An amendment reverses it: 0.1 now depends on 1.1, and 1.1 on
+        # nothing. Reconciling one child at a time against the old links would look like a cycle; the
+        # clear-then-set reconciliation must apply the (acyclic) new graph without raising.
+        self._amend_table(
+            "| 0.1 | Types | src/t.ts | 1.1 | low | S |\n"
+            "| 1.1 | H | src/h.ts |  | low | S |\n"
+            "| 1.2 | B | src/b.ts |  | low | S |\n"
+        )
+        self.run_fanout(amend=True)  # must not raise a false cycle
+        tasks = self.read()["tasks"]
+        after = {tuple(t["rows"]): t.get("after") or [] for t in tasks if t.get("role") == "child"}
+        h_child = next(t for t in tasks if t.get("rows") == ["1.1"])
+        self.assertEqual(after[("0.1",)], [h_child["id"]])  # 0.1 now waits for 1.1
+        self.assertEqual(after[("1.1",)], [])               # 1.1 waits for nothing
+
     def test_changed_owns_of_existing_child_warns(self):
         # Keep row 1.1 but change its owned paths. The running child keeps its owns; a warning names it.
         self._amend_table(
@@ -474,12 +528,12 @@ class AmendTest(Base):
 class RiskyPathTest(Base):
     def setUp(self):
         super().setUp()
+        self.make_feature()
         self.write_table(
             "## Work table\n\n"
             "| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
             "| 0.1 | Config | config/app.json |  | low | S |\n"
         )
-        self.make_feature()
 
     def test_owns_matching_risky_path_is_high(self):
         with open(settings_mod.SETTINGS, "w") as f:
@@ -497,15 +551,17 @@ class RiskyPathTest(Base):
 class CheckPlanTest(Base):
     def setUp(self):
         super().setUp()
+        # check_plan runs in the spec worker's own worktree: the change sits in the working tree here
+        # (self.repo), not yet merged to the feature branch, so write it there and read with folder=.
+        self.make_feature()
         subprocess.run(["openspec", "init", "--tools", "none"], cwd=self.repo,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.cdir = os.path.join(self.repo, "openspec", "changes", self.change)
         os.makedirs(os.path.join(self.cdir, "specs", "auth"), exist_ok=True)
         with open(os.path.join(self.cdir, "proposal.md"), "w") as f:
             f.write("## Why\nwhy\n\n## What Changes\n- a\n\n## Impact\n- auth\n")
-        self.write_table(VALID_TABLE)
+        self.write_worktree_table(self.repo, VALID_TABLE)
         self._spec(valid=True)
-        self.make_feature()
 
     def _spec(self, valid):
         body = ("## ADDED Requirements\n\n### Requirement: Login\nThe system SHALL let a user log in.\n\n"
@@ -525,7 +581,8 @@ class CheckPlanTest(Base):
 
     def test_bad_work_table_fails(self):
         # The OpenSpec change validates, but the work table has a cycle: the plan guard still refuses.
-        self.write_table(
+        self.write_worktree_table(
+            self.repo,
             "## Work table\n\n| id | title | owns | depends | risk | size |\n|---|---|---|---|---|---|\n"
             "| 0.1 | A | a.ts | 0.2 | low | S |\n| 0.2 | B | b.ts | 0.1 | low | S |\n")
         r = fanout.check_plan(self.repo, self.change)
@@ -549,8 +606,8 @@ class Args:
 class CmdFanoutTest(Base):
     def setUp(self):
         super().setUp()
-        self.write_table(VALID_TABLE)
         self.make_feature()
+        self.write_table(VALID_TABLE)
 
     def _capture(self, args):
         import io

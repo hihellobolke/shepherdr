@@ -38,7 +38,7 @@ import json
 import os
 import re
 
-from .base import Fail, now, run as run_cmd
+from .base import Fail, git, now, run as run_cmd
 from .settings import set_task, settings_for
 from .store import locate, open_store, Store
 from .queues import set_after
@@ -62,7 +62,13 @@ def plan(s, change, machines=None, amend=False, folder=None):
         raise Fail(f"{s.ref(feature)} is in local mode (no GitHub remote): it runs on one machine "
                    f"only, so fan-out cannot place children on {', '.join(machines)}.")
     try:
-        rows = _read_rows(folder or s.loc["folder"], change)
+        # The approved work table lives on the feature branch (contract C8), which is not the branch
+        # checked out where fan-out runs; read it from that branch. `folder` overrides this with a
+        # working tree (the spec worktree for the `ready` plan guard, before the merge).
+        if folder:
+            rows = _read_rows(folder, change)
+        else:
+            rows = _read_rows(s.loc["folder"], change, branch=feature["branch"])
         worktable.check_table(rows)
     except worktable.WorkTableError as e:
         return {"change": change, "valid": False, "code": e.code, "error": e.message}
@@ -131,12 +137,14 @@ def run(s, change, machines=None, amend=False, start=True):
     p = plan(s, change, machines, amend)
     if not p.get("valid"):
         raise Fail(p.get("error") or "the work table is not valid")
-    _refuse_remote_creation(p["packages"])
     feature = _feature_for(s, change)
 
     cancelled = _amend_cancel(s, feature, p["packages"]) if amend else []
 
     existing = _children_by_rows(feature)
+    # Only a package that still has to be created can be refused for its placement; a child already on
+    # another machine (its machine preserved in the plan) is left alone, not re-refused.
+    _refuse_remote_creation([pkg for pkg in p["packages"] if frozenset(pkg["rows"]) not in existing])
     created = 0
     queued_at = now()
     for entry in p["packages"]:
@@ -250,15 +258,25 @@ def _feature_for(s, change):
     raise Fail(f"No feature for change {change!r} in {s.loc['folder']}. Create it with `feature add` first.")
 
 
-def _read_rows(folder, change):
-    """The rows of `openspec/changes/<change>/tasks.md`; a WorkTableError(BAD_TABLE) when the file is
-    missing (so a caller treats it like any other bad table)."""
-    path = os.path.join(folder, "openspec", "changes", change, "tasks.md")
-    try:
-        with open(path) as f:
-            text = f.read()
-    except OSError:
-        raise worktable.WorkTableError(worktable.BAD_TABLE, f"no tasks.md at openspec/changes/{change}/")
+def _read_rows(folder, change, branch=None):
+    """The rows of `openspec/changes/<change>/tasks.md`. With `branch`, read the file from that git
+    branch (`git show <branch>:<path>`), without checking it out, so fan-out reads the approved table
+    from the feature branch while the main checkout stays on its own branch (contract C8). Without
+    `branch`, read the working tree under `folder` (the spec worktree, for the `ready` plan guard).
+    Raises WorkTableError(BAD_TABLE) when the file is missing, so a caller treats it like any other bad
+    table."""
+    rel = f"openspec/changes/{change}/tasks.md"
+    if branch:
+        ok, out, _ = git(folder, "show", f"{branch}:{rel}")
+        if not ok:
+            raise worktable.WorkTableError(worktable.BAD_TABLE, f"no {rel} on {branch}")
+        text = out
+    else:
+        try:
+            with open(os.path.join(folder, rel)) as f:
+                text = f.read()
+        except OSError:
+            raise worktable.WorkTableError(worktable.BAD_TABLE, f"no tasks.md at {rel}")
     return worktable.parse_table(text)
 
 
@@ -532,21 +550,33 @@ def _local_and_ext(s, children):
 
 
 def _link_home_children(s, feature, packages):
-    """Set each home child's `after` to the children of the packages it depends on, always reconciling
-    (so a dependency that an amendment removed is cleared, not left pointing at a cancelled Task). A
-    dependency on another machine becomes an external after record."""
-    by_pkg = {c["package"]: c for c in feature.get("children", [])}
+    """Set each home child's `after` to the children of the packages it depends on, reconciling the
+    whole graph (so a dependency an amendment removed is cleared, not left pointing at a cancelled
+    Task). A dependency on another machine becomes an external after record.
+
+    The new graph is applied in two passes, clear then set, because `set_after` rejects a loop against
+    the stored edges: updating one child while the others still hold their old links could look like a
+    cycle even though the work table (already checked acyclic) has none. Clearing first removes every
+    obsolete edge before any new one is validated. When the graph already matches, nothing is written,
+    so reruns stay idempotent."""
     entry_by_pkg = {e["package"]: e for e in packages}
+    home = []
     for c in feature.get("children", []):
         if c.get("machine"):
             continue  # a remote child's after was set on its own machine at creation
         t = s.task_by_id(c["ref"])
         entry = entry_by_pkg.get(c["package"])
-        if not t or not entry:
-            continue
-        home_ids, ext = _local_and_ext(s, _dep_children(feature, entry, packages))
-        if (t.get("after") or []) != home_ids or (t.get("after_ext") or []) != ext:
-            set_after(s, t, home_ids, ext)
+        if t and entry:
+            home_ids, ext = _local_and_ext(s, _dep_children(feature, entry, packages))
+            home.append((t, home_ids, ext))
+    if all((t.get("after") or []) == hid and (t.get("after_ext") or []) == ext for t, hid, ext in home):
+        return
+    for t, _, _ in home:
+        if t.get("after") or t.get("after_ext"):
+            set_after(s, t, [])
+    for t, hid, ext in home:
+        if hid or ext:
+            set_after(s, t, hid, ext)
 
 
 def _ensure_verify(s, feature, change, start, queued_at):
