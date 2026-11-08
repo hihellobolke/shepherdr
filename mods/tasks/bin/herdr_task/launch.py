@@ -16,8 +16,8 @@ import sys
 import time
 
 from .base import ENTRY, Fail, git, hc_json, now, run, WORKTREES
-from .settings import agent_key, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, notes, notes_part, review_limits, settings_block, settings_for
-from .templates import instructions
+from .settings import agent_key, ASSISTANT_TEMPLATES, bare, BRANCH_PATTERN, branch_pattern_problem, FLOW_WORDS, notes, notes_part, review_limits, settings_block, settings_for, TEMPLATES
+from .templates import FRONT, instructions
 from .agents import detail, LINE_MAX, live_agents, SUMMARY_MAX
 from .github import finish, remote_of
 from .browsers import browser_line, browser_path
@@ -399,6 +399,48 @@ def where_line(task):
     return f"You work in {task['worktree']} on branch {task['branch']}{base}."
 
 
+# ---- the OpenSpec flow file a Feature Task's brief carries (SHMD-22) -------------------------
+# When the Settings block says Flow: openspec and the Task is part of a Feature (it has a flow
+# role), brief() adds one flow file after the normal worker words: the spec Task gets flow-spec, a
+# Child, Fix or Integration Task gets flow-task, the Verify Task gets flow-verify. A classic Task,
+# or an ordinary Task in an openspec space (no flow role), gets none, so its brief stays byte for
+# byte the same as before. The flow needs the repo's openspec/ folder (flow init makes it), so a
+# flow Task in a repo without one stops with a clear message.
+FLOW_FILES = {"spec": "flow-spec", "child": "flow-task", "fix": "flow-task",
+              "integration": "flow-task", "verify": "flow-verify"}
+
+
+def task_flow(s, task, space=None):
+    """A Task's effective flow (classic or openspec), read exactly as the Settings block reads it."""
+    sets = task.get("set") or {}
+    k = settings_for(s, space or task.get("space"))["tasks"]
+    return sets.get("flow") or (k.get("flow") if k.get("flow") in FLOW_WORDS else "classic")
+
+
+def flow_file(name):
+    """A flow file's words (TEMPLATES/<name>.md without its frontmatter), or None when it is missing."""
+    try:
+        with open(os.path.join(TEMPLATES, f"{name}.md")) as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = FRONT.match(text)
+    body = (text[m.end():] if m else text).strip()
+    return body or None
+
+
+def flow_part(s, task, space=None):
+    """The flow file to add after the worker words, or None. Only when the flow is openspec and the
+    Task has a flow role; a flow Task in a repo with no openspec/ folder stops here."""
+    name = FLOW_FILES.get(task.get("role"))
+    if not name or task_flow(s, task, space) != "openspec":
+        return None
+    if not os.path.isdir(os.path.join(s.loc["folder"], "openspec")):
+        raise Fail(f"{s.ref(task)} is on the OpenSpec flow, but this repo has no openspec/ folder. "
+                   f"Run `herdr-task flow init` in it first.")
+    return flow_file(name)
+
+
 def brief(s, task, parent=None, space=None, argv=None):
     instructions("reviewer")  # the file its review's reviewer gets (WORKER_MD)
     start = notes_part("Before you start", notes(s, task, "start", space))
@@ -406,12 +448,13 @@ def brief(s, task, parent=None, space=None, argv=None):
         start += f"\n(The main folder is {s.loc['folder']}.)"
     body = "Your task, " + s.ref(task) + ":\n" + ((task.get("prompt") or "").strip() or task["title"])
     finish = notes_part("Before you say ready", notes(s, task, "finish", space))
-    return "\n\n".join(x for x in [instructions("worker"), start, body, where_line(task), finish, closing_line(s, task, parent, argv),
-                                    settings_block(s, task, space, argv)] if x)
+    return "\n\n".join(x for x in [instructions("worker"), flow_part(s, task, space), start, body, where_line(task), finish,
+                                    closing_line(s, task, parent, argv), settings_block(s, task, space, argv)] if x)
 
 
 def handoff(s, task, prev, parent=None, argv=None):
-    lines = [f"You are taking over task {s.ref(task)} \"{task['title']}\" from another agent.", instructions("worker")]
+    lines = [f"You are taking over task {s.ref(task)} \"{task['title']}\" from another agent.", instructions("worker"),
+             flow_part(s, task)]
     lines.append(where_line(task))
     lines.append("The task:\n" + ((task.get("prompt") or "").strip() or task["title"]))
     if prev and prev.get("log"):
