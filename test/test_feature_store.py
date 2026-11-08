@@ -10,17 +10,33 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
 if BIN not in sys.path:
     sys.path.insert(0, BIN)
 sys.dont_write_bytecode = True
-# STORE is read from this at import time; the per-test dir is set on the module below.
-os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-store-import-"))
 
 from herdr_task import store  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
+
+# A throwaway STORE off the real ~/.herdr, kept for this module's tests and restored after so it
+# never leaks into later test files. Each test also patches store.STORE to its own tmp dir in setUp.
+_ENV_PATCH = None
+
+
+def setUpModule():
+    global _ENV_PATCH
+    _ENV_PATCH = mock.patch.dict(os.environ, {
+        "HERDR_TASK_STORE": tempfile.mkdtemp(prefix="herdr-store-import-"),
+    })
+    _ENV_PATCH.start()
+
+
+def tearDownModule():
+    if _ENV_PATCH is not None:
+        _ENV_PATCH.stop()
 
 # The contract fixture of C10 (test/fixtures/openspec-flow/store.json, owned by task T00 and not on
 # this branch yet). Kept here verbatim so this task's test is self-contained; the real file is also

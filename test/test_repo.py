@@ -1,5 +1,6 @@
 """The repo as Herdr and the installer see it: the add-on list covers every mod, the layout has no
 live values, nothing personal is shipped, and the version is the same everywhere it's stated."""
+import ast
 import json
 import os
 import re
@@ -290,6 +291,154 @@ class Repo(unittest.TestCase):
         self.assertRegex(open(J("CHANGELOG.md")).read(), rf"(?m)^## {re.escape(v)}\b", "CHANGELOG's newest entry")
         self.assertIn(v, open(J("RECIPE.md")).read())
         self.assertIn(v, open(J("README.md")).read())
+
+
+def _dotted(node):
+    """The dotted name of an attribute/name chain as a tuple, e.g. os.environ.setdefault ->
+    ("os", "environ", "setdefault"); None for anything else (a subscript, a call result...)."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return tuple(reversed(parts))
+    return None
+
+
+def _is_environ(node):
+    """True when node is the subscript os.environ[...] (an assignment target or a del target)."""
+    return isinstance(node, ast.Subscript) and _dotted(node.value) == ("os", "environ")
+
+
+def _herdr_sys_modules(node):
+    """True when node is sys.modules["herdr_task..."] (an assignment target)."""
+    if not (isinstance(node, ast.Subscript) and _dotted(node.value) == ("sys", "modules")):
+        return False
+    key = node.slice
+    return isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value.startswith("herdr_task")
+
+
+def _first_arg_herdr(call):
+    arg = call.args[0] if call.args else None
+    return isinstance(arg, ast.Constant) and isinstance(arg.value, str) and arg.value.startswith("herdr_task")
+
+
+# The os.environ mutators and the sys.modules mutators that a module-level statement may not call.
+_ENV_CALLS = {("os", "environ", m) for m in ("setdefault", "update", "pop", "clear", "__setitem__")} | {("os", "putenv",)}
+_SYS_CALLS = {("sys", "modules", "setdefault"), ("sys", "modules", "update")}
+
+
+class _LeakFinder(ast.NodeVisitor):
+    """Flags os.environ mutations and sys.modules['herdr_task...'] injections that run at import
+    time, i.e. anywhere not inside a function/method body. Statements in the module body, in a
+    module-level if/try/with/for/while block, or in a class body all run on import; setUp,
+    tearDown, setUpModule and test methods are function bodies and are allowed (they can undo
+    their own changes). This is an AST walk, not a line scan, so indentation, multi-line calls and
+    module-level control-flow blocks cannot hide a leak."""
+
+    def __init__(self):
+        self.in_func = 0
+        self.bad = []
+
+    def _enter_func(self, node):
+        self.in_func += 1
+        self.generic_visit(node)
+        self.in_func -= 1
+
+    visit_FunctionDef = _enter_func
+    visit_AsyncFunctionDef = _enter_func
+    visit_Lambda = _enter_func
+
+    def _flag(self, node, what):
+        if not self.in_func:
+            self.bad.append((node.lineno, what))
+
+    def visit_Assign(self, node):
+        for target in node.targets:
+            if _is_environ(target):
+                self._flag(node, "os.environ mutation")
+            elif _herdr_sys_modules(target):
+                self._flag(node, "sys.modules['herdr_task...'] injection")
+        self.generic_visit(node)
+
+    def visit_AugAssign(self, node):
+        if _is_environ(node.target):
+            self._flag(node, "os.environ mutation")
+        self.generic_visit(node)
+
+    def visit_Delete(self, node):
+        if any(_is_environ(t) for t in node.targets):
+            self._flag(node, "os.environ mutation")
+        self.generic_visit(node)
+
+    def visit_Call(self, node):
+        name = _dotted(node.func)
+        if name in _ENV_CALLS:
+            self._flag(node, "os.environ mutation")
+        elif name in _SYS_CALLS and _first_arg_herdr(node):
+            self._flag(node, "sys.modules['herdr_task...'] injection")
+        self.generic_visit(node)
+
+
+class TestHygiene(unittest.TestCase):
+    """A full `python3 -m unittest discover -s test` imports every test file into one process, so a
+    test file that mutates global state at import time (where no setUp/tearDown can undo it) leaks
+    that state into every later file and makes the suite order-dependent. Two leaks have bitten this
+    repo, so no test file may, outside a function body (module body, a module-level control-flow
+    block, or a class body): inject a fake `herdr_task.*` into sys.modules (the real module then
+    never loads for later files), or mutate os.environ (the changed env then follows every later
+    file, including subprocesses). An os.environ patch belongs in setUpModule, restored in
+    tearDownModule."""
+
+    TESTDIR = os.path.dirname(os.path.abspath(__file__))
+
+    def _test_files(self):
+        for name in sorted(os.listdir(self.TESTDIR)):
+            if name.startswith("test_") and name.endswith(".py"):
+                yield name
+
+    def _leaks(self, source):
+        finder = _LeakFinder()
+        finder.visit(ast.parse(source))
+        return finder.bad
+
+    def test_no_module_level_state_leaks(self):
+        bad = []
+        for name in self._test_files():
+            with open(os.path.join(self.TESTDIR, name), encoding="utf-8") as fh:
+                for lineno, what in self._leaks(fh.read()):
+                    bad.append(f"{name}:{lineno}: import-time {what} "
+                               f"(move it into setUpModule/tearDownModule with restore, or into a test)")
+        self.assertEqual(bad, [], "test files leak global state at import time:\n" + "\n".join(sorted(bad)))
+
+    def test_guard_catches_the_known_leak_forms(self):
+        """The forms that have bitten this repo, plus the ones a line scan would miss: a module-level
+        if/try block and a multi-line call. Each must be flagged; a mutation inside a function must
+        not be."""
+        leaky = (
+            'import os, sys\nos.environ["X"] = "1"\n',
+            'import os\nos.environ.setdefault("X", "1")\n',
+            'import sys\nsys.modules["herdr_task.phases"] = object()\n',
+            'import sys\nsys.modules.setdefault("herdr_task.phases", object())\n',
+            'import os\nif True:\n    os.environ["X"] = "1"\n',          # module-level control flow
+            'import os\ntry:\n    os.environ["X"] = "1"\nexcept Exception:\n    pass\n',
+            'import sys\nsys.modules.setdefault(\n    "herdr_task.phases", object())\n',  # multi-line
+            'import os\nclass C:\n    os.environ["X"] = "1"\n',          # class body runs on import
+        )
+        for src in leaky:
+            self.assertTrue(self._leaks(src), f"guard missed a leak:\n{src}")
+        allowed = (
+            'import os\ndef setUpModule():\n    os.environ["X"] = "1"\n',
+            'import os\nfrom unittest import mock\n'
+            'def setUpModule():\n    mock.patch.dict(os.environ, {"X": "1"}).start()\n',
+            'import os, unittest\n'
+            'class T(unittest.TestCase):\n    def setUp(self):\n        os.environ["X"] = "1"\n',
+            'import os\nx = os.environ["PATH"]\n',                       # a read, not a mutation
+            'import os\ne = {**os.environ, "X": "1"}\n',                 # a copy, not a mutation
+        )
+        for src in allowed:
+            self.assertEqual(self._leaks(src), [], f"guard flagged allowed code:\n{src}")
 
 
 if __name__ == "__main__":

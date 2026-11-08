@@ -6,19 +6,20 @@ feature branch and the spec Task), the mode check (remote or local) with its war
 the local-mode guard (no GitHub remote), and that cancel deletes nothing.
 
 A real throwaway git repo (tempfile) and a throwaway STORE are used; no real HOME, HERDR_APP_HOME
-or ~/.herdr is touched. `phases.py` is built by a parallel task (T11a) and is not on this branch,
-so a small fake is injected as `herdr_task.phases` (feature.py imports it lazily). hc and gh are the
-only programs mocked; git is real, and the few places that would reach hc are monkeypatched so no
-real core is touched."""
+or ~/.herdr is touched. The real `herdr_task.phases` (its `PHASES` are the one list of phase names,
+C7) is used. hc and gh are the only programs mocked; git is real, and the few places that would
+reach hc are monkeypatched so no real core is touched. The STORE/settings and the empty git-config
+env vars are set in setUpModule and restored in tearDownModule, so nothing leaks into other test
+files in a full `unittest discover` run."""
 
 import io
 import os
 import shutil
 import sys
 import tempfile
-import types
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "mods", "tasks", "bin")
@@ -26,31 +27,50 @@ if BIN not in sys.path:
     sys.path.insert(0, BIN)
 sys.dont_write_bytecode = True
 
-# A throwaway STORE and settings file, set before the package is imported, so the real ones are
-# never read or written.
-os.environ.setdefault("HERDR_TASK_STORE", tempfile.mkdtemp(prefix="herdr-feature-store-import-"))
-os.environ.setdefault("HERDR_TASK_SETTINGS", os.path.join(
-    tempfile.mkdtemp(prefix="herdr-feature-settings-"), "shepherdr.json"))
-
-# Isolate every git call from the user's global and system config (hooks, signing, fsmonitor).
-_EMPTY_GITCONFIG = tempfile.NamedTemporaryFile(prefix="herdr-feature-gitconfig-", delete=False).name
-os.environ["GIT_CONFIG_GLOBAL"] = _EMPTY_GITCONFIG
-os.environ["GIT_CONFIG_SYSTEM"] = os.devnull
-
-# The fake phases module (T11a's PHASES are the one list of phase names, C7). feature.py imports it
-# lazily inside _set_phase, so injecting it here is enough.
-PHASES = ("planning", "building", "verifying", "closing", "ready", "done", "cancelled")
-_fake_phases = types.ModuleType("herdr_task.phases")
-_fake_phases.PHASES = PHASES
-_fake_phases.ATTENTION = ("verify-open", "row-no-child", "child-failed", "child-stalled",
-                          "needs-plan", "needs-owns", "base-conflict", "blocker-finding")
-_fake_phases.fix_round_allowed = lambda feature, verify_rounds: int(feature.get("fix_rounds") or 0) < verify_rounds
-sys.modules.setdefault("herdr_task.phases", _fake_phases)
-
 from herdr_task import feature  # noqa: E402
 from herdr_task import store as store_mod  # noqa: E402
+from herdr_task import settings as settings_mod  # noqa: E402
+from herdr_task import base as base_mod  # noqa: E402
 from herdr_task.store import Store, locate  # noqa: E402
 from herdr_task.base import Fail  # noqa: E402
+
+# A throwaway STORE and settings file, plus an empty git-config, kept for the lifetime of this
+# module's tests and torn down after, so the real ones are never read or written and nothing leaks
+# into later test files. STORE and SETTINGS are cached from the env at import (base.py, settings.py),
+# before setUpModule runs, so the module attributes are patched directly as well as the env (the env
+# still matters for any git or subprocess call). Each test also re-patches store_mod.STORE in setUp.
+_PATCHES = []
+_GITCONFIG = None
+
+
+def setUpModule():
+    global _PATCHES, _GITCONFIG
+    _fd, _GITCONFIG = tempfile.mkstemp(prefix="herdr-feature-gitconfig-")
+    os.close(_fd)
+    store_dir = tempfile.mkdtemp(prefix="herdr-feature-store-import-")
+    settings_file = os.path.join(tempfile.mkdtemp(prefix="herdr-feature-settings-"), "shepherdr.json")
+    _PATCHES = [
+        mock.patch.dict(os.environ, {
+            "HERDR_TASK_STORE": store_dir,
+            "HERDR_TASK_SETTINGS": settings_file,
+            # Isolate every git call from the user's global and system config (hooks, signing, fsmonitor).
+            "GIT_CONFIG_GLOBAL": _GITCONFIG,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }),
+        mock.patch.object(settings_mod, "SETTINGS", settings_file),
+        mock.patch.object(store_mod, "STORE", store_dir),
+        mock.patch.object(base_mod, "STORE", store_dir),
+    ]
+    for p in _PATCHES:
+        p.start()
+
+
+def tearDownModule():
+    for p in reversed(_PATCHES):
+        p.stop()
+    _PATCHES.clear()
+    if _GITCONFIG and os.path.exists(_GITCONFIG):
+        os.unlink(_GITCONFIG)
 
 
 def git(repo, *args, check=True):
