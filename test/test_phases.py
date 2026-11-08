@@ -221,6 +221,34 @@ class SkippedUnblocksDependents(unittest.TestCase):
         ]
         self.assertEqual(phases.blocked_dependents(kids), [])
 
+    def test_a_blocked_remote_dependent_is_named_machine_qualified(self):
+        # A:14 failed; A:15 (same machine) waits on it and is blocked, reported as vm-a:HAT-15.
+        kids = [
+            child(14, attention="failed", retries=1, machine="vm-a", ref="HAT-14"),
+            child(15, state="todo", after=[14], machine="vm-a", ref="HAT-15"),
+        ]
+        self.assertEqual(phases.blocked_dependents(kids), ["vm-a:HAT-15"])
+
+    def test_same_ref_on_two_machines_is_told_apart(self):
+        # Only vm-a:HAT-15 is blocked; vm-b:HAT-15 is independent and must not be swept in.
+        kids = [
+            child(14, attention="failed", retries=1, machine="vm-a", ref="HAT-14"),
+            child(15, state="todo", after=[14], machine="vm-a", ref="HAT-15"),
+            child(15, state="running", machine="vm-b", ref="HAT-15"),
+        ]
+        self.assertEqual(phases.blocked_dependents(kids), ["vm-a:HAT-15"])
+
+    def test_a_cross_machine_link_between_waves_propagates_the_block(self):
+        # vm-a:HAT-14 failed; vm-b:HAT-15 waits on it across machines (after_ext); vm-b:HAT-16 waits
+        # on 15 locally. Both vm-b children are blocked (proposal 6.13 allows cross-machine links).
+        kids = [
+            child(14, attention="failed", retries=1, machine="vm-a", ref="HAT-14"),
+            child(15, state="todo", machine="vm-b", ref="WEB-15",
+                  after_ext=[{"ref": "vm-a:HAT-14", "machine": "vm-a", "prefix": "HAT", "id": 14}]),
+            child(16, state="todo", after=[15], machine="vm-b", ref="WEB-16"),
+        ]
+        self.assertEqual(phases.blocked_dependents(kids), ["vm-b:WEB-15", "vm-b:WEB-16"])
+
     def test_skip_lets_the_feature_reach_verifying(self):
         # 14 failed with no retry, 15 waits on it. Skip 14, 15 merges -> all satisfied -> verifying.
         f = feature("building")
@@ -248,47 +276,46 @@ class Verifying(unittest.TestCase):
         kids = [merged(14), self._verify(state="done", verify_pass=True)]
         self.assertEqual(phases.phase_of(f, kids), ("closing", ""))
 
-    def test_a_blocker_finding_with_no_fix_in_flight_stops_the_loop(self):
+    def test_open_findings_rest_quietly_until_the_caller_decides(self):
+        # verify-open (needs the setting) and blocker-finding (needs the can-fix judgment) are the
+        # caller's to raise; with none set yet, phase_of leaves the Feature quiet.
         f = feature("verifying", verify_task=30)
+        findings = [{"level": "major", "title": "..."}]
+        kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
+        self.assertEqual(phases.phase_of(f, kids), ("verifying", ""))
+
+    def test_phase_of_never_raises_blocker_finding_on_its_own(self):
+        f = feature("verifying", verify_task=30)
+        findings = [{"level": "blocker", "title": "Auth bypass"}]
+        kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
+        self.assertEqual(phases.phase_of(f, kids), ("verifying", ""))
+
+    def test_a_verify_open_the_caller_set_is_kept(self):
+        f = feature("verifying", verify_task=30, attention="verify-open")
+        findings = [{"level": "major", "title": "..."}]
+        kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
+        self.assertEqual(phases.phase_of(f, kids), ("verifying", "verify-open"))
+
+    def test_a_blocker_finding_the_caller_set_is_kept(self):
+        f = feature("verifying", verify_task=30, attention="blocker-finding")
         findings = [{"level": "blocker", "title": "Auth bypass"}]
         kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
         self.assertEqual(phases.phase_of(f, kids), ("verifying", "blocker-finding"))
 
-    def test_a_blocker_being_fixed_does_not_stop_the_loop(self):
-        # A Fix Task is in flight for the blocker, so the loop waits rather than showing attention.
-        f = feature("verifying", verify_task=30)
-        findings = [{"level": "blocker", "title": "Auth bypass"}]
-        kids = [merged(14), self._verify(verify_pass=False, findings=findings),
-                child(31, role="fix", state="running")]
-        self.assertEqual(phases.phase_of(f, kids), ("verifying", ""))
-
-    def test_findings_before_the_rounds_run_out_do_not_show_verify_open(self):
-        # fix_rounds=0 of 2 allowed: a round is still available, so no Needs you yet.
-        f = feature("verifying", verify_task=30, fix_rounds=0)
-        findings = [{"level": "major", "title": "..."}]
-        kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
-        self.assertEqual(phases.phase_of(f, kids, verify_rounds=2), ("verifying", ""))
-
-    def test_findings_after_the_rounds_run_out_show_verify_open(self):
-        f = feature("verifying", verify_task=30, fix_rounds=2)
-        findings = [{"level": "major", "title": "..."}]
-        kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
-        self.assertEqual(phases.phase_of(f, kids, verify_rounds=2), ("verifying", "verify-open"))
-
-    def test_without_the_setting_phase_of_never_raises_verify_open(self):
-        # The bare contract call leaves the verify-open decision to the caller.
-        f = feature("verifying", verify_task=30, fix_rounds=2)
+    def test_a_stale_unrelated_attention_is_cleared(self):
+        # An attention that is not one of the two verifying ones does not survive the resting state.
+        f = feature("verifying", verify_task=30, attention="child-failed")
         findings = [{"level": "major", "title": "..."}]
         kids = [merged(14), self._verify(verify_pass=False, findings=findings)]
         self.assertEqual(phases.phase_of(f, kids), ("verifying", ""))
 
-    def test_findings_with_a_fix_task_in_flight_stay_quiet(self):
-        # A fix round is running, so the Feature waits rather than showing verify-open.
-        f = feature("verifying", verify_task=30, fix_rounds=2)
+    def test_a_fix_round_in_flight_keeps_the_feature_quiet(self):
+        # A fix round is running, so the Feature waits even if the caller had set verify-open before.
+        f = feature("verifying", verify_task=30, attention="verify-open")
         findings = [{"level": "minor", "title": "..."}]
         kids = [merged(14), self._verify(verify_pass=False, findings=findings),
                 child(31, role="fix", state="running")]
-        self.assertEqual(phases.phase_of(f, kids, verify_rounds=2), ("verifying", ""))
+        self.assertEqual(phases.phase_of(f, kids), ("verifying", ""))
 
     def test_a_named_verify_task_not_yet_present_keeps_waiting(self):
         # verify_task=32 names a fresh round's task that has not arrived; an old pass is not read.
@@ -301,8 +328,7 @@ class Verifying(unittest.TestCase):
         f = feature("verifying", verify_task=32)
         old = self._verify(30, state="done", verify_pass=False, findings=[{"level": "major"}])
         new = self._verify(32, state="running")
-        self.assertEqual(phases.phase_of(f, [merged(14), old, new], verify_rounds=2),
-                         ("verifying", ""))
+        self.assertEqual(phases.phase_of(f, [merged(14), old, new]), ("verifying", ""))
 
     def test_a_fix_task_exception_surfaces_in_verifying(self):
         f = feature("verifying", verify_task=30)
@@ -326,14 +352,11 @@ class FixRounds(unittest.TestCase):
         self.assertTrue(phases.fix_round_allowed(feature("verifying", fix_rounds=2), 5))
 
     def test_two_rounds_then_needs_you(self):
-        # Rounds 0 and 1 are allowed; after the second round's findings, verify-open and no round left.
-        findings = [{"level": "major", "title": "..."}]
-        verify = child(30, role="verify", state="done", verify_pass=False, findings=findings)
-        for used, allowed, attention in [(0, True, ""), (1, True, ""), (2, False, "verify-open")]:
+        # The rule the caller pairs with verify-open: a round is allowed for fix_rounds 0 and 1, and
+        # not for 2. The caller raises verify-open once this returns False (see the Verifying tests).
+        for used, allowed in [(0, True), (1, True), (2, False)]:
             f = feature("verifying", verify_task=30, fix_rounds=used)
             self.assertEqual(phases.fix_round_allowed(f, 2), allowed)
-            self.assertEqual(phases.phase_of(f, [merged(14), verify], verify_rounds=2),
-                             ("verifying", attention))
 
 
 class PreservedPhases(unittest.TestCase):
