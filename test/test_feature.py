@@ -328,6 +328,34 @@ class Sync(Base):
                                          "main", f["branch"]]).returncode, 0)
         self.assertEqual(git(self.repo, "rev-parse", "--abbrev-ref", "HEAD"), "main")
 
+    def test_remote_sync_merges_the_fetched_base(self):
+        """Remote mode fetches and merges the base at FETCH_HEAD, even without a tracking ref, so a
+        feature branch behind the remote's base catches up."""
+        import subprocess
+        origin = os.path.join(self.tmp, "origin.git")
+        os.makedirs(origin)
+        git(origin, "init", "-q", "--bare", "-b", "main")
+        with self.store() as s:
+            f = feature.create(s, "Login flow", mode="remote")
+            fid, fb = f["id"], f["branch"]
+        git(self.repo, "remote", "add", "origin", origin)
+        git(self.repo, "push", "-q", "origin", "main", fb)
+        before = git(self.repo, "rev-parse", fb)
+        # Another clone advances origin's main past the feature branch.
+        clone = os.path.join(self.tmp, "clone")
+        subprocess.run(["git", "clone", "-q", origin, clone], check=True,
+                       env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1"})
+        git(clone, "config", "user.email", "t@example.com")
+        git(clone, "config", "user.name", "Tester")
+        commit(clone, "remote-new.txt", "x\n", "remote advance")
+        git(clone, "push", "-q", "origin", "main")
+
+        with self.store() as s:
+            res = feature.sync(s, s.feature_by_id(fid))
+        self.assertTrue(res["merged"])
+        self.assertFalse(res["conflict"])
+        self.assertNotEqual(git(self.repo, "rev-parse", fb), before)
+
     def test_conflict_leaves_the_branch_untouched(self):
         f = self._feature_branch()
         # Both branches change the same file differently.

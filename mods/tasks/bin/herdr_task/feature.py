@@ -219,22 +219,22 @@ def show(s, feature):
 
 # ---- sync (merge the base branch into the feature branch early) ------------------------------
 
-def _base_point(s, feature):
-    """What `sync` merges into the feature branch: in remote mode the remote's base (fetched), so
-    the feature branch catches up with work merged on GitHub; else the local base branch. A fetch
-    that fails in remote mode is raised, not swallowed: merging a stale remote-tracking branch would
-    report a clean sync that never saw the current base."""
-    main, base = s.loc["folder"], feature.get("base") or "main"
+def _fetch_base_point(wt, feature):
+    """The ref `sync` merges into the feature branch, resolved inside the sync worktree `wt`. In
+    remote mode the base is fetched here so the feature branch catches up with work merged on
+    GitHub; the fetch runs in `wt` so `FETCH_HEAD` is this worktree's own (it is per-worktree, not
+    shared), and `FETCH_HEAD` is exactly the commit just fetched whatever the remote's fetch refspec
+    is, so no stale tracking ref is relied on. A failed fetch is raised, not swallowed. In local mode
+    it is the local base branch."""
+    base = feature.get("base") or "main"
     if feature.get("mode") == "remote":
-        remote = remote_of(main)
-        if remote in git(main, "remote")[1].split():
-            ok, _, err = git_quick(main, "fetch", "--quiet", "--no-tags", remote, base)
+        remote = remote_of(wt)
+        if remote in git(wt, "remote")[1].split():
+            ok, _, err = git_quick(wt, "fetch", "--quiet", "--no-tags", remote, base)
             if not ok:
                 raise Fail(f"Couldn't fetch {base} from {remote}: {err or 'the remote is unreachable'}. "
                            f"Sync again when it is reachable.")
-            tracked = f"{remote}/{base}"
-            if git(main, "show-ref", "--verify", "--quiet", f"refs/remotes/{tracked}")[0]:
-                return tracked
+            return "FETCH_HEAD"
     return base
 
 
@@ -243,13 +243,13 @@ def sync(s, feature):
     works in a throwaway worktree on the feature branch, so the folder's own checkout never moves.
     A conflict aborts the merge and leaves the feature branch untouched (`deletes nothing`)."""
     main, fb = s.loc["folder"], feature["branch"]
-    base_point = _base_point(s, feature)
     tmp = tempfile.mkdtemp(prefix="herdr-feature-sync-")
     try:
         ok, _, err = git(main, "worktree", "add", "--quiet", tmp, fb)
         if not ok:
             raise Fail(err or f"Couldn't check out {fb} to merge the base in.")
         try:
+            base_point = _fetch_base_point(tmp, feature)
             before = git(tmp, "rev-parse", "HEAD")[1]
             merged, _, _ = git(tmp, "merge", "--no-edit", base_point)
             if not merged:
@@ -326,11 +326,13 @@ def _squash_merge_local(main, fb, base, message):
             return err or f"Couldn't check out {base} to merge into."
         wt = own_tmp
     try:
-        ok, _, err = git(wt, "merge", "--squash", fb)
+        # --no-overwrite-ignore makes git refuse rather than clobber an uncommitted ignored file
+        # that the feature branch tracks, so a person's local ignored file is never lost.
+        ok, _, err = git(wt, "merge", "--squash", "--no-overwrite-ignore", fb)
         if not ok:
             # The worktree was clean before, so this restores it to the base tip and loses nothing.
             git(wt, "reset", "--hard", "HEAD")
-            return err or f"Couldn't squash-merge {fb} into {base} (conflicts)."
+            return err or f"Couldn't squash-merge {fb} into {base} (conflicts, or it would overwrite an ignored file)."
         ok, out, err = git(wt, "commit", "-m", message)
         if not ok and "nothing to commit" not in (out + err):
             git(wt, "reset", "--hard", "HEAD")
@@ -458,7 +460,12 @@ def _cmd_show(args):
     on = getattr(args, "on", None)
     if on and on != machine_name():
         from . import cli
-        return cli.remote(on, ["feature", "show", args.ref] + (["--json"] if getattr(args, "json", False) else []))
+        fwd = ["feature", "show", args.ref]
+        if getattr(args, "folder", None):
+            fwd += ["--folder", args.folder]
+        if getattr(args, "json", False):
+            fwd.append("--json")
+        return cli.remote(on, fwd)
     with open_store(args, write=False) as s:
         feature = get(s, args.ref)
         data = show(s, feature)
