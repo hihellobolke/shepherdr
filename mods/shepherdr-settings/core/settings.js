@@ -195,6 +195,13 @@ export const ABOUT = {
   "tasks.max_running": "Per folder. More wait their turn and start by themselves.",
   "tasks.archive_after": "Done tasks move to Archived, with their chat and summary.",
   "tasks.worktrees": "In a git repo, each task gets its own worktree and branch.",
+  "tasks.flow": "Classic runs one task at a time. OpenSpec flow plans a big piece of work and runs child tasks for its parts.",
+  "tasks.verify_rounds": "How many times a Feature fixes what the Verify task finds before it needs you.",
+  "tasks.risky_paths": "A task whose files match one of these globs is high risk, so you accept its merge yourself.",
+  "tasks.retro": "After a Feature is done, look back at how it went. Ask me first, or start it automatically.",
+  "tasks.retro_prompt": "What the retro is told to do: the built-in steps, a skill, or a file.",
+  "tasks.retro_save": "Where the retro write-up is kept.",
+  "tasks.may_change": "What a flow agent may change on its own, without your Accept.",
   "automations.enabled": "Tasks an agent set to start on a schedule or an event.",
 };
 // What a task's agent is told to do first and last (tasks.start_notes / finish_notes), each a box under its words.
@@ -291,7 +298,9 @@ export const MACHINES = {
 export const OLD_NAMES = { coordinator: "Assistant", worker: "Workers", reviewer: "Reviewer", backup: "Backup agent",
   automations: "Run automations", merge: "Merge", review_rounds: "Review", must_fix: "Must fix", proof: "Proof",
   max_running: "Tasks at once", archive_after: "Archive Done after", worktrees: "Worktrees",
-  start_notes: "When a task starts", finish_notes: "When a task finishes", base: "Base branch", branch: "Branch names", agents: "Reactions" };
+  start_notes: "When a task starts", finish_notes: "When a task finishes", base: "Base branch", branch: "Branch names", agents: "Reactions",
+  flow: "Flow", verify_rounds: "Verify rounds", risky_paths: "Risky paths", owns_exempt: "Exempt owned paths",
+  retro: "Retro", retro_prompt: "Retro prompt", retro_save: "Retro saves to", may_change: "May change without asking" };
 // Home Assistant's line: on or off, and what herdr-task's home round last found there (~/.herdr/tasks/.home.json).
 export function homeAbout(on, st) {
   return !on ? "Off: nobody watches its disk, load and processes."
@@ -345,9 +354,16 @@ export const MUST_FIX = [["blocker", "Blockers"], ["major", "Major and up"], ["m
 export const ROUNDS = [[0, "Off"], [1, "1 round"], [2, "2 rounds"], [3, "3 rounds"]];
 export const ARCHIVE = [[0, "Off"], [1, "1 day"], [3, "3 days"], [7, "1 week"], [30, "1 month"]];
 export const ONOFF = [[true, "On"], [false, "Off"]];
+// The OpenSpec flow rows' choices (docs/openspec-flow.md, the contract).
+export const FLOW = [["classic", "Classic"], ["openspec", "OpenSpec flow"]];
+export const VERIFY_ROUNDS = [[1, "1 round"], [2, "2 rounds"], [3, "3 rounds"], [4, "4 rounds"], [5, "5 rounds"]];
+export const RETRO = [["off", "Off"], ["ask", "Ask me"], ["automatic", "Automatic"]];
+export const RETRO_SAVE = [["outside", "Outside the repo"], ["repo", "In the repo (docs/retros/)"], ["pr", "Pull request comment"]];
+export const MAY_CHANGE = [["agents_md", "AGENTS.md"], ["specs", "Specs and ADRs"]];
 
-export const DEFAULTS = { tasks: { merge: "ask", review_rounds: 0, must_fix: "major", max_running: 10, worktrees: true, archive_after: 7, proof: true }, automations: { enabled: true },
-  agents: { reactions: true, feedback: true, feedback_repo: "" } };
+export const DEFAULTS = { tasks: { merge: "ask", review_rounds: 0, must_fix: "major", max_running: 10, worktrees: true, archive_after: 7, proof: true,
+    flow: "classic", verify_rounds: 2, risky_paths: [], owns_exempt: [], retro: "off", retro_prompt: "built-in", retro_save: "outside", may_change: [] },
+  automations: { enabled: true }, retro: {}, agents: { reactions: true, feedback: true, feedback_repo: "" } };
 
 // [section, field, label, choices | { min, max }]
 export const TASK_ROWS = [
@@ -358,6 +374,11 @@ export const TASK_ROWS = [
   ["tasks", "max_running", "Tasks at once", { min: 1, max: 10 }],
   ["tasks", "archive_after", "Archive Done after", ARCHIVE],
   ["tasks", "worktrees", "Worktrees", ONOFF],
+  ["tasks", "flow", "Flow", FLOW],
+  ["tasks", "verify_rounds", "Verify rounds", VERIFY_ROUNDS],
+  ["tasks", "retro", "Retro", RETRO],
+  ["tasks", "retro_save", "Retro saves to", RETRO_SAVE],
+  ["tasks", "may_change", "May change without asking", MAY_CHANGE],
   ["automations", "enabled", "Run automations", ONOFF],
 ];
 
