@@ -35,9 +35,9 @@ class FlowPointers(unittest.TestCase):
             self.assertIn("Flow: openspec", words)
             self.assertIn("flow file (spec, child or verify)", words)
             self.assertIn("herdr-task sync-branch", words)
-            self.assertIn("classic task", words)
-        # a classic brief shows the pointer but its condition is false, so it is inert
-        self.assertIn("Without that line, work as a classic task.", worker)
+            # an ordinary Task in an openspec space has no flow file: work as usual (proposal 6.2)
+            self.assertIn("ordinary task", words)
+        self.assertIn("A brief with no flow file is an ordinary task", worker)
 
     def test_reviewer_pointer_and_coding_standards(self):
         reviewer = body_of("reviewer")
@@ -45,6 +45,8 @@ class FlowPointers(unittest.TestCase):
             self.assertIn("Flow: openspec", words)
             self.assertIn("owned paths", words)
             self.assertIn("Verify Task checks the Feature as a whole", words)
+            # an ordinary Task has no owned paths: review it as usual (proposal 6.2)
+            self.assertIn("review it as usual", words)
             self.assertIn("CODING_STANDARDS.md", words)
         # the reviewer.md file and the REVIEWER_MD constant stay in sync
         self.assertEqual(reviewer.strip(), templates.REVIEWER_MD.strip())
@@ -54,7 +56,9 @@ class FlowPointers(unittest.TestCase):
         self.assertIn("## OpenSpec flow", assistant)
         for words in ("feature add", "Merge feature", "Add a fix round",
                       "herdr-task feature merge", "herdr-task feature fix-round",
-                      "digest", "Needs you", "Plan approval"):
+                      "digest", "Needs you", "Plan approval",
+                      # verify findings become Fix Tasks and a new Verify Task (proposal 6.11)
+                      "--role fix", "--role verify", "one fix round"):
             self.assertIn(words, assistant)
         # inert by default: it names the condition
         self.assertIn("applies only when Flow is openspec", assistant)

@@ -144,8 +144,10 @@ News and digests:
 - Read the full state with `herdr-task feature show HAT-12` before you act on one.
 
 Needs you, Merge feature and Add a fix round:
-- A Verify Task runs `/opsx:verify` on the feature branch. Its findings become Fix Tasks. A Feature allows a set number of fix rounds (the Verify rounds setting).
-- After the last fix round with open findings, or on a blocker the fixes cannot clear, the Feature shows Needs you. Decide with the person: `herdr-task feature fix-round HAT-12` adds one more round, or the person fixes by hand, or you merge as is.
+- A Verify Task runs `/opsx:verify` on the feature branch, and its findings reach you one by one.
+- On those findings, add a Fix Task for each with `herdr-task add --feature HAT-12 --role fix --owns <paths> --set merge=checks`, then add a Verify Task that waits for them (`--role verify`). That is one fix round.
+- A Feature allows a set number of fix rounds (the Verify rounds setting). After the last fix round with open findings, or on a blocker the fixes cannot clear, the Feature shows Needs you.
+- Then decide with the person: `herdr-task feature fix-round HAT-12` adds one more round, or the person fixes by hand, or you merge as is.
 - When verify is clean, herdr-task closes the Feature by itself: it ticks the rows, archives the change, merges the base in and opens the pull request. The Feature moves to phase `ready`.
 - In phase `ready` the person presses Merge feature: `herdr-task feature merge HAT-12` squash-merges the pull request into the base, and the Feature becomes done.
 - `herdr-task feature cancel HAT-12` stops a Feature: it stops running children, removes queued ones, keeps the feature branch and deletes nothing.

@@ -87,10 +87,10 @@ WORKER_MD_BEFORE_FEEDBACK = WORKER_MD_BEFORE_SUBAGENTS.replace(SUBAGENTS_OLD, SU
 FEEDBACK_RULE = ("- Shepherdr itself misbehaving, not your task's own code (a Shepherdr, herdr-task, web app or window feature that doesn't work as meant, a Herdr command failing like a bug, the person frustrated with Shepherdr, or a \"Shepherdr feedback:\" line in your reviewer's findings): run the `herdr-task feedback` command given at the end of your brief, once per problem, then carry on. It returns at once and your Assistant asks the person whether to file it; never file an issue yourself, and put no secrets, private paths or whole logs in it.\n")
 WORKER_MD_BEFORE_FLOW = WORKER_MD_BEFORE_FEEDBACK + FEEDBACK_RULE
 # Since the OpenSpec flow adds a flow file to a worker's brief (SHMD-13): the pointer is inert on a classic task.
-FLOW_POINTER_WORKER = ("- Flow: when your Settings block says `Flow: openspec`, this task is part of a Feature and your brief carries a "
-                       "flow file (spec, child or verify) with its rules: follow it. It covers your owned paths, `herdr-task "
-                       "sync-branch` before ready, and `/opsx:apply` for your own rows only. Without that line, work as a "
-                       "classic task.\n")
+FLOW_POINTER_WORKER = ("- Flow: when your Settings block says `Flow: openspec`, this space uses the OpenSpec flow. If your brief carries "
+                       "a flow file (spec, child or verify), this task is part of a Feature: follow that file's rules (its owned "
+                       "paths, `herdr-task sync-branch` before ready, and `/opsx:apply` for your own rows only). A brief with no "
+                       "flow file is an ordinary task: work as usual.\n")
 WORKER_MD = WORKER_MD_BEFORE_FLOW + FLOW_POINTER_WORKER
 
 REVIEWER_MD_BEFORE_SUBAGENT = """You review one Herdr task's work before it can merge. Read only: never edit files, commit or push.
@@ -107,8 +107,9 @@ REVIEWER_FEEDBACK = ("- Shepherdr itself misbehaving while you review (a Herdr c
                      "one line in your findings starting \"Shepherdr feedback:\", what happened and what you expected; your worker passes it on.\n")
 REVIEWER_MD_BEFORE_FLOW = REVIEWER_MD_BEFORE_FEEDBACK + REVIEWER_FEEDBACK
 # Since the reviewer reads CODING_STANDARDS.md and gets a flow pointer (SHMD-13): the pointer is inert on a classic task.
-REVIEWER_FLOW = ("- Flow: when the Settings block says `Flow: openspec`, the change is one Child Task of a Feature: check it stays "
-                 "within its owned paths and does only its work package; the Verify Task checks the Feature as a whole.\n"
+REVIEWER_FLOW = ("- Flow: when the Settings block says `Flow: openspec` and the task's brief carried a flow file with owned paths "
+                 "(a Feature's Child Task or Fix Task), check the change stays within those owned paths and does only its work "
+                 "package; the Verify Task checks the Feature as a whole. An ordinary task has no owned paths: review it as usual.\n"
                  "- If the repo has a CODING_STANDARDS.md, read it and check the change against it.\n")
 REVIEWER_MD = REVIEWER_MD_BEFORE_FLOW + REVIEWER_FLOW
 # Earlier reviewer defaults: a file still saying one, unedited, gets today's.
