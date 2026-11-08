@@ -292,7 +292,8 @@ def _open_pr(s, feature, folder):
         # Adopt an open pull request already on the feature branch even when it was not saved on the
         # record (a push or `gh pr create` that landed before the store write). Without this a retry
         # would call `gh pr create` again, hit "already exists", and never reach ready.
-        adopted = _existing_pr(repo, feature["branch"], base)
+        tip = git(folder, "rev-parse", "HEAD")[1]
+        adopted = _existing_pr(repo, feature["branch"], base, tip)
         if adopted:
             feature["pr"] = adopted
             _ready(feature)
@@ -311,16 +312,28 @@ def _open_pr(s, feature, folder):
     return {"pr": url}
 
 
-def _existing_pr(repo, branch, base):
-    """An open pull request already on `branch` into `base`, as `{number, url, repo}`, or None."""
+def _existing_pr(repo, branch, base, tip):
+    """An open pull request already on `branch` into `base` at `tip`, as `{number, url, repo}`, or None.
+
+    Mirrors `github.pr_adopt`'s safety: never a fork's branch of the same name (`isCrossRepository`),
+    only into our base, and only when its head commit is the branch tip we just pushed (so a stale or
+    unrelated pull request is not adopted). `tip` must be known; without it nothing is adopted.
+    """
+    if not tip:
+        return None
     ok, out, _ = gh("pr", "list", "--repo", repo, "--head", branch, "--state", "open",
-                    "--json", "number,url,baseRefName")
+                    "--json", "number,url,baseRefName,isCrossRepository,headRefOid")
     if not ok or not out:
         return None
     try:
         for pr in json.loads(out):
-            if pr.get("baseRefName") == base:
-                return {"number": pr["number"], "url": pr["url"], "repo": repo}
+            if pr.get("isCrossRepository"):
+                continue
+            if pr.get("baseRefName") != base:
+                continue
+            if pr.get("headRefOid") != tip:
+                continue
+            return {"number": pr["number"], "url": pr["url"], "repo": repo}
     except (ValueError, TypeError, KeyError):
         return None
     return None

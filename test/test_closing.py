@@ -79,17 +79,39 @@ else:
     sys.exit(1)
 """
 
-# An existing open pull request on the branch, and `pr create` fails ("already exists"): closing must
-# adopt the existing one rather than try to create a second.
+# An existing open pull request on the branch (at the pushed tip), and `pr create` fails ("already
+# exists"): closing must adopt the existing one rather than try to create a second. The fake reads the
+# pushed tip from the bare remote (HERDR_TEST_REMOTE) so its headRefOid matches.
 FAKE_GH_EXISTING = """#!/usr/bin/env python3
-import sys
+import json, os, subprocess, sys
+a = sys.argv[1:]
+def tip():
+    bare = os.environ.get("HERDR_TEST_REMOTE", "")
+    return subprocess.run(["git", "-C", bare, "rev-parse", "feature/login-flow"],
+                          capture_output=True, text=True).stdout.strip()
+if a[:2] == ["repo", "view"]:
+    print("acme/shop")
+elif a[:2] == ["pr", "list"]:
+    print(json.dumps([{"number": 11, "url": "https://github.com/acme/shop/pull/11",
+                       "baseRefName": "main", "isCrossRepository": False, "headRefOid": tip()}]))
+elif a[:2] == ["pr", "create"]:
+    sys.stderr.write("a pull request for branch already exists\\n"); sys.exit(1)
+else:
+    sys.exit(1)
+"""
+
+# `pr list` returns only a fork's PR (isCrossRepository) on the same branch name: closing must NOT
+# adopt it, and must create its own (pull/7).
+FAKE_GH_FORK = """#!/usr/bin/env python3
+import json, sys
 a = sys.argv[1:]
 if a[:2] == ["repo", "view"]:
     print("acme/shop")
 elif a[:2] == ["pr", "list"]:
-    print('[{"number": 11, "url": "https://github.com/acme/shop/pull/11", "baseRefName": "main"}]')
+    print(json.dumps([{"number": 99, "url": "https://github.com/fork/shop/pull/99",
+                       "baseRefName": "main", "isCrossRepository": True, "headRefOid": "deadbeef"}]))
 elif a[:2] == ["pr", "create"]:
-    sys.stderr.write("a pull request for branch already exists\\n"); sys.exit(1)
+    print("https://github.com/acme/shop/pull/7")
 else:
     sys.exit(1)
 """
@@ -122,6 +144,12 @@ class Base(unittest.TestCase):
         old = getattr(mod, name)
         setattr(mod, name, value)
         self.addCleanup(setattr, mod, name, old)
+
+    def _set_env(self, name, value):
+        old = os.environ.get(name)
+        os.environ[name] = value
+        self.addCleanup(lambda: os.environ.__setitem__(name, old) if old is not None
+                        else os.environ.pop(name, None))
 
     # ---- git helpers -------------------------------------------------------------------------
 
@@ -286,6 +314,7 @@ class RemoteClose(Base):
         self.git("push", "-q", "origin", "main")
         self.make_feature_branch()
 
+        self._set_env("HERDR_TEST_REMOTE", bare)
         fake_gh = os.path.join(self.bin, "gh")
         _script(fake_gh, FAKE_GH_EXISTING)  # `pr create` here fails; only adoption reaches ready
         self._set(github, "GH", fake_gh)
@@ -297,6 +326,26 @@ class RemoteClose(Base):
         self.assertEqual(result["pr"], "https://github.com/acme/shop/pull/11")
         with store.Store(self.loc, write=False) as s:
             self.assertEqual(s.find_feature(ref)["pr"]["number"], 11)
+
+    def test_remote_mode_never_adopts_a_fork_pull_request(self):
+        """A fork's PR on an identically named branch is not adopted; closing creates its own."""
+        self.seed_main()
+        bare = os.path.join(self.tmp, "origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", bare], check=True)
+        self.git("remote", "add", "origin", bare)
+        self.git("push", "-q", "origin", "main")
+        self.make_feature_branch()
+
+        fake_gh = os.path.join(self.bin, "gh")
+        _script(fake_gh, FAKE_GH_FORK)
+        self._set(github, "GH", fake_gh)
+
+        ref = self.build_store(ALL_ROWS, mode="remote")
+        with store.Store(self.loc) as s:
+            result = closing.close(s, s.find_feature(ref))
+        self.assertEqual(result["pr"], "https://github.com/acme/shop/pull/7")  # created, not the fork
+        with store.Store(self.loc, write=False) as s:
+            self.assertEqual(s.find_feature(ref)["pr"]["number"], 7)
 
 
 class BaseConflict(Base):
