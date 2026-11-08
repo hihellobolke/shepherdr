@@ -38,6 +38,7 @@ import json
 import os
 import re
 import shlex
+import sys
 
 from .base import Fail, git, now, run as run_cmd
 from .settings import set_task, settings_for
@@ -206,7 +207,10 @@ def cmd_fanout(args):
     with open_store(args, write=not dry) as s:
         p = plan(s, change, machines, amend)
         if not p.get("valid"):
-            _say_plan(args, p)
+            if getattr(args, "json", False):
+                say(args, p, "")  # the C5 invalid shape {valid:false, code, error}
+            else:
+                sys.stderr.write(f"herdr-task: the plan is not valid ({p.get('code')}): {p.get('error')}\n")
             return 1
         if not dry:
             p = run(s, change, machines, amend, start=not getattr(args, "no_start", False))
@@ -223,11 +227,9 @@ def cmd_fanout(args):
 
 
 def _say_plan(args, p):
+    """Print a valid plan (the invalid case is handled in `cmd_fanout`, to stderr per contract C4/C6)."""
     if getattr(args, "json", False):
         say(args, p, "")
-        return
-    if not p.get("valid"):
-        print(f"fanout: the work table is not valid ({p.get('code')}): {p.get('error')}")
         return
     lines = [f"{p['feature']} fan-out of {p['change']}: {len(p['packages'])} work packages"]
     for pkg in p["packages"]:
@@ -560,30 +562,47 @@ def _dep_children(feature, entry, packages):
     return out
 
 
-def _home_child_ids(children):
-    """The home task ids among a Feature's children (those on this machine). Fan-out links only these;
-    a child on another machine is waited for through the cross-machine integration (T17/T19), not here,
-    so this module never makes a synchronous cross-machine call while it holds the store lock."""
-    return [c["ref"] for c in children if not c.get("machine")]
+def _deps_split(s, feature, entry, packages):
+    """What a package's child comes after: (home task ids, external wait records) for the children of its
+    predecessor packages. A predecessor on another machine becomes an `after_ext` record built directly
+    (its machine, its id, the folder prefix) with no cross-machine query, so fan-out stays lock-safe."""
+    return _local_and_ext(s, _dep_children(feature, entry, packages))
 
 
-def _home_deps(s, feature, entry, packages):
-    """The home task ids a package's child depends on: the home children of its predecessor packages. A
-    predecessor on another machine is left to the integration layer to wire (a cross-wave, cross-machine
-    link), so fan-out neither queries that machine nor touches the child's `after_ext`."""
-    return [c["ref"] for c in _dep_children(feature, entry, packages) if not c.get("machine")]
+def _local_and_ext(s, children):
+    """Split a list of child entries into (home task ids, external wait records). A child on another
+    machine becomes an `after_ext` record (the shape `queues` uses), named machine-first with the folder
+    prefix (the C5 example's shape). The record is built directly, never by asking the machine, so it is
+    safe to set while the store lock is held; the queue's own `refresh_ext` fills in its live state later."""
+    home_ids, ext = [], []
+    for c in children:
+        if c.get("machine"):
+            ext.append({"ref": f"{c['machine']}:{s.prefix}-{c['ref']}", "machine": c["machine"],
+                        "prefix": s.prefix, "id": c["ref"]})
+        else:
+            home_ids.append(c["ref"])
+    return home_ids, ext
 
 
-def _reconcile_after(s, task, home_ids):
-    """Set a Task's home `after` to `home_ids`, leaving its `after_ext` (the integration's cross-machine
-    links) untouched and never querying another machine. Validates existence and that no loop forms over
-    the home `after` edges, as `set_after` does for local ids, but without its external-state checks
-    (those shell out to other machines and would deadlock against the held store lock)."""
-    if (task.get("after") or []) == home_ids:
-        return
+def _ext_key(ext):
+    """The identity (machine, id) of each external wait, for comparing links without the polling state
+    (`state`, `checked`) the queue stamps on them; a whole-record compare would see every rerun as
+    changed and re-query the machine."""
+    return [(e.get("machine"), e.get("id")) for e in (ext or [])]
+
+
+def _merge_ext(old, new):
+    """The external waits `new`, but keeping the polling state the queue already recorded for a wait that
+    is still present (matched by machine+id); a wait no longer wanted is dropped."""
+    old_by = {(e.get("machine"), e.get("id")): e for e in (old or [])}
+    return [old_by.get((e["machine"], e["id"]), e) for e in new]
+
+
+def _no_loop(s, task, ids):
+    """Raise if waiting for `ids` (home task ids) would make `task` wait for itself, following the home
+    `after` edges. The home-only check `set_after` does, without its cross-machine state query."""
     by_id = {t["id"]: t for t in s.data["tasks"]}
-    ids = [i for i in home_ids if i in by_id and i != task["id"]]
-    seen, todo = set(), list(ids)
+    seen, todo = set(), [i for i in ids if i in by_id and i != task["id"]]
     while todo:
         i = todo.pop()
         if i == task["id"]:
@@ -592,48 +611,85 @@ def _reconcile_after(s, task, home_ids):
             continue
         seen.add(i)
         todo.extend(by_id.get(i, {}).get("after") or [])
-    task["after"] = ids
+
+
+def _desired_links(task, home_ids, ext):
+    """The `after` and `after_ext` a Task should end with: its fan-out-managed home deps (`home_ids`)
+    plus the edges fan-out did not add (the Assistant's, proposal 6.8, kept across reruns), and the
+    external waits merged with any polling state already stored."""
+    managed = set(task.get("flow_after") or [])
+    kept = [i for i in (task.get("after") or []) if i not in managed and i not in home_ids]
+    after = [i for i in home_ids if i] + kept
+    return after, _merge_ext(task.get("after_ext"), ext)
+
+
+def _links_match(task, home_ids, ext):
+    after, after_ext = _desired_links(task, home_ids, ext)
+    return ((task.get("after") or []) == after
+            and _ext_key(task.get("after_ext")) == _ext_key(after_ext)
+            and (task.get("flow_after") or []) == list(home_ids))
+
+
+def _reconcile_after(s, task, home_ids, ext):
+    """Set a Task's fan-out-managed home deps (`home_ids`) and cross-machine waits (`ext`), keeping the
+    edges fan-out did not add and never querying another machine (lock-safe). `flow_after` records which
+    home deps fan-out owns, so a later rerun replaces only those and leaves an Assistant-added `--after`
+    in place (proposal 6.8)."""
+    if _links_match(task, home_ids, ext):
+        return
+    after, after_ext = _desired_links(task, home_ids, ext)
+    _no_loop(s, task, after)
+    task["after"] = after
+    if after_ext:
+        task["after_ext"] = after_ext
+    else:
+        task.pop("after_ext", None)
+    task["flow_after"] = list(home_ids)
     s.dirty = True
 
 
 def _link_home_children(s, feature, packages):
-    """Set each home child's `after` to the home children of the packages it depends on, reconciling the
-    whole graph (so a dependency an amendment removed is cleared, not left pointing at a cancelled Task).
+    """Set each home child's `after`/`after_ext` to the children of the packages it depends on (the home
+    ones directly, the cross-machine ones as external waits), reconciling the whole graph so a dependency
+    an amendment removed is cleared. Edges fan-out did not add (the Assistant's) are kept; reruns that
+    change nothing write nothing.
 
-    The new graph is applied in two passes, clear then set, because a loop check against the stored edges
-    would reject updating one child while the others still hold their old links, even though the work
-    table (already checked acyclic) has none. Clearing first removes every obsolete edge before any new
-    one is validated. When the graph already matches, nothing is written, so reruns stay idempotent."""
+    The home deps are applied clear-then-set, because a loop check against the stored edges would reject
+    updating one child while the others still hold their old fan-out edges (a reversed dependency looks
+    like a cycle, though the checked work table has none). Clearing fan-out's own edges first removes
+    every obsolete one before any new one is validated."""
     entry_by_pkg = {e["package"]: e for e in packages}
     home = []
     for c in feature.get("children", []):
         if c.get("machine"):
-            continue  # a remote child is linked by the cross-machine integration, not here
+            continue  # a child on another machine is reconciled by the cross-machine integration
         t = s.task_by_id(c["ref"])
         entry = entry_by_pkg.get(c["package"])
         if t and entry:
-            home.append((t, _home_deps(s, feature, entry, packages)))
-    if all((t.get("after") or []) == hid for t, hid in home):
+            home_ids, ext = _deps_split(s, feature, entry, packages)
+            home.append((t, home_ids, ext))
+    if all(_links_match(t, hid, ext) for t, hid, ext in home):
         return
-    for t, _ in home:
-        if t.get("after"):
-            _reconcile_after(s, t, [])
-    for t, hid in home:
-        if hid:
-            _reconcile_after(s, t, hid)
+    for t, _, _ in home:  # drop fan-out's own home edges first, so no new edge is validated against one
+        managed = set(t.get("flow_after") or [])
+        if managed & set(t.get("after") or []):
+            t["after"] = [i for i in (t.get("after") or []) if i not in managed]
+            s.dirty = True
+    for t, hid, ext in home:
+        _reconcile_after(s, t, hid, ext)
 
 
 def _ensure_verify(s, feature, change, space, start, queued_at):
     """Create the first Verify Task (role verify) that waits for the home children, or reconcile the
     existing one's home `after` with the current children (new ones added, cancelled ones dropped).
-    Returns True when a Verify Task was created. The Verify Task must also wait for children on other
-    machines (proposal section 6.11); those cross-machine waits are added by the integration layer
-    (T17/T19), which can query the machines lock-safely, and `_reconcile_after` leaves them in place."""
-    home_ids = _home_child_ids(feature.get("children", []))
+    Returns True when a Verify Task was created. The Verify Task waits for every child, on this machine
+    (directly) and on others (external waits built without a cross-machine query), so verify covers all
+    children (contract C7)."""
+    home_ids, ext = _local_and_ext(s, feature.get("children", []))
     if feature.get("verify_task"):
         t = s.task_by_id(feature["verify_task"])
         if t:
-            _reconcile_after(s, t, home_ids)
+            _reconcile_after(s, t, home_ids, ext)
         return False
     t = s.new(
         f"Verify {s.ref(feature)}: {feature['title']}",
@@ -648,7 +704,7 @@ def _ensure_verify(s, feature, change, space, start, queued_at):
     t["base"], t["base_set"] = feature["branch"], True
     if space:
         t["queue"] = {"space": space}
-    _reconcile_after(s, t, home_ids)
+    _reconcile_after(s, t, home_ids, ext)
     if start:
         t["state"], t["queued_at"] = "queued", queued_at
     feature["verify_task"] = t["id"]

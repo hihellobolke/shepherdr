@@ -325,37 +325,48 @@ class RunTest(Base):
             with self.assertRaises(Fail):
                 fanout.run(s, self.change)
 
-    def test_home_child_ids_excludes_other_machines(self):
+    def test_local_and_ext_splits_and_builds_waits_without_a_query(self):
+        # Home children become plain ids; a child on another machine becomes an external wait record
+        # built directly (machine, id, prefix) with no cross-machine call.
         children = [
             {"ref": 50, "machine": None, "rows": ["0.1"]},
             {"ref": 51, "machine": "vm-b", "rows": ["1.1"]},
             {"ref": 52, "machine": None, "rows": ["1.2"]},
         ]
-        self.assertEqual(fanout._home_child_ids(children), [50, 52])
+        with st.Store(self.loc, write=False) as s:
+            home_ids, ext = fanout._local_and_ext(s, children)
+            self.assertEqual(home_ids, [50, 52])
+            self.assertEqual(len(ext), 1)
+            self.assertEqual((ext[0]["machine"], ext[0]["id"]), ("vm-b", 51))
+            self.assertEqual(ext[0]["ref"], f"vm-b:{s.prefix}-51")
 
-    def test_verify_links_home_only_and_leaves_ext_to_the_integration(self):
-        # Fan-out never queries another machine under the store lock, so it links the Verify Task to the
-        # home children only and leaves any cross-machine after_ext (added by the integration) untouched.
-        # A rerun with such an after_ext present makes no change and no cross-machine call.
+    def test_verify_waits_for_a_remote_child_without_querying(self):
+        # The Verify Task must wait for every child, including one on another machine. Fan-out builds that
+        # wait as an external record directly (no cross-machine call under the lock), so a seeded remote
+        # child gets a verify after_ext and no machine is contacted.
         self.run_fanout()
         with st.Store(self.loc) as s:
             feat = s.data["features"][0]
             leaf = next(c for c in feat["children"] if c["rows"] == ["2.1"])
-            leaf["machine"] = "vm-b"  # as if the integration placed this leaf elsewhere
-            verify = s.task_by_id(feat["verify_task"])
-            verify["after"] = [c["ref"] for c in feat["children"] if not c.get("machine")]
-            verify["after_ext"] = [{"ref": f"vm-b:{s.prefix}-{leaf['ref']}", "machine": "vm-b",
-                                    "prefix": s.prefix, "id": leaf["ref"], "state": "running", "checked": 1}]
-            s.dirty = True
+            leaf["machine"] = "vm-b"  # a leaf (nothing depends on it), placed elsewhere
+            fanout._ensure_verify(s, feat, self.change, None, True, 0)  # no vm-b call
+        verify = next(t for t in self.read()["tasks"] if t.get("role") == "verify")
+        ext = verify.get("after_ext") or []
+        self.assertEqual([(e["machine"], e["id"]) for e in ext], [("vm-b", leaf["ref"])])
+
+    def test_rerun_preserves_an_assistant_added_dependency(self):
+        # The Assistant can add an --after link when it extends owned paths (proposal 6.8). A later
+        # fan-out rerun (tick's repeated trigger, contract C8) must keep it, not erase it.
+        self.run_fanout()
         with st.Store(self.loc) as s:
-            feat = s.data["features"][0]
-            before = json.loads(json.dumps(s.task_by_id(feat["verify_task"])))
-            made = fanout._ensure_verify(s, feat, self.change, None, True, 0)  # no vm-b call, no rewrite
-        self.assertFalse(made)
-        after = self.read()["tasks"]
-        verify = next(t for t in after if t.get("role") == "verify")
-        self.assertEqual(verify, before)                       # unchanged
-        self.assertTrue(verify.get("after_ext"))               # the integration's link is preserved
+            by_rows = {tuple(t["rows"]): t for t in s.data["tasks"] if t.get("role") == "child"}
+            extra = by_rows[("0.1",)]["id"]                       # 2.1 already waits for 1.1, 1.2
+            wire = by_rows[("2.1",)]
+            wire["after"] = (wire.get("after") or []) + [extra]   # the Assistant adds 2.1 -> 0.1
+            s.dirty = True
+        self.run_fanout()  # the repeated trigger must not drop the Assistant's edge
+        wire = next(t for t in self.read()["tasks"] if t.get("rows") == ["2.1"])
+        self.assertIn(extra, wire["after"])
 
 
 # ---- placement with chain affinity (section 6.13), via the dry run ----------------------------
@@ -768,11 +779,12 @@ class CmdFanoutTest(Base):
 
     def _capture(self, args):
         import io
-        from contextlib import redirect_stdout
-        buf = io.StringIO()
-        with redirect_stdout(buf):
+        from contextlib import redirect_stdout, redirect_stderr
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             rc = fanout.cmd_fanout(args)
-        return rc, buf.getvalue()
+        self._stderr = err.getvalue()
+        return rc, out.getvalue()
 
     def test_dry_run_json_creates_nothing(self):
         before = self.read()
@@ -799,6 +811,9 @@ class CmdFanoutTest(Base):
         self.write_table("## Work table\n\nnothing\n")
         rc, out = self._capture(Args(change=self.change, folder=self.repo, dry_run=True))
         self.assertEqual(rc, 1)
+        # Contract C4/C6: a non-JSON refusal goes to stderr with the herdr-task: prefix, not stdout.
+        self.assertEqual(out, "")
+        self.assertTrue(self._stderr.startswith("herdr-task: "))
 
     def test_real_run_invalid_prints_c5_shape(self):
         # A real run (not dry) with a bad table still prints the C5 invalid shape and exits 1, rather
