@@ -419,14 +419,18 @@ export default class ShepherdrSettings extends View {
 
   // The OpenSpec flow's text boxes show what applies in this scope: Risky paths one glob per line,
   // Retro prompt empty when it follows the built-in steps.
-  resetFlow() {
+  resetFlow(only = null) {
     const k = shepherdrFor(this.cfg, this.scope).tasks;
-    const globs = Array.isArray(k.risky_paths) ? k.risky_paths : [];
-    this.risky.saved = globs.join("\n");
-    this.risky.box.set_value(this.risky.saved);
-    const rp = k.retro_prompt ?? "built-in";
-    this.retroPrompt.saved = rp === "built-in" ? "" : rp;
-    this.retroPrompt.box.set_value(this.retroPrompt.saved);
+    if (only === null || only === "risky_paths") {
+      const globs = Array.isArray(k.risky_paths) ? k.risky_paths : [];
+      this.risky.saved = globs.join("\n");
+      this.risky.box.set_value(this.risky.saved);
+    }
+    if (only === null || only === "retro_prompt") {
+      const rp = k.retro_prompt ?? "built-in";
+      this.retroPrompt.saved = rp === "built-in" ? "" : rp;
+      this.retroPrompt.box.set_value(this.retroPrompt.saved);
+    }
   }
 
   // Writes the flow text rows changed since they were saved to `scope` (taken when called). A value
@@ -472,7 +476,8 @@ export default class ShepherdrSettings extends View {
   resetFlowField(field, cx) {
     cx.spawn(async (cx) => {
       await this.apply((next) => this.drop(this.layerOf(next), "tasks", field));
-      this.resetFlow();
+      // Only the reset row's box, so an edit typed in the other row while the write was pending stays.
+      this.resetFlow(field);
       cx.notify();
     });
   }
@@ -749,6 +754,14 @@ export default class ShepherdrSettings extends View {
   // and its button shows the Reviewer's model; on Everywhere, "Use the Reviewer's" puts it back.
   retroAgentRow(t, cx) {
     const c = this.roles.retro;
+    // While it follows the Reviewer, keep its shown model in step with the Reviewer's current one
+    // (it may have changed on the Agents page since resetRoles). Move `saved` with it so this is a
+    // display refresh, never a write of a Retro override.
+    if (c?.unset) {
+      const rv = this.roles.reviewer?.sel ?? null;
+      c.sel = rv ? { ...rv } : null;
+      c.saved = JSON.stringify(rv);
+    }
     const control = h_flex().gap(8).items_center()
       .child(c?.sel ? models.modelButton(t, c, {}, cx) : div().text_size(TEXT.label).text_color(t.dim).child(LOADING_AGENTS))
       .when(!this.scope && c && !c.unset,
