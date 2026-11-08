@@ -201,6 +201,14 @@ def cmd_fanout(args):
             return 1
         if not dry:
             p = run(s, change, machines, amend, start=not getattr(args, "no_start", False))
+    if not dry and p.get("started"):
+        # The queue starts the children; wake the scheduler as cmd_start does, now the lock is
+        # released. (When tick.py drives fan-out, the scheduler is already the caller.)
+        try:
+            from .scheduler import ensure_scheduler
+            ensure_scheduler(quiet=True)
+        except Exception:
+            pass
     _say_plan(args, p)
     return 0
 
@@ -549,6 +557,14 @@ def _local_and_ext(s, children):
     return home_ids, ext
 
 
+def _ext_key(ext):
+    """The identity of an `after_ext` list (its machine+id pairs), for comparing a child's current
+    external links to the desired ones. `queues.set_after` adds polling fields (`state`, `checked`) to
+    the stored records, so a whole-record comparison would see every rerun as changed and re-query the
+    machine; comparing identity keeps a rerun idempotent and avoids needless cross-machine calls."""
+    return [(e.get("machine"), e.get("id")) for e in (ext or [])]
+
+
 def _link_home_children(s, feature, packages):
     """Set each home child's `after` to the children of the packages it depends on, reconciling the
     whole graph (so a dependency an amendment removed is cleared, not left pointing at a cancelled
@@ -569,7 +585,8 @@ def _link_home_children(s, feature, packages):
         if t and entry:
             home_ids, ext = _local_and_ext(s, _dep_children(feature, entry, packages))
             home.append((t, home_ids, ext))
-    if all((t.get("after") or []) == hid and (t.get("after_ext") or []) == ext for t, hid, ext in home):
+    if all((t.get("after") or []) == hid and _ext_key(t.get("after_ext")) == _ext_key(ext)
+           for t, hid, ext in home):
         return
     for t, _, _ in home:
         if t.get("after") or t.get("after_ext"):
@@ -587,7 +604,7 @@ def _ensure_verify(s, feature, change, start, queued_at):
     home_ids, ext = _local_and_ext(s, feature.get("children", []))
     if feature.get("verify_task"):
         t = s.task_by_id(feature["verify_task"])
-        if t and ((t.get("after") or []) != home_ids or (t.get("after_ext") or []) != ext):
+        if t and ((t.get("after") or []) != home_ids or _ext_key(t.get("after_ext")) != _ext_key(ext)):
             set_after(s, t, home_ids, ext)
         return False
     t = s.new(

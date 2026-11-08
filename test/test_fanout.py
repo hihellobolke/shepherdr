@@ -313,6 +313,38 @@ class RunTest(Base):
             with self.assertRaises(Fail):
                 fanout.run(s, self.change)
 
+    def test_ext_key_ignores_polling_fields(self):
+        # set_after stamps state/checked onto an after_ext record; the idempotency comparison must look
+        # only at identity (machine + id), or every rerun would re-query the machine.
+        stored = [{"ref": "vm-b:HAT-5", "machine": "vm-b", "prefix": "HAT", "id": 5,
+                   "state": "running", "checked": 123}]
+        fresh = [{"ref": "vm-b:HAT-5", "machine": "vm-b", "prefix": "HAT", "id": 5}]
+        self.assertEqual(fanout._ext_key(stored), fanout._ext_key(fresh))
+        self.assertNotEqual(fanout._ext_key(stored), fanout._ext_key([{"machine": "vm-c", "id": 5}]))
+
+    def test_verify_relink_idempotent_with_a_remote_child(self):
+        # A Verify Task that already waits for a remote child (its after_ext stamped with polling
+        # fields) must not be rewritten on a rerun, so no needless cross-machine call is made.
+        self.run_fanout()
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            # make 2.1's child a remote leaf, and point the Verify Task at the children as set_after would
+            leaf = next(c for c in feat["children"] if c["rows"] == ["2.1"])
+            leaf["machine"] = "vm-b"
+            verify = s.task_by_id(feat["verify_task"])
+            home_ids = [c["ref"] for c in feat["children"] if not c.get("machine")]
+            verify["after"] = home_ids
+            verify["after_ext"] = [{"ref": f"vm-b:{s.prefix}-{leaf['ref']}", "machine": "vm-b",
+                                    "prefix": s.prefix, "id": leaf["ref"], "state": "running", "checked": 1}]
+            s.dirty = True
+        with st.Store(self.loc) as s:
+            feat = s.data["features"][0]
+            before = json.loads(json.dumps(s.task_by_id(feat["verify_task"])))
+            made = fanout._ensure_verify(s, feat, self.change, True, 0)  # must not reach vm-b or rewrite
+        self.assertFalse(made)
+        with st.Store(self.loc, write=False) as s:
+            self.assertEqual(s.task_by_id(s.data["features"][0]["verify_task"]), before)
+
     def test_verify_waits_for_children_on_every_machine(self):
         # A Verify Task must wait for children on other machines too, not only the home ones. Seed a
         # remote child entry and check the split the Verify Task's after is built from.
