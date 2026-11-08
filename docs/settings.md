@@ -23,6 +23,7 @@ drops the space's own, and it inherits again. A few settings are one for every s
 | Agents | Workers | Everywhere, space | The same: what a task in this space runs on |
 | Agents | Reviewer | Everywhere, space | The same |
 | Agents | Backup agent | Everywhere, space | A space whose work shouldn't move to the other CLI |
+| Agents | Retro agent (CLI, model, effort) | Everywhere, space | The OpenSpec flow's retro agent; empty means the Reviewer's (`retro` role, `docs/openspec-flow.md`) |
 | Agents | Reactions (every agent reacts with an emoji; on) | Everywhere, space | A space may want a plainer chat |
 | Agents | Ask for a GitHub star (on; once asked, just when) | Everywhere only | One ask per person, ever, on every machine (`star_prompt`, herdr-task's `star.py`) |
 | Agents | Instructions (assistant.md, worker.md, reviewer.md) | Everywhere only | Repo rules belong in the repo's AGENTS.md or CLAUDE.md, which every agent there reads |
@@ -34,6 +35,9 @@ drops the space's own, and it inherits again. A few settings are one for every s
 | Tasks | Branch names (a pattern: `{n}`, `{key}`, `{slug}`; empty: `task/{n}-{slug}`; a task's own `--branch` wins) | Everywhere, space | A team may name branches after its tickets |
 | Tasks | Run automations | Everywhere, space | Pause one repo's automations |
 | Tasks | When a task starts / finishes | Everywhere, space | Setup and cleanup steps are a repo's |
+| Tasks | Flow (classic or openspec) | Everywhere, space | A repo opts into the OpenSpec Feature flow; classic is the default (`docs/openspec-flow.md`) |
+| Tasks | Verify rounds, Risky paths, Owned-paths exempt | Everywhere, space | How many fix rounds a Feature allows, and which paths are high risk or exempt from the owned-paths check |
+| Tasks | Retro, Retro prompt, Retro saves to, May change without asking | Everywhere, space | Whether and how a Feature's retro runs after it merges, and what a flow agent may change without an Accept |
 | Autopilot | Heartbeat, Schedule, Events | Everywhere, space | Each space works toward its own goal, at its own pace |
 | Autopilot | On or off | Space only | The header's switch: Everywhere never turns a space on |
 | Notify | All / Needs me / Off | Everywhere, space | A busy space can be quiet |

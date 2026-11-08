@@ -13,13 +13,18 @@ bin/shepherdr            the installer (install, update, uninstall, doctor); ./i
 bin/                     herdr-secret, herdr-browser, herdr-browser-view, sync-shared (installed to the app's bin/)
 mods/tasks/bin/          herdr-task (entry) and its herdr_task package
 mods/artifacts/bin/      herdr-artifact
-templates/               assistant.md, worker.md, reviewer.md (herdr-core templates)
+templates/               assistant.md, worker.md, reviewer.md, flow-*.md, retro.md (herdr-core templates)
 guard/herdr-app          the window guard (--guard)
 keys.json                Shepherdr's keys, merged into the person's
 test/                    python tests: repo rules, the installer in throwaway roots, herdr-task
 scripts/parity.py        a scratch install against this machine's live Herdr home, file by file
 RECIPE.md, preview.png   the herdr.dev listing (repo topic herdr-layout)
 ```
+
+The optional OpenSpec flow, which builds one Feature with many agents at once, is documented in
+[docs/openspec-flow.md](openspec-flow.md).
+It is off by default: a repo opts in with the `flow=openspec` setting, and `herdr-task flow init`
+prepares the repo.
 
 ## Rules
 
